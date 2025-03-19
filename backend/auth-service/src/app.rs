@@ -1,8 +1,10 @@
 use axum::{Router, routing::get};
 use tower_http::cors::{CorsLayer, Any};
 
+use crate::config::database::DbPool;
 
-pub async fn build_app() -> Router {
+
+pub async fn build_app(pool: DbPool) -> Router {
     Router::new()
         .route("/", get(|| async { "🚀 BuildHub Authorization Service is running" }))
         .layer(
