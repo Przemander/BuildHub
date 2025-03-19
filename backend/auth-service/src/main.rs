@@ -6,7 +6,7 @@ use crate::config::database::init_pool;
 
 mod app;
 mod config;
-
+mod db;
 
 #[tokio::main]
 async fn main() {
