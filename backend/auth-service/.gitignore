@@ -1,2 +1,38 @@
-/target
+# Build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Environment variables & secrets
 .env
+.env.*
+!.env.example
+
+# Database files
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+
+# IDE/Editor directories
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log
+logs/
+
+# Temporary files
+tmp/
+.tmp/
+
+# Generated content
+/dist
+/generated
