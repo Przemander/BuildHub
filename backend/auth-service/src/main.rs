@@ -1,10 +1,10 @@
 use axum::Server;
-use config::redis::check_redis_connection;
 use std::{net::SocketAddr, env};
 use dotenvy::dotenv;
 use crate::app::build_app;
 use crate::config::database::init_pool;
-use crate::config::redis::init_redis;
+use crate::config::redis::{init_redis, check_redis_connection};
+use crate::utils::email::EmailConfig;
 use log::{info, error, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -49,9 +49,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None
         }
     };
+    
+    // Initialize email configuration
+    info!("Initializing email configuration");
+    let email_config = match EmailConfig::new() {
+        Ok(config) => {
+            info!("Email configuration initialized successfully");
+            Some(config)
+        }
+        Err(e) => {
+            warn!("Failed to initialize email configuration: {}. Email features will be disabled.", e);
+            None
+        }
+    };
 
-    // Build application with database pool and Redis client
-    let app = build_app(pool, redis_client).await;
+    // Build application with database pool, Redis client, and email config
+    let app = build_app(pool, redis_client, email_config).await;
 
     // Determine address to listen on
     let port = env::var("PORT")
@@ -84,7 +97,7 @@ fn check_required_env_vars() {
         }
     }
 
-    let optional_vars = ["REDIS_URL", "PORT", "HOST"];
+    let optional_vars = ["REDIS_URL", "PORT", "HOST", "SMTP_SERVER", "SMTP_USERNAME", "SMTP_PASSWORD", "FRONTEND_URL"];
     
     for var in optional_vars.iter() {
         if env::var(var).is_err() {

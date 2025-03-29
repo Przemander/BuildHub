@@ -129,4 +129,18 @@ impl User {
         info!("User {} activated successfully", self.email);
         Ok(())
     }
+
+    pub fn update(&self, conn: &mut SqliteConnection) -> QueryResult<()> {
+        use crate::db::schema::users::dsl::*;
+        
+        if let Some(user_id) = self.id {
+            diesel::update(users.filter(id.eq(user_id)))
+                .set(self)
+                .execute(conn)
+                .map(|_| ())
+        } else {
+            Err(diesel::result::Error::NotFound)
+        }
+    }
+
 }
