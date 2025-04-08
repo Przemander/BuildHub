@@ -4,6 +4,7 @@
 //! and starts the HTTP server to handle API requests.
 
 use axum::Server;
+use utils::log::Log;
 use std::{net::SocketAddr, env};
 use dotenvy::dotenv;
 use tokio::signal;
@@ -12,7 +13,7 @@ use crate::config::database::{init_pool, DbPool};
 use crate::config::redis::{init_redis, check_redis_connection};
 use redis::Client as RedisClient;
 use crate::utils::email::EmailConfig;
-use log::{info, error, warn};
+use log::{error, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod app;
@@ -30,32 +31,69 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|_| "auth_service=debug,tower_http=debug".into()))
         .with(tracing_subscriber::fmt::layer())
         .init();
+    
+    Log::debug(
+        "Server initialization", 
+        "Configure logging system", 
+        "success"
+    );
 
     // Load environment variables
     dotenv().ok();
-    info!("Environment variables loaded");
+    
+    Log::debug(
+        "Server initialization",
+        "Load environment variables", 
+        "success"
+    );
     
     // Check for required environment variables
     check_required_env_vars();
-
-    // Initialize services
+    
     let (pool, redis_client, email_config) = initialize_services().await?;
 
-    // Build application with database pool, Redis client, and email config
+    Log::debug(
+        "Server initialization",
+        "Services initialization complete",
+        "success"
+    );
+
+    
     let app = build_app(pool, redis_client, email_config).await;
-    info!("Application built successfully");
+    
+    Log::debug(
+        "Server initialization",
+        "Build application",
+        "success"
+    );
 
     // Determine address to listen on
     let addr = get_server_address()?;
-    info!("🚀 Server starting on {}", addr);
-
-    // Start the server with graceful shutdown signal handling
+    
+    Log::debug(
+        "Server startup",
+        "Configure server address",
+        "success"
+    );
+    
+    // Log startup message
+    Log::info(
+        "Server startup",
+        "Auth service listening",
+        "success"
+    );
+    
     Server::bind(&addr)
         .serve(app.into_make_service())
         .with_graceful_shutdown(shutdown_signal())
         .await?;
         
-    info!("Server shutdown complete");
+    Log::info(
+        "Server shutdown",
+        "Complete shutdown sequence",
+        "success"
+    );
+    
     Ok(())
 }
 
@@ -70,47 +108,96 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// A tuple containing the initialized services or None if they failed to initialize
 async fn initialize_services() -> Result<(DbPool, Option<RedisClient>, Option<EmailConfig>), Box<dyn std::error::Error>> {
     
-    // Initialize database connection pool
-    info!("Initializing database connection pool");
+
     let pool = init_pool();
     
-    // Test database connection
     {
         let conn = pool.get().map_err(|e| {
+            Log::error(
+                "Server initialization",
+                "Test database connection",
+                "failure"
+            );
             error!("Failed to connect to database: {}", e);
             e
         })?;
         
-        info!("Database connection successful");
+        Log::info(
+            "Server initialization",
+            "Database connection pool",
+            "success"
+        );
+        
         drop(conn);
     }
     
-    // Initialize Redis client
-    info!("Initializing Redis client");
+    
     let redis_client = match init_redis() {
         Ok(client) => {
+            Log::info(
+                "Server initialization",
+                "Redis client created",
+                "success"
+            );
+            
             if check_redis_connection(&client).await {
-                info!("Redis connection successful");
+                Log::debug(
+                    "Server initialization",
+                    "Test Redis connection",
+                    "success"
+                );
                 Some(client)
             } else {
-                warn!("Redis connection test failed, continuing without Redis");
+                Log::warn(
+                    "Server initialization",
+                    "Test Redis connection",
+                    "failure"
+                );
+                
+                Log::debug(
+                    "Server initialization",
+                    "Redis connection test",
+                    "failure"
+                );
+                
                 None
             }
         }
         Err(e) => {
+            Log::warn(
+                "Server initialization",
+                "Initialize Redis client",
+                "failure"
+            );
+        
             warn!("Failed to initialize Redis client: {}, continuing without Redis", e);
             None
         }
     };
     
-    // Initialize email configuration
-    info!("Initializing email configuration");
+
     let email_config = match EmailConfig::new() {
         Ok(config) => {
-            info!("Email configuration initialized successfully");
+            Log::info(
+                "Server initialization",
+                "Initialize email configuration",
+                "success");
+            
             Some(config)
         }
         Err(e) => {
+            Log::warn(
+                "Server initialization",
+                "Initialize email configuration",
+                "failure"
+            );
+            
+            Log::debug(
+                "Server initialization",
+                "Email configuration error",
+                "failure"
+            );
+            
             warn!("Failed to initialize email configuration: {}. Email features will be disabled.", e);
             None
         }
@@ -125,22 +212,42 @@ async fn initialize_services() -> Result<(DbPool, Option<RedisClient>, Option<Em
 /// A properly formatted SocketAddr to bind the server to
 fn get_server_address() -> Result<SocketAddr, Box<dyn std::error::Error>> {
     // Determine address to listen on
+    
     let port = env::var("PORT")
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(3000);
         
+    Log::debug(
+        "Server initialization",
+        "Server port",
+        "success"
+    );
+    
     let host = env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    
+    Log::debug(
+        "Server initialization",
+        "Server host",
+        "success"
+    );
     
     // Parse the host string into a SocketAddr
     let addr_str = format!("{}:{}", host, port);
     let addr: SocketAddr = addr_str.parse()?;
+    
+    Log::info(
+        "Server initialization",
+        "Parse server address",
+        "success"
+    );
     
     Ok(addr)
 }
 
 /// Check required and optional environment variables and log their status.
 fn check_required_env_vars() {
+    
     let required_vars = ["DATABASE_URL", "JWT_SECRET"];
     let mut missing_required = false;
     
@@ -148,23 +255,58 @@ fn check_required_env_vars() {
         if env::var(var).is_err() {
             error!("Required environment variable '{}' is not set", var);
             missing_required = true;
-        } else {
-            info!("Required environment variable '{}' is set", var);
-        }
-    }
+    }};
 
+    Log::debug(
+        "Server initialization",
+        "Check environment variable",
+        "success"
+    );
+    
     if missing_required {
-        warn!("Some required environment variables are missing. The application may not function correctly.");
-    }
+        Log::warn(
+            "Server initialization",
+            "Verify all required variables",
+            "failure"
+        )
+    };
+    
 
     let optional_vars = ["REDIS_URL", "PORT", "HOST", "SMTP_SERVER", "SMTP_USERNAME", "SMTP_PASSWORD", "FRONTEND_URL"];
+    let mut all_optional_present = true;
+    let mut missing_count = 0;
     
     for var in optional_vars.iter() {
         if env::var(var).is_err() {
-            warn!("Optional environment variable '{}' is not set, using default", var);
+            Log::debug(
+                "Server initialization",
+                "Check environment variable",
+                "failure"
+            );
+            
+            all_optional_present = false;
+            missing_count += 1;
         } else {
-            info!("Optional environment variable '{}' is set", var);
+            Log::debug(
+                "Server initialization",
+                "Check environment variable",
+                "success"
+            );
         }
+    }
+    
+    if all_optional_present {
+        Log::info(
+            "Server initialization",
+            "Check optional environment variables",
+            "success"
+        );
+    } else {
+        Log::info(
+            "Server initialization",
+            "Check optional environment variables",
+            "partial"
+        );
     }
 }
 
@@ -174,6 +316,12 @@ fn check_required_env_vars() {
 /// and returns when one is received, allowing the server to
 /// gracefully complete in-flight requests before shutting down.
 async fn shutdown_signal() {
+    Log::debug(
+        "Server lifecycle",
+        "Shutdown signal handler",
+        "success"
+    );
+
     let ctrl_c = async {
         signal::ctrl_c()
             .await
@@ -193,10 +341,18 @@ async fn shutdown_signal() {
 
     tokio::select! {
         _ = ctrl_c => {
-            info!("SIGINT received, starting graceful shutdown");
+            Log::info(
+                "Server shutdown",
+                "Receive shutdown signal",
+                "success"
+            );
         },
         _ = terminate => {
-            info!("SIGTERM received, starting graceful shutdown");
+            Log::info(
+                "Server shutdown",
+                "Receive shutdown signal",
+                "success"
+            );
         },
-    }
+    };
 }

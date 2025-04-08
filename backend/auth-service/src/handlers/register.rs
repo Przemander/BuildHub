@@ -3,9 +3,12 @@
 //! This module provides functionality for creating new user accounts,
 //! including validation, database storage, and email activation.
 
-use axum::{Extension, Json};
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::{
+    extract::{State, Json},
+    http::StatusCode,
+    response::IntoResponse,
+};
+use crate::app::AppState;
 use crate::config::database::DbPool;
 use crate::db::users::{User, RegisterData};
 use crate::utils::email::{EmailConfig, generate_activation_code};
@@ -25,9 +28,7 @@ use redis::Client as RedisClient;
 /// 5. Returns a success response
 ///
 /// # Arguments
-/// * `pool` - Database connection pool
-/// * `email_config` - Email service configuration
-/// * `redis_client` - Redis client for activation code storage
+/// * `app_state` - Application state containing shared resources
 /// * `register_data` - User registration data from request body
 ///
 /// # Returns
@@ -35,12 +36,19 @@ use redis::Client as RedisClient;
 /// * `400 Bad Request` - For invalid input data
 /// * `500 Internal Server Error` - For database or service failures
 pub async fn register_handler(
-    Extension(pool): Extension<DbPool>,
-    Extension(email_config): Extension<EmailConfig>,
-    Extension(redis_client): Extension<RedisClient>,
+    State(app_state): State<AppState>,
     Json(register_data): Json<RegisterData>,
 ) -> impl IntoResponse {
-    // Process registration and map the result to HTTP response
+    let pool = app_state.pool.clone();
+    let email_config = match &app_state.email_config {
+        Some(cfg) => cfg.clone(),
+        None => return ApiError::internal_error("Missing EmailConfig").into_response(),
+    };
+    let redis_client = match &app_state.redis_client {
+        Some(r) => r.clone(),
+        None => return ApiError::internal_error("Missing RedisClient").into_response(),
+    };
+
     match process_registration(pool, email_config, redis_client, register_data).await {
         Ok(response) => response.into_response(),
         Err(api_error) => api_error.into_response(),
