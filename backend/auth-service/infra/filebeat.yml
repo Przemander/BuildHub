@@ -1,0 +1,56 @@
+filebeat.inputs:
+- type: log
+  enabled: true
+  paths:
+    - /logs/*.log
+  json.keys_under_root: true
+  json.add_error_key: true
+  json.message_key: message
+  fields:
+    service: auth-service
+  fields_under_root: true
+  scan_frequency: 5s
+
+filebeat.config.modules:
+  path: ${path.config}/modules.d/*.yml
+  reload.enabled: false
+
+processors:
+  - add_host_metadata:
+      when.not.contains.tags: forwarded
+  - add_docker_metadata: ~
+  - add_cloud_metadata: ~
+  - add_fields:
+      target: ''
+      fields:
+        environment: ${ENVIRONMENT:development}
+  - timestamp:
+      field: timestamp
+      layouts:
+        - '2006-01-02T15:04:05.999Z07:00' # RFC3339
+  - drop_fields:
+      fields: ["agent", "ecs", "input", "log"]
+      ignore_missing: true
+
+output.opensearch:
+  hosts: ["${OPENSEARCH_HOSTS:opensearch:9200}"]
+  index: "logs-auth-service-%{+yyyy.MM.dd}"
+  protocol: http
+  timeout: 30s
+  ssl.enabled: false
+  bulk_max_size: 1000
+  compression_level: 5
+  worker: 2
+
+setup.template.name: "logs-auth-service"
+setup.template.pattern: "logs-auth-service-*"
+setup.template.overwrite: true
+setup.ilm.enabled: false
+
+logging.level: info
+logging.to_files: true
+logging.files:
+  path: /var/log/filebeat
+  name: filebeat
+  keepfiles: 7
+  permissions: 0644

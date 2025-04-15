@@ -1,261 +1,220 @@
 //! Email service utilities for user account management.
 //!
 //! This module provides functionality for sending transactional emails
-//! and managing email-related activation codes through Redis.
+//! and managing activation codes via Redis. It uses Lettre for email delivery 
+//! and integrates structured logging and Prometheus metrics to track configuration,
+//! email sending attempts, and Redis operations.
 
 use lettre::{Message, SmtpTransport, Transport};
 use lettre::transport::smtp::authentication::Credentials;
 use std::env;
-use log::{info, error};
-use uuid::Uuid;
 use redis::{AsyncCommands, Client as RedisClient};
-
+use crate::{log_info, log_warn, log_error, log_debug};
 use crate::utils::errors::ApiError;
+use crate::utils::metrics::{EMAILS_SENT, REDIS_OPERATIONS};
 
 /// Configuration for sending emails via SMTP.
 #[derive(Clone)]
 pub struct EmailConfig {
-    /// The email address used as the sender for all outgoing emails
+    /// The email address used as the sender for all outgoing emails.
     from_address: String,
-    /// The configured SMTP transport client
+    /// The configured SMTP transport client.
     mailer: SmtpTransport,
 }
 
 impl EmailConfig {
     /// Creates a new EmailConfig instance from environment variables.
+    ///
+    /// Reads SMTP_SERVER, SMTP_USERNAME, SMTP_PASSWORD, and SMTP_FROM_ADDRESS.
+    /// Logs and records metric events for configuration initialization.
     pub fn new() -> Result<Self, ApiError> {
-        // Get SMTP configuration from environment
-        let smtp_server = env::var("SMTP_SERVER")
-            .map_err(|_| {
-                error!("SMTP_SERVER environment variable not set");
-                ApiError::configuration_error("SMTP_SERVER must be set")
-            })?;
+        let smtp_server = env::var("SMTP_SERVER").map_err(|_| {
+            log_error!("Email Configuration", "SMTP server variable missing", "failure");
+            EMAILS_SENT.with_label_values(&["config", "failure"]).inc();
+            ApiError::configuration_error("SMTP_SERVER must be set")
+        })?;
         
-        let smtp_username = env::var("SMTP_USERNAME")
-            .map_err(|_| {
-                error!("SMTP_USERNAME environment variable not set");
-                ApiError::configuration_error("SMTP_USERNAME must be set")
-            })?;
+        let smtp_username = env::var("SMTP_USERNAME").map_err(|_| {
+            log_error!("Email Configuration", "SMTP username variable missing", "failure");
+            EMAILS_SENT.with_label_values(&["config", "failure"]).inc();
+            ApiError::configuration_error("SMTP_USERNAME must be set")
+        })?;
         
-        let smtp_password = env::var("SMTP_PASSWORD")
-            .map_err(|_| {
-                error!("SMTP_PASSWORD environment variable not set");
-                ApiError::configuration_error("SMTP_PASSWORD must be set")
-            })?;
+        let smtp_password = env::var("SMTP_PASSWORD").map_err(|_| {
+            log_error!("Email Configuration", "SMTP password variable missing", "failure");
+            EMAILS_SENT.with_label_values(&["config", "failure"]).inc();
+            ApiError::configuration_error("SMTP_PASSWORD must be set")
+        })?;
         
         let from_address = env::var("SMTP_FROM_ADDRESS")
             .unwrap_or_else(|_| "no-reply@example.com".to_string());
         
-        info!("Initializing SMTP connection to {} as {}", smtp_server, smtp_username);
+        log_info!("Email Configuration", "Initializing SMTP connection", "success");
         
-        // Create SMTP transport with credentials
         let creds = Credentials::new(smtp_username, smtp_password);
-        let mailer = SmtpTransport::relay(&smtp_server)
-            .map_err(|e| {
-                error!("Failed to create SMTP transport: {}", e);
-                ApiError::internal_error(&format!("Failed to create mailer: {}", e))
-            })?
-            .credentials(creds)
-            .build();
+        let mailer = SmtpTransport::relay(&smtp_server).map_err(|_| {
+            log_error!("Email Configuration", "Creation of SMTP transport failed", "failure");
+            EMAILS_SENT.with_label_values(&["transport_init", "failure"]).inc();
+            ApiError::internal_error("Failed to create email transport")
+        })?
+        .credentials(creds)
+        .build();
 
-        Ok(Self {
-            from_address,
-            mailer,
-        })
+        log_debug!("Email Configuration", "SMTP transport configured", "success");
+        EMAILS_SENT.with_label_values(&["config", "success"]).inc();
+        
+        Ok(Self { from_address, mailer })
     }
 
-    /// Sends an activation email with a link containing the provided activation code.
+    /// Sends an activation email containing the provided activation code.
     ///
-    /// # Arguments
-    /// * `to_email` - The recipient's email address
-    /// * `activation_code` - The unique activation code to include in the email
-    /// * `redis_client` - Redis client for storing the activation code
-    ///
-    /// # Returns
-    /// * `Ok(())` - If the email was sent successfully
-    /// * `Err(ApiError)` - If sending failed
+    /// Generates an activation link, builds the email message, stores the activation code in Redis,
+    /// and sends the email. If Redis storage fails, email is still sent.
     pub async fn send_activation_email(
         &self, 
         to_email: &str, 
         activation_code: &str,
         redis_client: &RedisClient
     ) -> Result<(), ApiError> {
-        // Generate the activation link with the provided code
+        log_debug!("Account Activation", "Begin email send process", "success");
+        
         let activation_link = generate_activation_link(activation_code);
-
-        // Create email body
         let email_body = format!(
-            "Hello,\n\nTo activate your account, click the link below:\n{}\n\n
-            If you did not create an account, please ignore this message.\n\n
-            This link will expire in 24 hours.",
+            "Hello,\n\nTo activate your account, click the link below:\n{}\n\n\
+             If you did not create an account, please ignore this message.\n\n\
+             This link will expire in 24 hours.",
             activation_link
         );
 
-        info!("Sending activation email to {}", to_email);
+        log_debug!("Account Activation", "Email content prepared", "success");
         
-        // Build the email message
         let email = Message::builder()
-            .from(self.from_address.parse().map_err(|e| {
-                error!("Invalid from address: {}", e);
-                ApiError::internal_error(&format!("Invalid from address: {}", e))
+            .from(self.from_address.parse().map_err(|_| {
+                log_error!("Account Activation", "Parsing sender address failed", "failure");
+                EMAILS_SENT.with_label_values(&["addressing", "failure"]).inc();
+                ApiError::internal_error("Invalid from address")
             })?)
-            .to(to_email.parse().map_err(|e| {
-                error!("Invalid recipient address: {}", e);
-                ApiError::internal_error(&format!("Invalid to address: {}", e))
+            .to(to_email.parse().map_err(|_| {
+                log_error!("Account Activation", "Parsing recipient address failed", "failure");
+                EMAILS_SENT.with_label_values(&["addressing", "failure"]).inc();
+                ApiError::internal_error("Invalid recipient address")
             })?)
             .subject("Activate Your BuildHub Account")
             .body(email_body)
-            .map_err(|e| {
-                error!("Failed to build email: {}", e);
-                ApiError::internal_error(&format!("Failed to build email: {}", e))
+            .map_err(|_| {
+                log_error!("Account Activation", "Building email message failed", "failure");
+                EMAILS_SENT.with_label_values(&["build", "failure"]).inc();
+                ApiError::internal_error("Failed to build email")
             })?;
 
-        // Store the activation code in Redis
-        let to_email_clone = to_email.to_string();
-        let activation_code_clone = activation_code.to_string();
-        
-        // Store activation code directly (no need for spawn)
-        if let Err(e) = store_activation_code(redis_client, &to_email_clone, &activation_code_clone).await {
-            error!("Failed to store activation code: {}", e);
-            // Continue with sending email even if Redis storage fails
+        // Attempt to store the activation code in Redis.
+        if let Err(_) = store_activation_code(redis_client, to_email, activation_code).await {
+            log_error!("Account Activation", "Storing activation code in Redis failed", "failure");
+            // Proceed to send email even if code storage fails.
         }
 
-        // Send the email
-        self.mailer.send(&email)
-            .map_err(|e| {
-                error!("Failed to send activation email: {}", e);
-                ApiError::internal_error(&format!("Failed to send activation email: {}", e))
-            })?;
+        EMAILS_SENT.with_label_values(&["activation", "attempt"]).inc();
+        self.mailer.send(&email).map_err(|_| {
+            log_error!("Account Activation", "Sending email failed", "failure");
+            EMAILS_SENT.with_label_values(&["activation", "failure"]).inc();
+            ApiError::internal_error("Failed to send activation email")
+        })?;
 
-        info!("Activation email sent successfully to {}", to_email);
+        log_info!("Account Activation", "Activation email sent", "success");
+        EMAILS_SENT.with_label_values(&["activation", "success"]).inc();
         Ok(())
     }
 }
 
-/// Generates a unique activation code.
-///
-/// Creates a UUID v4 string for use as an activation code.
-///
-/// # Returns
-/// A unique string that can be used as an activation code
+/// Generates a unique activation code using UUID v4.
 pub fn generate_activation_code() -> String {
-    let code = Uuid::new_v4().to_string();
-    info!("Generated new activation code");
+    let code = uuid::Uuid::new_v4().to_string();
+    log_debug!("Account Activation", "Generated activation code", "success");
     code
 }
 
-/// Creates an activation link from an activation code.
-///
-/// Combines the frontend URL from the environment with the activation code
-/// to create a complete activation link.
-///
-/// # Arguments
-/// * `activation_code` - The code to include in the activation link
-///
-/// # Returns
-/// A complete URL string for account activation
+/// Creates an activation link by combining the frontend URL with the activation code.
 pub fn generate_activation_link(activation_code: &str) -> String {
-    let frontend_url = env::var("FRONTEND_URL")
-        .unwrap_or_else(|_| {
-            info!("FRONTEND_URL not set, using default localhost:3000");
-            "http://localhost:3000".to_string()
-        });
-
+    let frontend_url = env::var("FRONTEND_URL").unwrap_or_else(|_| {
+        log_debug!("Account Activation", "FRONTEND_URL not set", "defaulting to localhost");
+        "http://localhost:3000".to_string()
+    });
+    log_debug!("Account Activation", "Generated activation link", "success");
     format!("{}/activate?code={}", frontend_url, activation_code)
 }
 
-/// Stores an activation code in Redis with the user's email as the value.
-///
-/// # Arguments
-/// * `redis_client` - Redis client instance
-/// * `email` - The user's email to associate with the code
-/// * `code` - The activation code to store
-///
-/// # Returns
-/// * `Ok(())` - If the code was stored successfully
-/// * `Err(ApiError)` - If storage failed
+/// Stores an activation code in Redis with an expiration of 24 hours.
+/// The activation code is stored under a key prefixed with "activation:code:".
 pub async fn store_activation_code(
     redis_client: &RedisClient,
     email: &str,
     code: &str
 ) -> Result<(), ApiError> {
-    info!("Storing activation code for {}", email);
+    log_debug!("Account Activation", "Begin code storage", "success");
     
-    // Get an async Redis connection
-    let mut conn = redis_client.get_async_connection().await
-        .map_err(|e| {
-            error!("Redis connection error: {}", e);
-            ApiError::internal_error(&format!("Service unavailable - please try again later"))
-        })?;
+    let mut conn = redis_client.get_async_connection().await.map_err(|_| {
+        log_error!("Account Activation", "Acquiring Redis connection failed", "failure");
+        REDIS_OPERATIONS.with_label_values(&["connection", "failure"]).inc();
+        ApiError::internal_error("Service unavailable - please try again later")
+    })?;
     
-    // Create the key in the format: activation:code:{uuid}
+    REDIS_OPERATIONS.with_label_values(&["connection", "success"]).inc();
     let key = format!("activation:code:{}", code);
+    const EXPIRY: u64 = 86_400;
     
-    // Activation code expiration time (24 hours)
-    const ACTIVATION_CODE_EXPIRY: u64 = 86_400; // 24 hours in seconds
+    REDIS_OPERATIONS.with_label_values(&["set_ex", "attempt"]).inc();
+    conn.set_ex::<_, _, ()>(key, email, EXPIRY as usize).await.map_err(|_| {
+        log_error!("Account Activation", "Storing key in Redis failed", "failure");
+        REDIS_OPERATIONS.with_label_values(&["set_ex", "failure"]).inc();
+        ApiError::internal_error("Failed to complete registration. Please try again later.")
+    })?;
     
-    // Store the email as the value with expiration time
-    conn.set_ex::<_, _, ()>(key, email, ACTIVATION_CODE_EXPIRY as usize).await
-        .map_err(|e| {
-            error!("Failed to store activation code: {}", e);
-            ApiError::internal_error("Failed to complete registration. Please try again later.")
-        })?;
-    
-    info!("Activation code stored successfully for {}", email);
+    REDIS_OPERATIONS.with_label_values(&["set_ex", "success"]).inc();
+    log_info!("Account Activation", "Activation code stored in Redis", "success");
     Ok(())
 }
 
-/// Verifies an activation code and returns the associated email if valid.
-///
-/// If the code is valid, it retrieves the associated email and deletes
-/// the code from Redis to prevent reuse.
-///
-/// # Arguments
-/// * `redis_client` - Redis client instance
-/// * `code` - The activation code to verify
-///
-/// # Returns
-/// * `Ok(String)` - The email associated with the activation code
-/// * `Err(ApiError)` - If verification failed or code is invalid
+/// Verifies an activation code by retrieving and then deleting the associated email in Redis.
+/// Returns the email if the code is valid; otherwise, returns an error.
 pub async fn verify_activation_code(
     redis_client: &RedisClient,
     code: &str
 ) -> Result<String, ApiError> {
-    info!("Verifying activation code");
+    log_debug!("Account Activation", "Begin code verification", "success");
     
-    // Get Redis connection
-    let mut conn = redis_client.get_async_connection().await
-        .map_err(|e| {
-            error!("Redis connection error during verification: {}", e);
-            ApiError::internal_error(&format!("Service unavailable - please try again later"))
-        })?;
+    let mut conn = redis_client.get_async_connection().await.map_err(|_| {
+        log_error!("Account Activation", "Acquiring Redis connection failed", "failure");
+        REDIS_OPERATIONS.with_label_values(&["connection", "failure"]).inc();
+        ApiError::internal_error("Service unavailable - please try again later")
+    })?;
     
-    // Construct the key to look up
+    REDIS_OPERATIONS.with_label_values(&["connection", "success"]).inc();
     let key = format!("activation:code:{}", code);
+    REDIS_OPERATIONS.with_label_values(&["get", "attempt"]).inc();
     
-    // Get the email associated with this code
-    let email: Option<String> = conn.get(&key).await
-        .map_err(|e| {
-            error!("Failed to query Redis for activation code: {}", e);
-            ApiError::internal_error(&format!("Failed to verify activation code"))
-        })?;
+    let email: Option<String> = conn.get(&key).await.map_err(|_| {
+        log_error!("Account Activation", "Lookup of activation code failed", "failure");
+        REDIS_OPERATIONS.with_label_values(&["get", "failure"]).inc();
+        ApiError::internal_error("Failed to verify activation code")
+    })?;
     
+    REDIS_OPERATIONS.with_label_values(&["get", "success"]).inc();
     match email {
         Some(email) => {
-            info!("Valid activation code found for {}", email);
-            
-            // Delete the code after successful verification to prevent reuse
-            let _: () = conn.del(&key).await
-                .map_err(|e| {
-                    error!("Failed to delete used activation code: {}", e);
-                    ApiError::internal_error("Failed to complete activation process")
-                })?;
-            
-            info!("Activation code verified and deleted for {}", email);
+            log_debug!("Account Activation", "Valid code found", "success");
+            REDIS_OPERATIONS.with_label_values(&["del", "attempt"]).inc();
+            let _: () = conn.del(&key).await.map_err(|_| {
+                log_error!("Account Activation", "Deleting activation code failed", "failure");
+                REDIS_OPERATIONS.with_label_values(&["del", "failure"]).inc();
+                ApiError::internal_error("Failed to complete activation process")
+            })?;
+            REDIS_OPERATIONS.with_label_values(&["del", "success"]).inc();
+            log_info!("Account Activation", "Activation code verified and deleted", "success");
             Ok(email)
         },
         None => {
-            info!("Invalid or expired activation code");
+            log_warn!("Account Activation", "Activation code invalid or expired", "failure");
+            REDIS_OPERATIONS.with_label_values(&["get", "not_found"]).inc();
             Err(ApiError::bad_request_error("Invalid or expired activation code"))
         }
     }
