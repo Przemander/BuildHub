@@ -11,15 +11,15 @@
 //! - Clear module and function documentation with Rust doc comments.
 //! - Structured logging using log_debug, log_info, log_warn, and log_error.
 //! - Metrics integration to track token operations and validations.
-//! - Consistent error handling using a custom ApiError type.
+//! - Consistent error handling using domain errors and ServiceError internally.
 
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation, Algorithm};
 use serde::{Deserialize, Serialize};
 use std::env;
 use chrono::{Duration, Utc};
 use crate::{log_info, log_warn, log_error, log_debug};
-use crate::utils::errors::ApiError;
 use crate::utils::metrics::{TOKEN_OPERATIONS, TOKEN_VALIDATIONS};
+use crate::utils::errors::{ServiceError, JwtError};
 
 /// Claims structure for JWT tokens.
 /// 
@@ -46,12 +46,12 @@ pub const TOKEN_TYPE_REFRESH: &str = "refresh";
 /// * `expires_in` - Optional custom expiration duration.
 ///
 /// # Returns
-/// * `Result<String, ApiError>` containing the generated JWT or error.
+/// * `Result<String, ServiceError>` containing the generated JWT or error.
 pub fn generate_token(
     username: &str,
     token_type: &str,
     expires_in: Option<Duration>,
-) -> Result<String, ApiError> {
+) -> Result<String, ServiceError> {
     log_debug!("Token Management", "Begin token generation", "attempt");
     TOKEN_OPERATIONS.with_label_values(&["generate", "attempt"]).inc();
 
@@ -92,7 +92,7 @@ pub fn generate_token(
     let secret = env::var("JWT_SECRET").map_err(|_| {
         log_error!("Token Management", "JWT secret configuration", "failure");
         TOKEN_OPERATIONS.with_label_values(&["generate", "failure"]).inc();
-        ApiError::configuration_error("JWT secret is not configured")
+        ServiceError::Jwt(JwtError::Configuration("JWT secret is not configured".to_string()))
     })?;
 
     let mut header = Header::default();
@@ -102,7 +102,7 @@ pub fn generate_token(
         .map_err(|_| {
             log_error!("Token Management", "Token encoding", "failure");
             TOKEN_OPERATIONS.with_label_values(&["generate", "failure"]).inc();
-            ApiError::internal_error("Failed to generate token")
+            ServiceError::Jwt(JwtError::Internal("Failed to generate token".to_string()))
         })
         .map(|token| {
             log_debug!("Token Management", "Token encoding", "success");
@@ -117,15 +117,15 @@ pub fn generate_token(
 /// * `token` - JWT token string.
 ///
 /// # Returns
-/// * `Result<TokenClaims, ApiError>` containing token claims or error.
-pub fn decode_token(token: &str) -> Result<TokenClaims, ApiError> {
+/// * `Result<TokenClaims, ServiceError>` containing token claims or error.
+pub fn decode_token(token: &str) -> Result<TokenClaims, ServiceError> {
     log_debug!("Token Management", "Begin token decoding", "attempt");
     TOKEN_VALIDATIONS.with_label_values(&["decode", "attempt"]).inc();
 
     let secret = env::var("JWT_SECRET").map_err(|_| {
         log_error!("Token Management", "JWT secret configuration", "failure");
         TOKEN_VALIDATIONS.with_label_values(&["decode", "failure"]).inc();
-        ApiError::configuration_error("JWT secret is not configured")
+        ServiceError::Jwt(JwtError::Configuration("JWT secret is not configured".to_string()))
     })?;
 
     let mut validation = Validation::new(Algorithm::HS256);
@@ -143,22 +143,22 @@ pub fn decode_token(token: &str) -> Result<TokenClaims, ApiError> {
         data.claims
     })
     .map_err(|e| {
-        let error_resp = match e.kind() {
+        let err = match e.kind() {
             jsonwebtoken::errors::ErrorKind::ExpiredSignature => {
                 log_debug!("Token Management", "Token expiration check", "failure");
-                ApiError::unauthorized_error("Token has expired")
+                JwtError::Expired
             },
             jsonwebtoken::errors::ErrorKind::InvalidSignature => {
                 log_warn!("Token Management", "Token signature verification", "failure");
-                ApiError::unauthorized_error("Invalid token signature")
+                JwtError::InvalidSignature
             },
             _ => {
                 log_error!("Token Management", "Token decoding", "failure");
-                ApiError::unauthorized_error("Invalid token")
+                JwtError::Invalid
             }
         };
         TOKEN_VALIDATIONS.with_label_values(&["decode", "failure"]).inc();
-        error_resp
+        ServiceError::Jwt(err)
     })
 }
 
@@ -169,11 +169,11 @@ pub fn decode_token(token: &str) -> Result<TokenClaims, ApiError> {
 /// * `redis_client` - Redis client for blocklist checking.
 ///
 /// # Returns
-/// * `Result<TokenClaims, ApiError>` containing token claims or error.
+/// * `Result<TokenClaims, ServiceError>` containing token claims or error.
 pub async fn validate_token(
     token: &str,
     redis_client: &redis::Client,
-) -> Result<TokenClaims, ApiError> {
+) -> Result<TokenClaims, ServiceError> {
     log_debug!("Token Management", "Begin token validation", "attempt");
     TOKEN_VALIDATIONS.with_label_values(&["validate", "attempt"]).inc();
 
@@ -184,7 +184,7 @@ pub async fn validate_token(
             if is_blocked {
                 log_debug!("Token Management", "Token revocation check", "failure");
                 TOKEN_VALIDATIONS.with_label_values(&["validate", "revoked"]).inc();
-                return Err(ApiError::unauthorized_error("Token has been revoked"));
+                return Err(ServiceError::Jwt(JwtError::Revoked));
             }
         },
         Err(_) => {
@@ -196,12 +196,12 @@ pub async fn validate_token(
     if claims.exp < now {
         log_debug!("Token Management", "Token expiration check", "failure");
         TOKEN_VALIDATIONS.with_label_values(&["validate", "expired"]).inc();
-        return Err(ApiError::unauthorized_error("Token has expired"));
+        return Err(ServiceError::Jwt(JwtError::Expired));
     }
     if claims.iat > now + 60 {
         log_warn!("Token Management", "Token issue time check", "failure");
         TOKEN_VALIDATIONS.with_label_values(&["validate", "invalid_iat"]).inc();
-        return Err(ApiError::unauthorized_error("Invalid token issue time"));
+        return Err(ServiceError::Jwt(JwtError::InvalidIat));
     }
 
     log_info!("Token Management", "Token validation complete", "success");
@@ -216,11 +216,11 @@ pub async fn validate_token(
 /// * `redis_client` - Redis client for the blocklist.
 ///
 /// # Returns
-/// * `Result<(), ApiError>` indicating success or error.
+/// * `Result<(), ServiceError>` indicating success or error.
 pub async fn revoke_token(
     token: &str,
     redis_client: &redis::Client,
-) -> Result<(), ApiError> {
+) -> Result<(), ServiceError> {
     log_debug!("Token Management", "Begin token revocation", "attempt");
     TOKEN_OPERATIONS.with_label_values(&["revoke", "attempt"]).inc();
 
@@ -239,7 +239,7 @@ pub async fn revoke_token(
         .map_err(|_| {
             log_error!("Token Management", "Redis token blocking", "failure");
             TOKEN_OPERATIONS.with_label_values(&["revoke", "failure"]).inc();
-            ApiError::internal_error("Failed to revoke token")
+            ServiceError::Jwt(JwtError::Internal("Failed to revoke token".to_string()))
         })?;
 
     log_info!("Token Management", "Token revocation complete", "success");

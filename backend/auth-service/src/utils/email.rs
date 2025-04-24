@@ -10,40 +10,35 @@ use lettre::transport::smtp::authentication::Credentials;
 use std::env;
 use redis::{AsyncCommands, Client as RedisClient};
 use crate::{log_info, log_warn, log_error, log_debug};
-use crate::utils::errors::ApiError;
+use crate::utils::errors::{ServiceError, EmailError};
 use crate::utils::metrics::{EMAILS_SENT, REDIS_OPERATIONS};
 
 /// Configuration for sending emails via SMTP.
 #[derive(Clone)]
 pub struct EmailConfig {
-    /// The email address used as the sender for all outgoing emails.
     from_address: String,
-    /// The configured SMTP transport client.
     mailer: SmtpTransport,
 }
 
 impl EmailConfig {
     /// Creates a new EmailConfig instance from environment variables.
-    ///
-    /// Reads SMTP_SERVER, SMTP_USERNAME, SMTP_PASSWORD, and SMTP_FROM_ADDRESS.
-    /// Logs and records metric events for configuration initialization.
-    pub fn new() -> Result<Self, ApiError> {
+    pub fn new() -> Result<Self, ServiceError> {
         let smtp_server = env::var("SMTP_SERVER").map_err(|_| {
             log_error!("Email Configuration", "SMTP server variable missing", "failure");
             EMAILS_SENT.with_label_values(&["config", "failure"]).inc();
-            ApiError::configuration_error("SMTP_SERVER must be set")
+            ServiceError::Email(EmailError::Configuration("SMTP_SERVER must be set".to_string()))
         })?;
         
         let smtp_username = env::var("SMTP_USERNAME").map_err(|_| {
             log_error!("Email Configuration", "SMTP username variable missing", "failure");
             EMAILS_SENT.with_label_values(&["config", "failure"]).inc();
-            ApiError::configuration_error("SMTP_USERNAME must be set")
+            ServiceError::Email(EmailError::Configuration("SMTP_USERNAME must be set".to_string()))
         })?;
         
         let smtp_password = env::var("SMTP_PASSWORD").map_err(|_| {
             log_error!("Email Configuration", "SMTP password variable missing", "failure");
             EMAILS_SENT.with_label_values(&["config", "failure"]).inc();
-            ApiError::configuration_error("SMTP_PASSWORD must be set")
+            ServiceError::Email(EmailError::Configuration("SMTP_PASSWORD must be set".to_string()))
         })?;
         
         let from_address = env::var("SMTP_FROM_ADDRESS")
@@ -55,7 +50,7 @@ impl EmailConfig {
         let mailer = SmtpTransport::relay(&smtp_server).map_err(|_| {
             log_error!("Email Configuration", "Creation of SMTP transport failed", "failure");
             EMAILS_SENT.with_label_values(&["transport_init", "failure"]).inc();
-            ApiError::internal_error("Failed to create email transport")
+            ServiceError::Email(EmailError::Internal("Failed to create email transport".to_string()))
         })?
         .credentials(creds)
         .build();
@@ -67,15 +62,12 @@ impl EmailConfig {
     }
 
     /// Sends an activation email containing the provided activation code.
-    ///
-    /// Generates an activation link, builds the email message, stores the activation code in Redis,
-    /// and sends the email. If Redis storage fails, email is still sent.
     pub async fn send_activation_email(
         &self, 
         to_email: &str, 
         activation_code: &str,
         redis_client: &RedisClient
-    ) -> Result<(), ApiError> {
+    ) -> Result<(), ServiceError> {
         log_debug!("Account Activation", "Begin email send process", "success");
         
         let activation_link = generate_activation_link(activation_code);
@@ -92,24 +84,24 @@ impl EmailConfig {
             .from(self.from_address.parse().map_err(|_| {
                 log_error!("Account Activation", "Parsing sender address failed", "failure");
                 EMAILS_SENT.with_label_values(&["addressing", "failure"]).inc();
-                ApiError::internal_error("Invalid from address")
+                ServiceError::Email(EmailError::Internal("Invalid from address".to_string()))
             })?)
             .to(to_email.parse().map_err(|_| {
                 log_error!("Account Activation", "Parsing recipient address failed", "failure");
                 EMAILS_SENT.with_label_values(&["addressing", "failure"]).inc();
-                ApiError::internal_error("Invalid recipient address")
+                ServiceError::Email(EmailError::Internal("Invalid recipient address".to_string()))
             })?)
             .subject("Activate Your BuildHub Account")
             .body(email_body)
             .map_err(|_| {
                 log_error!("Account Activation", "Building email message failed", "failure");
                 EMAILS_SENT.with_label_values(&["build", "failure"]).inc();
-                ApiError::internal_error("Failed to build email")
+                ServiceError::Email(EmailError::Internal("Failed to build email".to_string()))
             })?;
 
         // Attempt to store the activation code in Redis.
-        if let Err(_) = store_activation_code(redis_client, to_email, activation_code).await {
-            log_error!("Account Activation", "Storing activation code in Redis failed", "failure");
+        if let Err(e) = store_activation_code(redis_client, to_email, activation_code).await {
+            log_error!("Account Activation", &format!("Storing activation code in Redis failed: {e}"), "failure");
             // Proceed to send email even if code storage fails.
         }
 
@@ -117,7 +109,7 @@ impl EmailConfig {
         self.mailer.send(&email).map_err(|_| {
             log_error!("Account Activation", "Sending email failed", "failure");
             EMAILS_SENT.with_label_values(&["activation", "failure"]).inc();
-            ApiError::internal_error("Failed to send activation email")
+            ServiceError::Email(EmailError::Internal("Failed to send activation email".to_string()))
         })?;
 
         log_info!("Account Activation", "Activation email sent", "success");
@@ -144,18 +136,17 @@ pub fn generate_activation_link(activation_code: &str) -> String {
 }
 
 /// Stores an activation code in Redis with an expiration of 24 hours.
-/// The activation code is stored under a key prefixed with "activation:code:".
 pub async fn store_activation_code(
     redis_client: &RedisClient,
     email: &str,
     code: &str
-) -> Result<(), ApiError> {
+) -> Result<(), ServiceError> {
     log_debug!("Account Activation", "Begin code storage", "success");
     
     let mut conn = redis_client.get_async_connection().await.map_err(|_| {
         log_error!("Account Activation", "Acquiring Redis connection failed", "failure");
         REDIS_OPERATIONS.with_label_values(&["connection", "failure"]).inc();
-        ApiError::internal_error("Service unavailable - please try again later")
+        ServiceError::Email(EmailError::Internal("Service unavailable - please try again later".to_string()))
     })?;
     
     REDIS_OPERATIONS.with_label_values(&["connection", "success"]).inc();
@@ -166,7 +157,7 @@ pub async fn store_activation_code(
     conn.set_ex::<_, _, ()>(key, email, EXPIRY as usize).await.map_err(|_| {
         log_error!("Account Activation", "Storing key in Redis failed", "failure");
         REDIS_OPERATIONS.with_label_values(&["set_ex", "failure"]).inc();
-        ApiError::internal_error("Failed to complete registration. Please try again later.")
+        ServiceError::Email(EmailError::Internal("Failed to complete registration. Please try again later.".to_string()))
     })?;
     
     REDIS_OPERATIONS.with_label_values(&["set_ex", "success"]).inc();
@@ -175,17 +166,16 @@ pub async fn store_activation_code(
 }
 
 /// Verifies an activation code by retrieving and then deleting the associated email in Redis.
-/// Returns the email if the code is valid; otherwise, returns an error.
 pub async fn verify_activation_code(
     redis_client: &RedisClient,
     code: &str
-) -> Result<String, ApiError> {
+) -> Result<String, ServiceError> {
     log_debug!("Account Activation", "Begin code verification", "success");
     
     let mut conn = redis_client.get_async_connection().await.map_err(|_| {
         log_error!("Account Activation", "Acquiring Redis connection failed", "failure");
         REDIS_OPERATIONS.with_label_values(&["connection", "failure"]).inc();
-        ApiError::internal_error("Service unavailable - please try again later")
+        ServiceError::Email(EmailError::Internal("Service unavailable - please try again later".to_string()))
     })?;
     
     REDIS_OPERATIONS.with_label_values(&["connection", "success"]).inc();
@@ -195,7 +185,7 @@ pub async fn verify_activation_code(
     let email: Option<String> = conn.get(&key).await.map_err(|_| {
         log_error!("Account Activation", "Lookup of activation code failed", "failure");
         REDIS_OPERATIONS.with_label_values(&["get", "failure"]).inc();
-        ApiError::internal_error("Failed to verify activation code")
+        ServiceError::Email(EmailError::Internal("Failed to verify activation code".to_string()))
     })?;
     
     REDIS_OPERATIONS.with_label_values(&["get", "success"]).inc();
@@ -206,7 +196,7 @@ pub async fn verify_activation_code(
             let _: () = conn.del(&key).await.map_err(|_| {
                 log_error!("Account Activation", "Deleting activation code failed", "failure");
                 REDIS_OPERATIONS.with_label_values(&["del", "failure"]).inc();
-                ApiError::internal_error("Failed to complete activation process")
+                ServiceError::Email(EmailError::Internal("Failed to complete activation process".to_string()))
             })?;
             REDIS_OPERATIONS.with_label_values(&["del", "success"]).inc();
             log_info!("Account Activation", "Activation code verified and deleted", "success");
@@ -215,7 +205,7 @@ pub async fn verify_activation_code(
         None => {
             log_warn!("Account Activation", "Activation code invalid or expired", "failure");
             REDIS_OPERATIONS.with_label_values(&["get", "not_found"]).inc();
-            Err(ApiError::bad_request_error("Invalid or expired activation code"))
+            Err(ServiceError::Email(EmailError::InvalidCode("Invalid or expired activation code".to_string())))
         }
     }
 }

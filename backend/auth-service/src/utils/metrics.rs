@@ -4,248 +4,221 @@
 //! covering authentication, token operations, database and Redis usage,
 //! email transactions, HTTP request measurements, logging statistics, and
 //! user operations. Its data helps monitor performance, reliability, and usage.
-//!
-//! Usage:
-//! 1. Call `metrics::init()` during startup to force initialization.
-//! 2. Use `gather_metrics()` to output the metrics in Prometheus text format,
-//!    for instance via a `/metrics` HTTP endpoint.
-//! 3. Update metrics as needed in your code by importing the appropriate static ref.
 
 use lazy_static::lazy_static;
 use prometheus::{
     register_counter_vec, register_histogram, register_histogram_vec, register_gauge,
-    register_gauge_vec, CounterVec, Histogram, HistogramVec, Gauge, GaugeVec, Registry, Encoder,
+    register_gauge_vec, CounterVec, Histogram, HistogramVec, Gauge, GaugeVec, Encoder,
     TextEncoder,
 };
-use std::sync::Mutex;
-
-// Global registry for all metrics.
-lazy_static! {
-    static ref REGISTRY: Mutex<Registry> = Mutex::new(Registry::new());
-}
 
 // ===== Authentication Metrics =====
 lazy_static! {
-    /// Tracks login attempts by result (e.g. "success" or "failure").
     pub static ref AUTH_LOGIN_ATTEMPTS: CounterVec = register_counter_vec!(
         "auth_login_attempts_total", 
         "Number of login attempts",
-        &["result"]
-    ).unwrap();
+        &["result"] // result: "success", "failure"
+    ).expect("Failed to register AUTH_LOGIN_ATTEMPTS");
 
-    /// Tracks registration attempts by result.
     pub static ref AUTH_REGISTRATIONS: CounterVec = register_counter_vec!(
         "auth_registrations_total", 
         "Number of registration attempts",
-        &["result"]
-    ).unwrap();
+        &["result"] // result: "success", "validation_error", "already_exists", "system_error"
+    ).expect("Failed to register AUTH_REGISTRATIONS");
 
-    /// Tracks account activations by result.
     pub static ref AUTH_ACTIVATIONS: CounterVec = register_counter_vec!(
         "auth_activations_total", 
         "Number of account activation attempts",
-        &["result"]
-    ).unwrap();
+        &["result"] // result: "success", "invalid_code", "user_not_found", "already_active", "system_error"
+    ).expect("Failed to register AUTH_ACTIVATIONS");
 
-    /// Tracks password reset operations.
     pub static ref AUTH_PASSWORD_RESETS: CounterVec = register_counter_vec!(
         "auth_password_resets_total", 
         "Number of password reset operations",
-        &["operation", "result"]
-    ).unwrap();
+        &["operation", "result"] // operation: "request", "complete"; result: "success", "failure"
+    ).expect("Failed to register AUTH_PASSWORD_RESETS");
 }
 
 // ===== JWT Authentication Metrics =====
 lazy_static! {
-    /// Tracks total JWT authentication attempts.
     pub static ref JWT_AUTH_ATTEMPTS: CounterVec = register_counter_vec!(
         "auth_jwt_auth_attempts_total",
         "Total number of JWT authentication attempts",
-        &["result"] // e.g. "attempt"
-    ).unwrap();
+        &["result"] // result: "success", "failure"
+    ).expect("Failed to register JWT_AUTH_ATTEMPTS");
 
-    /// Tracks successful JWT authentications.
     pub static ref JWT_AUTH_SUCCESS: CounterVec = register_counter_vec!(
         "auth_jwt_auth_success_total",
         "Total number of successful JWT authentications",
-        &["result"] // e.g. "success"
-    ).unwrap();
+        &["result"] // result: "success"
+    ).expect("Failed to register JWT_AUTH_SUCCESS");
 
-    /// Tracks failed JWT authentications.
     pub static ref JWT_AUTH_FAILURE: CounterVec = register_counter_vec!(
         "auth_jwt_auth_failure_total",
         "Total number of failed JWT authentications",
-        &["reason"] // e.g. "missing_header", "invalid_format", etc.
-    ).unwrap();
+        &["reason"] // reason: "expired", "invalid", "revoked", etc.
+    ).expect("Failed to register JWT_AUTH_FAILURE");
 }
 
 // ===== Token Metrics =====
 lazy_static! {
-    /// Tracks token operations by type and operation (e.g. "generate", "revoke").
     pub static ref TOKEN_OPERATIONS: CounterVec = register_counter_vec!(
         "auth_token_operations_total", 
         "Number of token operations",
-        &["type", "operation"]
-    ).unwrap();
+        &["type", "operation"] // type: "access", "refresh", "any"; operation: "generate", "revoke", "error", etc.
+    ).expect("Failed to register TOKEN_OPERATIONS");
 
-    /// Tracks token validations with results.
     pub static ref TOKEN_VALIDATIONS: CounterVec = register_counter_vec!(
         "auth_token_validations_total", 
         "Number of token validations",
-        &["result"]
-    ).unwrap();
+        &["result"] // result: "valid", "invalid", "expired", "revoked", "wrong_type"
+    ).expect("Failed to register TOKEN_VALIDATIONS");
 
-    /// Tracks currently active tokens by type.
     pub static ref ACTIVE_TOKENS: GaugeVec = register_gauge_vec!(
         "auth_active_tokens", 
         "Number of active tokens",
-        &["type"]
-    ).unwrap();
+        &["type"] // type: "access", "refresh"
+    ).expect("Failed to register ACTIVE_TOKENS");
 }
 
 // ===== Database Metrics =====
 lazy_static! {
-    /// Tracks database operations by type and result.
     pub static ref DB_OPERATIONS: CounterVec = register_counter_vec!(
         "auth_db_operations_total", 
         "Number of database operations",
-        &["operation", "result"]
-    ).unwrap();
+        &["operation", "result"] // operation: "connection", "query", "insert", "update", "migration"; result: "success", "failure", "attempt"
+    ).expect("Failed to register DB_OPERATIONS");
 
-    /// Gauge indicating database health (1 = healthy, 0 = unhealthy).
     pub static ref DB_HEALTH: Gauge = register_gauge!(
         "auth_db_health", 
         "Database health status (1 = healthy, 0 = unhealthy)"
-    ).unwrap();
+    ).expect("Failed to register DB_HEALTH");
 
-    /// Tracks statistics of the database connection pool by state.
     pub static ref DB_POOL_SIZE: GaugeVec = register_gauge_vec!(
         "auth_db_pool", 
         "Database connection pool statistics",
-        &["state"] // e.g. "in_use", "idle", "total"
-    ).unwrap();
+        &["state"] // state: "used", "idle"
+    ).expect("Failed to register DB_POOL_SIZE");
 }
 
 // ===== Redis/Cache Metrics =====
 lazy_static! {
-    /// Tracks Redis operations by type and result.
     pub static ref REDIS_OPERATIONS: CounterVec = register_counter_vec!(
         "auth_redis_operations_total", 
         "Number of Redis operations",
-        &["operation", "result"]
-    ).unwrap();
+        &["operation", "result"] // operation: "init", "get", "set_ex", "del", "ping", "block_token", "is_token_blocked", "connection"; result: "success", "failure", "not_found", "attempt"
+    ).expect("Failed to register REDIS_OPERATIONS");
 
-    /// Gauge indicating Redis connection health (1 = connected, 0 = disconnected).
     pub static ref REDIS_HEALTH: Gauge = register_gauge!(
         "auth_redis_health", 
         "Redis connection health (1 = connected, 0 = disconnected)"
-    ).unwrap();
+    ).expect("Failed to register REDIS_HEALTH");
 }
 
 // ===== Email Metrics =====
 lazy_static! {
-    /// Tracks emails sent grouped by type and result (e.g. "activation", "success").
     pub static ref EMAILS_SENT: CounterVec = register_counter_vec!(
         "auth_emails_sent_total", 
         "Number of emails sent",
-        &["type", "result"]
-    ).unwrap();
+        &["type", "result"] // type: "activation", "reset", "config", "build", "addressing"; result: "success", "failure", "attempt"
+    ).expect("Failed to register EMAILS_SENT");
 }
 
 // ===== Request/Response Metrics =====
 lazy_static! {
-    /// Histogram measuring request durations (in seconds) by endpoint and status.
     pub static ref REQUEST_DURATION: HistogramVec = register_histogram_vec!(
         "auth_request_duration_seconds", 
         "Request duration in seconds",
-        &["endpoint", "status"],
+        &["endpoint", "status"], // endpoint: static route names only; status: HTTP status code as string
         vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
-    ).unwrap();
+    ).expect("Failed to register REQUEST_DURATION");
 
-    /// Counter for total HTTP requests by endpoint, method, and status.
     pub static ref REQUESTS_TOTAL: CounterVec = register_counter_vec!(
         "auth_requests_total", 
         "Total number of HTTP requests",
-        &["endpoint", "method", "status"]
-    ).unwrap();
+        &["endpoint", "method", "status"] // endpoint: static route names only; method: "GET", "POST", etc.; status: HTTP status code as string
+    ).expect("Failed to register REQUESTS_TOTAL");
 
-    /// Gauge for currently active HTTP requests.
     pub static ref ACTIVE_REQUESTS: Gauge = register_gauge!(
         "auth_active_requests", 
         "Number of currently active requests"
-    ).unwrap();
+    ).expect("Failed to register ACTIVE_REQUESTS");
 }
 
 // ===== System Metrics =====
 lazy_static! {
-    /// Counts log entries generated, grouped by log level (e.g. "info", "error").
     pub static ref LOG_ENTRIES: CounterVec = register_counter_vec!(
         "auth_log_entries_total", 
         "Number of log entries generated",
-        &["level"]
-    ).unwrap();
+        &["level"] // level: "info", "warn", "error", "debug"
+    ).expect("Failed to register LOG_ENTRIES");
 
-    /// Histogram capturing log processing times (in seconds).
     pub static ref LOG_PROCESSING_TIME: Histogram = register_histogram!(
         "auth_log_processing_seconds", 
         "Time spent processing logs",
         vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]
-    ).unwrap();
+    ).expect("Failed to register LOG_PROCESSING_TIME");
 
-    /// Tracks log channel usage (e.g. "accepted" versus "dropped").
     pub static ref LOG_CHANNEL_USAGE: CounterVec = register_counter_vec!(
         "auth_log_channel_usage", 
         "Log channel usage statistics",
-        &["status"]
-    ).unwrap();
+        &["status"] // status: "success", "failure"
+    ).expect("Failed to register LOG_CHANNEL_USAGE");
 }
 
 // ===== User Metrics =====
 lazy_static! {
-    /// Gauge for total registered users.
     pub static ref TOTAL_USERS: Gauge = register_gauge!(
         "auth_total_users", 
         "Total number of registered users"
-    ).unwrap();
+    ).expect("Failed to register TOTAL_USERS");
 
-    /// Gauge for active user sessions.
     pub static ref ACTIVE_SESSIONS: Gauge = register_gauge!(
         "auth_active_sessions", 
         "Number of active user sessions"
-    ).unwrap();
+    ).expect("Failed to register ACTIVE_SESSIONS");
 
-    /// Tracks user operations (e.g. update, delete) by operation name and result.
-    pub static ref USER_OPERATIONS: CounterVec = register_counter_vec!(
-        "auth_user_operations_total", 
-        "Number of user operations",
-        &["operation", "result"]
-    ).unwrap();
+    // Commented out: Remove or enable only if you have a clear use case.
+    // pub static ref USER_OPERATIONS: CounterVec = register_counter_vec!(
+    //     "auth_user_operations_total", 
+    //     "Number of user operations",
+    //     &["operation", "result"]
+    // ).expect("Failed to register USER_OPERATIONS");
 }
 
 // ===== Validation Metrics =====
 lazy_static! {
-    /// Tracks input validation operations by field and result.
     pub static ref VALIDATION_OPERATIONS: CounterVec = register_counter_vec!(
         "auth_validation_operations_total", 
         "Number of input validation operations",
-        &["field", "result"]
-    ).unwrap();
+        &["field", "result"] // field: "username", "email", "password"; result: "success", "failure"
+    ).expect("Failed to register VALIDATION_OPERATIONS");
 
-    /// Histogram capturing validation execution times (in seconds) per field.
     pub static ref VALIDATION_TIMING: HistogramVec = register_histogram_vec!(
         "auth_validation_seconds",
         "Time spent on input validation operations",
-        &["field"],
+        &["field"], // field: "username", "email", "password"
         vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1]
-    ).unwrap();
+    ).expect("Failed to register VALIDATION_TIMING");
 
-    /// Gauge for application build information (e.g. version and commit).
-    pub static ref APP_INFO: GaugeVec = register_gauge_vec!(
-        "auth_app_info", 
-        "Application build information",
-        &["version", "commit"]
-    ).unwrap();
+    // Commented out: Remove or enable only if you have a clear use case.
+    // pub static ref APP_INFO: GaugeVec = register_gauge_vec!(
+    //     "auth_app_info", 
+    //     "Application build information",
+    //     &["version", "commit"]
+    // ).expect("Failed to register APP_INFO");
 }
+
+// ===== Rate Limiting Metrics =====
+use once_cell::sync::Lazy;
+
+pub static RATE_LIMIT_BLOCKS: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "rate_limit_blocks",
+        "Number of requests blocked by rate limiting",
+        &["endpoint"]
+    ).unwrap()
+});
 
 /// Initialize all metrics.
 /// Call this function early in the application startup to force registration.
@@ -274,94 +247,51 @@ pub fn init() {
     let _ = &LOG_CHANNEL_USAGE;
     let _ = &TOTAL_USERS;
     let _ = &ACTIVE_SESSIONS;
-    let _ = &USER_OPERATIONS;
+    // let _ = &USER_OPERATIONS;
     let _ = &VALIDATION_OPERATIONS;
     let _ = &VALIDATION_TIMING;
-    let _ = &APP_INFO;
-}
-
-/// Retrieve the metrics registry.
-/// This is used to expose the metrics via an HTTP endpoint.
-pub fn get_registry() -> Registry {
-    let registry = Registry::new();
-    registry.register(Box::new(AUTH_LOGIN_ATTEMPTS.clone())).unwrap();
-    registry.register(Box::new(AUTH_REGISTRATIONS.clone())).unwrap();
-    registry.register(Box::new(AUTH_ACTIVATIONS.clone())).unwrap();
-    registry.register(Box::new(AUTH_PASSWORD_RESETS.clone())).unwrap();
-    registry.register(Box::new(JWT_AUTH_ATTEMPTS.clone())).unwrap();
-    registry.register(Box::new(JWT_AUTH_SUCCESS.clone())).unwrap();
-    registry.register(Box::new(JWT_AUTH_FAILURE.clone())).unwrap();
-    registry.register(Box::new(TOKEN_OPERATIONS.clone())).unwrap();
-    registry.register(Box::new(TOKEN_VALIDATIONS.clone())).unwrap();
-    registry.register(Box::new(ACTIVE_TOKENS.clone())).unwrap();
-    registry.register(Box::new(DB_OPERATIONS.clone())).unwrap();
-    registry.register(Box::new(DB_HEALTH.clone())).unwrap();
-    registry.register(Box::new(DB_POOL_SIZE.clone())).unwrap();
-    registry.register(Box::new(REDIS_OPERATIONS.clone())).unwrap();
-    registry.register(Box::new(REDIS_HEALTH.clone())).unwrap();
-    registry.register(Box::new(EMAILS_SENT.clone())).unwrap();
-    registry.register(Box::new(REQUEST_DURATION.clone())).unwrap();
-    registry.register(Box::new(REQUESTS_TOTAL.clone())).unwrap();
-    registry.register(Box::new(ACTIVE_REQUESTS.clone())).unwrap();
-    registry.register(Box::new(LOG_ENTRIES.clone())).unwrap();
-    registry.register(Box::new(LOG_PROCESSING_TIME.clone())).unwrap();
-    registry.register(Box::new(LOG_CHANNEL_USAGE.clone())).unwrap();
-    registry.register(Box::new(TOTAL_USERS.clone())).unwrap();
-    registry.register(Box::new(ACTIVE_SESSIONS.clone())).unwrap();
-    registry.register(Box::new(USER_OPERATIONS.clone())).unwrap();
-    registry.register(Box::new(VALIDATION_OPERATIONS.clone())).unwrap();
-    registry.register(Box::new(VALIDATION_TIMING.clone())).unwrap();
-    registry.register(Box::new(APP_INFO.clone())).unwrap();
-    registry
+    // let _ = &APP_INFO;
+    let _ = &RATE_LIMIT_BLOCKS;
 }
 
 /// Gather metrics in Prometheus text format.
 /// This can be used as the response body for a /metrics endpoint.
 pub fn gather_metrics() -> String {
     let encoder = TextEncoder::new();
-    let registry = get_registry();
-    let metric_families = registry.gather();
+    let metric_families = prometheus::gather();
     let mut buffer = Vec::new();
     encoder.encode(&metric_families, &mut buffer).unwrap();
     String::from_utf8(buffer).unwrap()
 }
 
-/// Update database health based on health checks.
-/// A healthy database sets the gauge to 1.0, otherwise 0.0.
-pub fn update_db_health(is_healthy: bool) {
-    DB_HEALTH.set(if is_healthy { 1.0 } else { 0.0 });
-}
-
-/// Update Redis health based on connectivity checks.
-pub fn update_redis_health(is_connected: bool) {
-    REDIS_HEALTH.set(if is_connected { 1.0 } else { 0.0 });
-}
-
-/// Update user-related metrics with total registered and active sessions.
-pub fn update_user_metrics(total_users: i64, active_sessions: i64) {
-    TOTAL_USERS.set(total_users as f64);
-    ACTIVE_SESSIONS.set(active_sessions as f64);
-}
-
 /// A simple request timer helper to measure request durations.
 /// The timer starts when the request begins and is completed when the response is sent.
+/// 
+/// # Usage
+/// - Create with `RequestTimer::start(endpoint, method)`.
+/// - Call `set_status()` before completion if you want to record a specific status code.
+/// - Metrics are always recorded on drop, even if the handler returns early.
 pub struct RequestTimer<'a> {
-    timer: prometheus::HistogramTimer,
+    timer: Option<prometheus::HistogramTimer>,
     endpoint: &'a str,
+    method: &'a str,
     status: &'a str,
+    completed: bool,
 }
 
 impl<'a> RequestTimer<'a> {
-    /// Starts a new timer for a given endpoint.
-    pub fn start(endpoint: &'a str) -> Self {
+    /// Starts a new timer for a given endpoint and method.
+    pub fn start(endpoint: &'a str, method: &'a str) -> Self {
         let timer = REQUEST_DURATION
             .with_label_values(&[endpoint, "unknown"])
             .start_timer();
         ACTIVE_REQUESTS.inc();
         Self {
-            timer,
+            timer: Some(timer),
             endpoint,
+            method,
             status: "unknown",
+            completed: false,
         }
     }
     
@@ -371,12 +301,27 @@ impl<'a> RequestTimer<'a> {
     }
     
     /// Completes the timer and records the request metrics.
-    /// The method parameter is used to classify the request (e.g., "GET", "POST").
-    pub fn complete(self, method: &str) {
+    pub fn complete(mut self) {
+        self.record();
+        self.completed = true;
+    }
+
+    fn record(&mut self) {
         ACTIVE_REQUESTS.dec();
         REQUESTS_TOTAL
-            .with_label_values(&[self.endpoint, method, self.status])
+            .with_label_values(&[self.endpoint, self.method, self.status])
             .inc();
-        // The timer automatically observes duration upon drop.
+        if let Some(timer) = self.timer.take() {
+            timer.observe_duration();
+        }
+    }
+}
+
+impl<'a> Drop for RequestTimer<'a> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.record();
+            self.completed = true;
+        }
     }
 }

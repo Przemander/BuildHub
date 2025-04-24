@@ -71,7 +71,7 @@ impl User {
         let parsed_hash = match PasswordHash::new(&self.password_hash) {
             Ok(hash) => hash,
             Err(e) => {
-                log_error!("User Management", "Parse password hash", "failure");
+                log_error!("User Management", &format!("Parse password hash: {}", e), "failure");
                 return Err(e);
             }
         };
@@ -100,7 +100,7 @@ impl User {
                     rows
                 })
                 .map_err(|e| {
-                    log_error!("User Management", "Insert user record", "failure");
+                    log_error!("User Management", &format!("Insert user record: {}", e), "failure");
                     e
                 })
         })
@@ -109,9 +109,7 @@ impl User {
     /// Finds a user by username in the database.
     pub fn find_by_username(conn: &mut SqliteConnection, username_str: &str) -> QueryResult<Self> {
         log_debug!("User Management", "Query user by username", "success");
-        
         use crate::db::schema::users::dsl::*;
-        
         users.filter(username.eq(username_str))
             .first(conn)
             .map(|user| {
@@ -119,7 +117,7 @@ impl User {
                 user
             })
             .map_err(|e| {
-                log_debug!("User Management", "Find user by username", "failure");
+                log_debug!("User Management", &format!("Find user by username: {}", e), "failure");
                 e
             })
     }
@@ -127,9 +125,7 @@ impl User {
     /// Finds a user by email in the database.
     pub fn find_by_email(conn: &mut SqliteConnection, email_str: &str) -> QueryResult<Self> {
         log_debug!("User Management", "Query user by email", "success");
-        
         use crate::db::schema::users::dsl::*;
-        
         users.filter(email.eq(email_str))
             .first(conn)
             .map(|user| {
@@ -137,7 +133,7 @@ impl User {
                 user
             })
             .map_err(|e| {
-                log_debug!("User Management", "Find user by email", "failure");
+                log_debug!("User Management", &format!("Find user by email: {}", e), "failure");
                 e
             })
     }
@@ -145,9 +141,7 @@ impl User {
     /// Activates the user's account by setting `is_active` to true.
     pub fn activate(&self, conn: &mut SqliteConnection) -> Result<(), diesel::result::Error> {
         log_debug!("User Management", "Begin account activation", "success");
-        
         use crate::db::schema::users::dsl::*;
-        
         diesel::update(users.filter(email.eq(&self.email)))
             .set(is_active.eq(true))
             .execute(conn)
@@ -156,7 +150,7 @@ impl User {
                 ()
             })
             .map_err(|e| {
-                log_error!("User Management", "Activate user account", "failure");
+                log_error!("User Management", &format!("Activate user account: {}", e), "failure");
                 e
             })
     }
@@ -164,9 +158,7 @@ impl User {
     /// Updates an existing user record in the database.
     pub fn update(&self, conn: &mut SqliteConnection) -> QueryResult<()> {
         log_debug!("User Management", "Begin user record update", "success");
-        
         use crate::db::schema::users::dsl::*;
-        
         if let Some(user_id) = self.id {
             diesel::update(users.filter(id.eq(user_id)))
                 .set(self)
@@ -176,7 +168,7 @@ impl User {
                     ()
                 })
                 .map_err(|e| {
-                    log_error!("User Management", "Update user record", "failure");
+                    log_error!("User Management", &format!("Update user record: {}", e), "failure");
                     e
                 })
         } else {

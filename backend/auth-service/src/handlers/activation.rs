@@ -17,18 +17,24 @@ use axum::{
 };
 use serde::Deserialize;
 use redis::Client as RedisClient;
-use std::env;
 
 use crate::{log_info, log_warn, log_error, log_debug};
 use crate::app::AppState;
-use crate::config::database::DbPool;
+use crate::config::database::{DbPool, get_connection};
 use crate::db::users::User;
 use crate::utils::email::verify_activation_code;
-use crate::utils::errors::ApiError;
+use crate::utils::errors::{ApiError, ServiceError};
 use crate::utils::metrics::{
     AUTH_ACTIVATIONS, DB_OPERATIONS, REDIS_OPERATIONS,
     REQUESTS_TOTAL, RequestTimer
 };
+
+/// All possible label values for AUTH_ACTIVATIONS:
+/// "success", "already_active", "invalid_code", "user_not_found", "system_error", "service_unavailable"
+/// All possible label values for DB_OPERATIONS:
+/// operation: "connection", "query", "update"; result: "success", "failure"
+/// All possible label values for REDIS_OPERATIONS:
+/// operation: "get", "del", "connection"; result: "success", "failure"
 
 /// Request parameters for account activation.
 #[derive(Debug, Deserialize)]
@@ -37,49 +43,43 @@ pub struct ActivationParams {
 }
 
 /// Handler for account activation requests.
-///
-/// This handler processes the activation by verifying the provided activation code,
-/// updating the corresponding user account, cleaning up the Redis code, and returning
-/// an HTML response to the user.
-///
-/// Returns:
-/// - HTML response indicating success (200) or error (400, 404, or 500).
 pub async fn activate_account_handler(
     Query(params): Query<ActivationParams>,
     State(app_state): State<AppState>,
 ) -> impl IntoResponse {
-    let mut timer = RequestTimer::start("/auth/activate");
+    let mut timer = RequestTimer::start("/auth/activate", "GET");
     REQUESTS_TOTAL.with_label_values(&["/auth/activate", "GET", "pending"]).inc();
 
     log_info!("Account Activation", "Processing activation request", "start");
 
-    // Obtain a database pool and Redis client.
-    let pool = app_state.pool.clone();
-    let redis_client = match app_state.redis_client {
+    // Obtain a database pool and Redis client (prefer references).
+    let pool = &app_state.pool;
+    let redis_client = match &app_state.redis_client {
         Some(client) => client,
         None => {
             log_error!("Account Activation", "Missing Redis client", "failure");
             AUTH_ACTIVATIONS.with_label_values(&["service_unavailable"]).inc();
             timer.set_status("500");
-            timer.complete("GET");
             REQUESTS_TOTAL.with_label_values(&["/auth/activate", "GET", "500"]).inc();
-            return render_error_page(&ApiError::internal_error("Service unavailable"));
+            return render_error_page(&ApiError::service_unavailable_error("Redis client not configured"));
         }
     };
 
     // Process activation logic.
-    match process_activation(pool, redis_client, params.code).await {
-        Ok(email) => {
+    let result = process_activation(pool, redis_client, &params.code).await;
+
+    match result {
+        Ok(_) => {
             log_info!("Account Activation", "Activation completed", "success");
             AUTH_ACTIVATIONS.with_label_values(&["success"]).inc();
             timer.set_status("200");
             REQUESTS_TOTAL.with_label_values(&["/auth/activate", "GET", "200"]).inc();
-            timer.complete("GET");
             render_success_page()
         },
-        Err(error) => {
+        Err(err) => {
             log_warn!("Account Activation", "Activation failed", "failure");
-            let status_code = match error.status.as_str() {
+            let api_error = ApiError::from(err); // FIX: pass owned ServiceError, not reference or clone
+            let status_code = match api_error.status.as_str() {
                 "bad_request" => {
                     AUTH_ACTIVATIONS.with_label_values(&["invalid_code"]).inc();
                     "400"
@@ -95,70 +95,45 @@ pub async fn activate_account_handler(
             };
             timer.set_status(status_code);
             REQUESTS_TOTAL.with_label_values(&["/auth/activate", "GET", status_code]).inc();
-            timer.complete("GET");
-            render_error_page(&error)
+            render_error_page(&api_error)
         }
     }
 }
 
 /// Core activation logic separated for clarity and testability.
-///
-/// # Arguments
-/// * `pool` - The database connection pool.
-/// * `redis_client` - The Redis client for activation code verification.
-/// * `code` - The activation code from the query.
-///
-/// # Returns
-/// On success, returns the email associated with the activated account.
-/// On failure, returns an appropriate ApiError.
 async fn process_activation(
-    pool: DbPool,
-    redis_client: RedisClient,
-    code: String,
-) -> Result<String, ApiError> {
+    pool: &DbPool,
+    redis_client: &RedisClient,
+    code: &str,
+) -> Result<String, ServiceError> {
     log_debug!("Account Activation", "Start activation process", "debug");
 
     // Verify the activation code in Redis and retrieve email.
-    let email = match verify_activation_code(&redis_client, &code).await {
-        Ok(email) => {
-            REDIS_OPERATIONS.with_label_values(&["get", "success"]).inc();
-            log_info!("Account Activation", "Activation code verified", "success");
-            email
-        },
-        Err(_) => {
-            REDIS_OPERATIONS.with_label_values(&["get", "failure"]).inc();
-            log_warn!("Account Activation", "Activation code verification failed", "failure");
-            return Err(ApiError::bad_request_error("Invalid or expired activation code"));
-        }
-    };
+    let email = verify_activation_code(redis_client, code).await.map_err(|err| {
+        REDIS_OPERATIONS.with_label_values(&["get", "failure"]).inc();
+        log_warn!("Account Activation", &format!("Activation code verification failed: {}", err), "failure");
+        err
+    })?;
+
+    REDIS_OPERATIONS.with_label_values(&["get", "success"]).inc();
+    log_info!("Account Activation", "Activation code verified", "success");
 
     // Obtain a database connection.
-    let mut conn = match pool.get() {
-        Ok(conn) => {
-            DB_OPERATIONS.with_label_values(&["connection", "success"]).inc();
-            log_debug!("Account Activation", "Database connection established", "debug");
-            conn
-        },
-        Err(_) => {
-            DB_OPERATIONS.with_label_values(&["connection", "failure"]).inc();
-            log_error!("Account Activation", "Failed to get database connection", "failure");
-            return Err(ApiError::internal_error("Database connection error"));
-        }
-    };
+    let mut conn = get_connection(pool).map_err(|_| {
+        DB_OPERATIONS.with_label_values(&["connection", "failure"]).inc();
+        log_error!("Account Activation", "Failed to get database connection", "failure");
+        ServiceError::Internal("Database connection failed".to_string())
+    })?;
 
     // Find the user by email.
-    let mut user = match User::find_by_email(&mut conn, &email) {
-        Ok(user) => {
-            DB_OPERATIONS.with_label_values(&["query", "success"]).inc();
-            log_debug!("Account Activation", "User found", "debug");
-            user
-        },
-        Err(_) => {
-            DB_OPERATIONS.with_label_values(&["query", "failure"]).inc();
-            log_warn!("Account Activation", "User not found", "failure");
-            return Err(ApiError::not_found_error("User account"));
-        }
-    };
+    let mut user = User::find_by_email(&mut conn, &email).map_err(|_err| {
+        DB_OPERATIONS.with_label_values(&["query", "failure"]).inc();
+        log_warn!("Account Activation", "User not found", "failure");
+        ServiceError::NotFound("User not found".to_string())
+    })?;
+
+    DB_OPERATIONS.with_label_values(&["query", "success"]).inc();
+    log_debug!("Account Activation", "User found", "debug");
 
     // If the user is already active, return the email immediately.
     if let Some(is_active) = user.is_active {
@@ -172,19 +147,36 @@ async fn process_activation(
 
     // Mark the user as active.
     user.is_active = Some(true);
-    match user.update(&mut conn) {
-        Ok(_) => {
-            DB_OPERATIONS.with_label_values(&["update", "success"]).inc();
-            log_info!("Account Activation", "User account activated", "success");
-        },
-        Err(_) => {
-            DB_OPERATIONS.with_label_values(&["update", "failure"]).inc();
-            log_error!("Account Activation", "Failed to update account", "failure");
-            return Err(ApiError::internal_error("Failed to activate account"));
+    user.update(&mut conn).map_err(|err| {
+        DB_OPERATIONS.with_label_values(&["update", "failure"]).inc();
+        log_error!("Account Activation", &format!("Failed to update account: {}", err), "failure");
+        // Try to distinguish constraint errors if possible
+        match &err {
+            diesel::result::Error::DatabaseError(kind, _) => {
+                use diesel::result::DatabaseErrorKind;
+                if matches!(kind, DatabaseErrorKind::UniqueViolation) {
+                    return ServiceError::Internal("Account update failed: unique constraint violation".to_string());
+                }
+            }
+            _ => {}
         }
-    }
+        ServiceError::Internal("Failed to update user account".to_string())
+    })?;
+
+    DB_OPERATIONS.with_label_values(&["update", "success"]).inc();
+    log_info!("Account Activation", "User account activated", "success");
 
     // Attempt to remove the activation code from Redis.
+    cleanup_activation_code(redis_client, code).await;
+
+    Ok(email)
+}
+
+/// Helper function to clean up the activation code from Redis.
+///
+/// This function doesn't return errors since activation cleanup 
+/// failures shouldn't prevent successful activation.
+async fn cleanup_activation_code(redis_client: &RedisClient, code: &str) {
     match redis_client.get_async_connection().await {
         Ok(mut redis_conn) => {
             REDIS_OPERATIONS.with_label_values(&["connection", "success"]).inc();
@@ -204,11 +196,8 @@ async fn process_activation(
         Err(_) => {
             REDIS_OPERATIONS.with_label_values(&["connection", "failure"]).inc();
             log_warn!("Account Activation", "Could not obtain Redis connection for cleanup", "warning");
-            // Proceed without failing activation.
         }
     }
-
-    Ok(email)
 }
 
 /// Renders a styled HTML success page after successful account activation.
@@ -353,21 +342,4 @@ fn render_error_page(error: &ApiError) -> Html<String> {
         heading,
         message
     ))
-}
-
-/// Generates an activation link by combining the frontend URL and the activation code.
-///
-/// # Arguments
-/// * `activation_code` - The activation code.
-///
-/// # Returns
-/// A complete URL string for activating the account.
-pub fn generate_activation_link(activation_code: &str) -> String {
-    let frontend_url = env::var("FRONTEND_URL").unwrap_or_else(|_| {
-        log_debug!("Account Activation", "Frontend URL not set", "defaulting to localhost");
-        "http://localhost:3000".to_string()
-    });
-
-    log_debug!("Account Activation", "Generating activation link", "debug");
-    format!("{}/auth/activate?code={}", frontend_url, activation_code)
 }

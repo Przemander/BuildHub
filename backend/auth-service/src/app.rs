@@ -24,9 +24,9 @@ use crate::{
     config::database::DbPool,
     handlers::{
         activation::activate_account_handler,
-        login::login_handler,     // Use the existing login.rs handler (or auth::login::login_handler)
-        logout::logout_handler,   // Use the new logout.rs handler
-        refresh::refresh_token_handler, // Use the new refresh.rs handler
+        login::login_handler,
+        logout::logout_handler,
+        refresh::refresh_token_handler,
         register::register_handler,
     },
     utils::email::EmailConfig,

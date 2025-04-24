@@ -18,7 +18,6 @@ use tokio::signal;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use redis::Client as RedisClient;
 use crate::app::build_app;
-// Import run_migrations along with init_pool
 use crate::config::database::{init_pool, DbPool, run_migrations};
 use crate::config::redis::{init_redis, check_redis_connection};
 use crate::utils::email::EmailConfig;
@@ -107,15 +106,17 @@ async fn initialize_services() -> Result<(DbPool, Option<RedisClient>, Option<Em
     }
 
     // Run database migrations after confirming pool is working.
-    if !run_migrations(&pool) {
-        log_error!("Server initialization", "Database migrations failed", "critical");
-        // Exit the application if migrations fail, as it's a critical step.
-        // Using std::process::exit might be abrupt in async context, returning error is better.
-        return Err("Database migrations failed".into());
-    } else {
-        log_info!("Server initialization", "Database migrations checked/run", "success");
+    match run_migrations(&pool) {
+        Ok(_) => {
+            log_info!("Server initialization", "Database migrations checked/run", "success");
+        },
+        Err(e) => {
+            log_error!("Server initialization", "Database migrations failed", "critical");
+            // Exit the application if migrations fail, as it's a critical step.
+            // Using std::process::exit might be abrupt in async context, returning error is better.
+            return Err(Box::new(e));
+        }
     }
-
 
     // Attempt to initialize Redis client.
     let redis_client = match init_redis() {

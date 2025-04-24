@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::json;
 use redis::Client as RedisClient;
 
-use crate::{log_info, log_error};
+use crate::{log_info, log_warn, log_error, log_debug};
 use crate::app::AppState;
 use crate::utils::errors::ApiError;
 use crate::utils::jwt::{validate_token, revoke_token};
@@ -21,6 +21,8 @@ use crate::utils::metrics::{
     REQUESTS_TOTAL, RequestTimer,
 };
 
+/// All possible label values for TOKEN_OPERATIONS:
+/// type: "any", operation: "revoke", result: "success", "failure"
 #[derive(Debug, Deserialize)]
 pub struct TokenRequest {
     pub token: String,
@@ -32,21 +34,20 @@ pub async fn logout_handler(
     State(app_state): State<AppState>,
     Json(logout_request): Json<TokenRequest>,
 ) -> impl IntoResponse {
-    let mut timer = RequestTimer::start("/auth/logout");
+    let mut timer = RequestTimer::start("/auth/logout", "POST");
     REQUESTS_TOTAL.with_label_values(&["/auth/logout", "POST", "pending"]).inc();
 
-    let redis_client = match app_state.redis_client {
+    // Get Redis client (prefer reference if possible)
+    let redis_client = match &app_state.redis_client {
         Some(client) => client,
         None => {
             log_error!("Session Management", "Missing Redis client", "failure");
             timer.set_status("500");
-            timer.complete("POST");
-            REQUESTS_TOTAL.with_label_values(&["/auth/logout", "POST", "500"]).inc();
             return ApiError::internal_error("Redis client not available").into_response();
         },
     };
 
-    let result = process_logout(redis_client.clone(), logout_request.token).await;
+    let result = process_logout(redis_client, &logout_request.token).await;
 
     match &result {
         Ok(_) => {
@@ -54,50 +55,83 @@ pub async fn logout_handler(
             timer.set_status("200");
             REQUESTS_TOTAL.with_label_values(&["/auth/logout", "POST", "200"]).inc();
         },
-        Err(_) => {
-            log_error!("Session Management", "Logout failed", "failure");
-            timer.set_status("500");
-            REQUESTS_TOTAL.with_label_values(&["/auth/logout", "POST", "500"]).inc();
+        Err(e) => {
+            let status_code = match e.status.as_str() {
+                "unauthorized" => {
+                    log_warn!("Session Management", &format!("Invalid token: {}", e.message), "warning");
+                    "401"
+                },
+                "not_found" => {
+                    log_warn!("Session Management", &format!("Token not found: {}", e.message), "warning");
+                    "404"
+                },
+                "service_unavailable" => {
+                    log_error!("Session Management", &format!("Redis unavailable: {}", e.message), "failure");
+                    "503"
+                },
+                _ => {
+                    log_error!("Session Management", &format!("Logout failed: {}", e.message), "failure");
+                    "500"
+                }
+            };
+            timer.set_status(status_code);
+            REQUESTS_TOTAL.with_label_values(&["/auth/logout", "POST", status_code]).inc();
         },
     }
 
-    timer.complete("POST");
+    // No need to call timer.complete(); Drop will handle it.
     result.into_response()
 }
 
 /// Processes logout by validating and revoking the token.
 /// Logs errors only when token revocation fails.
 async fn process_logout(
-    redis_client: RedisClient,
-    token: String,
+    redis_client: &RedisClient,
+    token: &str,
 ) -> Result<impl IntoResponse, ApiError> {
+    log_debug!("Session Management", "Processing logout request", "start");
+    
     // Attempt to validate token, but we'll revoke it regardless
-    let _user_info = match validate_token(&token, &redis_client).await {
+    let user_id = match validate_token(token, redis_client).await {
         Ok(claims) => {
             TOKEN_VALIDATIONS.with_label_values(&["valid"]).inc();
+            log_debug!("Session Management", &format!("Valid token for user {}", claims.sub), "success");
             claims.sub
         },
-        Err(_) => {
+        Err(e) => {
             TOKEN_VALIDATIONS.with_label_values(&["invalid"]).inc();
+            log_debug!("Session Management", &format!("Invalid token: {}", e), "warning");
+            // Continue with revocation even if token is invalid
             "unknown".to_string()
         }
     };
 
-    match revoke_token(&token, &redis_client).await {
+    // Revoke the token in Redis
+    match revoke_token(token, redis_client).await {
         Ok(_) => {
-            TOKEN_OPERATIONS.with_label_values(&["any", "revoke"]).inc();
-            log_info!("Session Management", "Token revoked", "success");
+            TOKEN_OPERATIONS.with_label_values(&["any", "revoke", "success"]).inc();
+            log_info!("Session Management", &format!("Token revoked for user {}", user_id), "success");
         },
-        Err(_) => {
-            TOKEN_OPERATIONS.with_label_values(&["any", "revoke_error"]).inc();
-            log_error!("Session Management", "Token revocation failed", "failure");
-            return Err(ApiError::internal_error("Failed to logout"));
+        Err(e) => {
+            TOKEN_OPERATIONS.with_label_values(&["any", "revoke", "failure"]).inc();
+            log_error!("Session Management", &format!("Token revocation failed: {}", e), "failure");
+            // Prefer error type matching, but if not possible, document why:
+            // Here, we match on error strings because the error type is opaque from redis/jwt.
+            let err_str = e.to_string();
+            if err_str.contains("connection") {
+                return Err(ApiError::service_unavailable_error("Redis service unavailable. Please try again later."));
+            } else if err_str.contains("not found") {
+                return Err(ApiError::not_found_error("Token not found or already expired"));
+            } else {
+                return Err(ApiError::internal_error("Failed to logout due to an internal error"));
+            }
         }
     }
 
+    // Return successful response
     Ok((
         StatusCode::OK,
-        Json(json!({
+        axum::Json(json!({
             "status": "success",
             "message": "Successfully logged out"
         }))

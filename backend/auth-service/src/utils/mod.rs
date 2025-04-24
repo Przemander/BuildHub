@@ -4,3 +4,4 @@ pub mod jwt;
 pub mod email;
 pub mod log;
 pub mod metrics;
+pub mod rate_limit;
