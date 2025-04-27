@@ -118,6 +118,48 @@ impl EmailConfig {
     }
 }
 
+/// Sends a password reset email with a reset link containing the token.
+pub async fn send_password_reset_email(
+    email_config: &EmailConfig,
+    to_email: &str,
+    reset_token: &str,
+) -> Result<(), ServiceError> {
+    let frontend_url = std::env::var("FRONTEND_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
+    let reset_link = format!("{}/reset-password?token={}", frontend_url, reset_token);
+
+    let email_body = format!(
+        "Hello,\n\nTo reset your password, click the link below:\n{}\n\n\
+         If you did not request a password reset, please ignore this message.\n\n\
+         This link will expire in 30 minutes.",
+        reset_link
+    );
+
+    let email = Message::builder()
+        .from(email_config.from_address.parse().map_err(|_| {
+            EMAILS_SENT.with_label_values(&["password_reset", "failure"]).inc();
+            ServiceError::Email(EmailError::Internal("Invalid from address".to_string()))
+        })?)
+        .to(to_email.parse().map_err(|_| {
+            EMAILS_SENT.with_label_values(&["password_reset", "failure"]).inc();
+            ServiceError::Email(EmailError::Internal("Invalid recipient address".to_string()))
+        })?)
+        .subject("Reset Your BuildHub Password")
+        .body(email_body)
+        .map_err(|_| {
+            EMAILS_SENT.with_label_values(&["password_reset", "failure"]).inc();
+            ServiceError::Email(EmailError::Internal("Failed to build email".to_string()))
+        })?;
+
+    EMAILS_SENT.with_label_values(&["password_reset", "attempt"]).inc();
+    email_config.mailer.send(&email).map_err(|_| {
+        EMAILS_SENT.with_label_values(&["password_reset", "failure"]).inc();
+        ServiceError::Email(EmailError::Internal("Failed to send password reset email".to_string()))
+    })?;
+
+    EMAILS_SENT.with_label_values(&["password_reset", "success"]).inc();
+    Ok(())
+}
+
 /// Generates a unique activation code using UUID v4.
 pub fn generate_activation_code() -> String {
     let code = uuid::Uuid::new_v4().to_string();

@@ -1,205 +1,52 @@
-//! JWT authentication utilities for BuildHub.
+//! JWT authentication middleware for BuildHub.
 //!
-//! Handles token creation, validation, and revocation using Redis blocklist.
-//! All error types are defined in errors.rs and only ServiceError is used internally.
+//! This middleware validates JWT tokens on protected routes using the shared JWT utility functions.
+//! It checks for token presence, validity, and revocation (via Redis blocklist).
+//! On failure, it returns a 401 Unauthorized response.
 
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation, Algorithm};
-use serde::{Deserialize, Serialize};
-use std::env;
-use chrono::{Duration, Utc};
-use crate::{log_info, log_warn, log_error, log_debug};
-use crate::utils::metrics::{TOKEN_OPERATIONS, TOKEN_VALIDATIONS};
-use crate::utils::errors::{ServiceError, JwtError};
+use axum::{
+    middleware::Next,
+    extract::State,
+    http::Request,
+    response::IntoResponse,
+};
+use std::sync::Arc;
+use crate::app::AppState;
+use crate::utils::jwt;
+use crate::utils::errors::ApiError;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TokenClaims {
-    pub sub: String,
-    pub exp: usize,
-    pub iat: usize,
-    pub token_type: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub jti: Option<String>,
-}
-
-pub const TOKEN_TYPE_ACCESS: &str = "access";
-pub const TOKEN_TYPE_REFRESH: &str = "refresh";
-
-/// Generates a JWT token for the given user and token type.
-pub fn generate_token(
-    username: &str,
-    token_type: &str,
-    expires_in: Option<Duration>,
-) -> Result<String, ServiceError> {
-    log_debug!("Token Management", "Begin token generation", "attempt");
-    TOKEN_OPERATIONS.with_label_values(&["generate", "attempt"]).inc();
-
-    let now = Utc::now();
-    let expiration = match expires_in {
-        Some(duration) => now + duration,
-        None => match token_type {
-            TOKEN_TYPE_ACCESS => {
-                let seconds = env::var("JWT_ACCESS_TOKEN_EXPIRES_IN")
-                    .ok()
-                    .and_then(|val| val.parse::<i64>().ok())
-                    .unwrap_or(3600);
-                now + Duration::seconds(seconds)
-            },
-            TOKEN_TYPE_REFRESH => {
-                let seconds = env::var("JWT_REFRESH_TOKEN_EXPIRES_IN")
-                    .ok()
-                    .and_then(|val| val.parse::<i64>().ok())
-                    .unwrap_or(604800);
-                now + Duration::seconds(seconds)
-            },
-            _ => {
-                log_warn!("Token Management", "Unknown token type", "failure");
-                now + Duration::hours(1)
-            }
-        },
+/// JWT authentication middleware for protected routes.
+///
+/// Expects the `Authorization: Bearer <token>` header.
+/// On success, passes the request to the next handler.
+/// On failure, returns 401 Unauthorized.
+pub async fn jwt_auth_middleware<B>(
+    State(app_state): State<Arc<AppState>>,
+    req: Request<B>,
+    next: Next<B>,
+) -> impl IntoResponse {
+    // Extract the Authorization header
+    let token = match req.headers().get("authorization").and_then(|h| h.to_str().ok()) {
+        Some(header) if header.starts_with("Bearer ") => header.trim_start_matches("Bearer ").trim(),
+        _ => {
+            return ApiError::unauthorized("Missing or invalid Authorization header").into_response();
+        }
     };
 
-    let claims = TokenClaims {
-        sub: username.to_string(),
-        exp: expiration.timestamp() as usize,
-        iat: now.timestamp() as usize,
-        token_type: token_type.to_string(),
-        jti: Some(uuid::Uuid::new_v4().to_string()),
+    // Validate the token using the shared JWT utility
+    let redis_client = match &app_state.redis_client {
+        Some(redis) => redis,
+        None => {
+            return ApiError::internal("Redis unavailable for token validation").into_response();
+        }
     };
 
-    let secret = env::var("JWT_SECRET").map_err(|_| {
-        log_error!("Token Management", "JWT secret configuration", "failure");
-        TOKEN_OPERATIONS.with_label_values(&["generate", "failure"]).inc();
-        ServiceError::Jwt(JwtError::Configuration("JWT secret is not configured".to_string()))
-    })?;
-
-    let mut header = Header::default();
-    header.alg = Algorithm::HS256;
-
-    encode(&header, &claims, &EncodingKey::from_secret(secret.as_ref()))
-        .map_err(|_| {
-            log_error!("Token Management", "Token encoding", "failure");
-            TOKEN_OPERATIONS.with_label_values(&["generate", "failure"]).inc();
-            ServiceError::Jwt(JwtError::Internal("Failed to generate token".to_string()))
-        })
-        .map(|token| {
-            log_debug!("Token Management", "Token encoding", "success");
-            TOKEN_OPERATIONS.with_label_values(&["generate", "success"]).inc();
-            token
-        })
-}
-
-/// Decodes and validates a JWT token, returning the claims.
-pub fn decode_token(token: &str) -> Result<TokenClaims, ServiceError> {
-    log_debug!("Token Management", "Begin token decoding", "attempt");
-    TOKEN_VALIDATIONS.with_label_values(&["decode", "attempt"]).inc();
-
-    let secret = env::var("JWT_SECRET").map_err(|_| {
-        log_error!("Token Management", "JWT secret configuration", "failure");
-        TOKEN_VALIDATIONS.with_label_values(&["decode", "failure"]).inc();
-        ServiceError::Jwt(JwtError::Configuration("JWT secret is not configured".to_string()))
-    })?;
-
-    let mut validation = Validation::new(Algorithm::HS256);
-    validation.validate_exp = true;
-    validation.leeway = 5;
-
-    decode::<TokenClaims>(
-        token,
-        &DecodingKey::from_secret(secret.as_bytes()),
-        &validation,
-    )
-    .map(|data| {
-        log_debug!("Token Management", "Token decoding", "success");
-        TOKEN_VALIDATIONS.with_label_values(&["decode", "success"]).inc();
-        data.claims
-    })
-    .map_err(|e| {
-        let err = match e.kind() {
-            jsonwebtoken::errors::ErrorKind::ExpiredSignature => {
-                log_debug!("Token Management", "Token expiration check", "failure");
-                JwtError::Expired
-            },
-            jsonwebtoken::errors::ErrorKind::InvalidSignature => {
-                log_warn!("Token Management", "Token signature verification", "failure");
-                JwtError::InvalidSignature
-            },
-            _ => {
-                log_error!("Token Management", "Token decoding", "failure");
-                JwtError::Invalid
-            }
-        };
-        TOKEN_VALIDATIONS.with_label_values(&["decode", "failure"]).inc();
-        ServiceError::Jwt(err)
-    })
-}
-
-/// Validates a JWT token and checks if it is revoked in Redis.
-pub async fn validate_token(
-    token: &str,
-    redis_client: &redis::Client,
-) -> Result<TokenClaims, ServiceError> {
-    log_debug!("Token Management", "Begin token validation", "attempt");
-    TOKEN_VALIDATIONS.with_label_values(&["validate", "attempt"]).inc();
-
-    let claims = decode_token(token)?;
-
-    match crate::config::redis::is_token_blocked(redis_client, token).await {
-        Ok(is_blocked) => {
-            if is_blocked {
-                log_debug!("Token Management", "Token revocation check", "failure");
-                TOKEN_VALIDATIONS.with_label_values(&["validate", "revoked"]).inc();
-                return Err(ServiceError::Jwt(JwtError::Revoked));
-            }
-        },
-        Err(_) => {
-            log_warn!("Token Management", "Redis revocation check", "failure");
+    match jwt::validate_token(token, redis_client).await {
+        Ok(_claims) => {
+            next.run(req).await
+        }
+        Err(err) => {
+            ApiError::unauthorized(&format!("Invalid or expired token: {}", err)).into_response()
         }
     }
-
-    let now = Utc::now().timestamp() as usize;
-    if claims.exp < now {
-        log_debug!("Token Management", "Token expiration check", "failure");
-        TOKEN_VALIDATIONS.with_label_values(&["validate", "expired"]).inc();
-        return Err(ServiceError::Jwt(JwtError::Expired));
-    }
-    if claims.iat > now + 60 {
-        log_warn!("Token Management", "Token issue time check", "failure");
-        TOKEN_VALIDATIONS.with_label_values(&["validate", "invalid_iat"]).inc();
-        return Err(ServiceError::Jwt(JwtError::InvalidIat));
-    }
-
-    log_info!("Token Management", "Token validation complete", "success");
-    TOKEN_VALIDATIONS.with_label_values(&["validate", "success"]).inc();
-    Ok(claims)
-}
-
-/// Revokes a JWT token by adding it to the Redis blocklist until its expiration.
-pub async fn revoke_token(
-    token: &str,
-    redis_client: &redis::Client,
-) -> Result<(), ServiceError> {
-    log_debug!("Token Management", "Begin token revocation", "attempt");
-    TOKEN_OPERATIONS.with_label_values(&["revoke", "attempt"]).inc();
-
-    let claims = decode_token(token)?;
-
-    let now = Utc::now().timestamp() as usize;
-    if claims.exp <= now {
-        log_debug!("Token Management", "Token already expired", "success");
-        TOKEN_OPERATIONS.with_label_values(&["revoke", "expired"]).inc();
-        return Ok(());
-    }
-
-    let ttl = claims.exp - now;
-    crate::config::redis::block_token(redis_client, token, ttl)
-        .await
-        .map_err(|_| {
-            log_error!("Token Management", "Redis token blocking", "failure");
-            TOKEN_OPERATIONS.with_label_values(&["revoke", "failure"]).inc();
-            ServiceError::Jwt(JwtError::Internal("Failed to revoke token".to_string()))
-        })?;
-
-    log_info!("Token Management", "Token revocation complete", "success");
-    TOKEN_OPERATIONS.with_label_values(&["revoke", "success"]).inc();
-    Ok(())
 }

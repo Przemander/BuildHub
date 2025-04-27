@@ -3,6 +3,8 @@
 //! Provides functionality for invalidating JWT tokens during logout
 //! by adding them to a revocation list in Redis.
 
+use std::sync::Arc;
+
 use axum::{
     extract::{State, Json},
     http::StatusCode,
@@ -14,7 +16,7 @@ use redis::Client as RedisClient;
 
 use crate::{log_info, log_warn, log_error, log_debug};
 use crate::app::AppState;
-use crate::utils::errors::ApiError;
+use crate::utils::errors::{ApiError, ApiStatus};
 use crate::utils::jwt::{validate_token, revoke_token};
 use crate::utils::metrics::{
     TOKEN_OPERATIONS, TOKEN_VALIDATIONS,
@@ -31,7 +33,7 @@ pub struct TokenRequest {
 /// Handler for logout which revokes a token.
 /// Logs errors and overall summary, relying on metrics for high-frequency events.
 pub async fn logout_handler(
-    State(app_state): State<AppState>,
+    State(app_state): State<Arc<AppState>>,
     Json(logout_request): Json<TokenRequest>,
 ) -> impl IntoResponse {
     let mut timer = RequestTimer::start("/auth/logout", "POST");
@@ -43,7 +45,7 @@ pub async fn logout_handler(
         None => {
             log_error!("Session Management", "Missing Redis client", "failure");
             timer.set_status("500");
-            return ApiError::internal_error("Redis client not available").into_response();
+            return ApiError::internal("Redis client not available").into_response();
         },
     };
 
@@ -56,16 +58,16 @@ pub async fn logout_handler(
             REQUESTS_TOTAL.with_label_values(&["/auth/logout", "POST", "200"]).inc();
         },
         Err(e) => {
-            let status_code = match e.status.as_str() {
-                "unauthorized" => {
+            let status_code = match e.status {
+                ApiStatus::Unauthorized => {
                     log_warn!("Session Management", &format!("Invalid token: {}", e.message), "warning");
                     "401"
                 },
-                "not_found" => {
+                ApiStatus::NotFound => {
                     log_warn!("Session Management", &format!("Token not found: {}", e.message), "warning");
                     "404"
                 },
-                "service_unavailable" => {
+                ApiStatus::ServiceUnavailable => {
                     log_error!("Session Management", &format!("Redis unavailable: {}", e.message), "failure");
                     "503"
                 },
@@ -115,15 +117,13 @@ async fn process_logout(
         Err(e) => {
             TOKEN_OPERATIONS.with_label_values(&["any", "revoke", "failure"]).inc();
             log_error!("Session Management", &format!("Token revocation failed: {}", e), "failure");
-            // Prefer error type matching, but if not possible, document why:
-            // Here, we match on error strings because the error type is opaque from redis/jwt.
             let err_str = e.to_string();
             if err_str.contains("connection") {
-                return Err(ApiError::service_unavailable_error("Redis service unavailable. Please try again later."));
+                return Err(ApiError::service_unavailable("Redis service unavailable. Please try again later."));
             } else if err_str.contains("not found") {
-                return Err(ApiError::not_found_error("Token not found or already expired"));
+                return Err(ApiError::not_found("Token not found or already expired"));
             } else {
-                return Err(ApiError::internal_error("Failed to logout due to an internal error"));
+                return Err(ApiError::internal("Failed to logout due to an internal error"));
             }
         }
     }

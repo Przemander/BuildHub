@@ -12,13 +12,16 @@
 //! - Centralized configuration of CORS settings for controlled cross-origin requests.
 
 use axum::{
-    http::{header::HeaderName, Method},
+    http::{header::HeaderName, Method, StatusCode},
+    middleware,
     response::IntoResponse,
     routing::{get, post},
-    Router,
+    Json, Router,
 };
+use serde_json::json;
 use tower_http::cors::CorsLayer;
 use redis::Client as RedisClient;
+use std::sync::Arc;
 use crate::{log_info, log_debug};
 use crate::{
     config::database::DbPool,
@@ -28,8 +31,14 @@ use crate::{
         logout::logout_handler,
         refresh::refresh_token_handler,
         register::register_handler,
+        password_reset::{
+            password_reset_request_handler,
+            password_reset_confirm_handler,
+        },
     },
     utils::email::EmailConfig,
+    middleware::jwt_auth, // Import the module, not a non-existent function
+    middleware::rate_limiter::RateLimiterLayer,
 };
 
 /// Application state shared across handlers.
@@ -60,27 +69,80 @@ pub async fn build_app(
     log_debug!("App initialization", "Creating application state", "success");
     
     // Construct shared state for all handlers.
-    let state = AppState {
+    let state = Arc::new(AppState {
         pool,
         redis_client,
         email_config,
+    });
+
+    // --- Rate Limiter Middleware Setup ---
+    let rate_limiter = if let Some(redis_client) = &state.redis_client {
+        // Example: 5 requests per minute per IP per endpoint
+        Some(RateLimiterLayer {
+            redis: Arc::new(redis_client.clone()),
+            max_attempts: 5,
+            window_secs: 60,
+            key_fn: Arc::new(|req: &axum::http::Request<axum::body::Body>| {
+                let ip = req
+                    .headers()
+                    .get("x-forwarded-for")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("unknown");
+                format!("rate:{}:ip:{}", req.uri().path(), ip)
+            }),
+        })
+    } else {
+        None
     };
 
     log_debug!("App initialization", "Configuring public routes", "success");
-    // Define public endpoints for registration, login, refresh and account activation.
-    let public_routes = Router::new()
+    // Define public endpoints for registration, login, refresh, account activation, and password reset.
+    let mut public_routes = Router::new()
         .route("/", get(|| async { "🚀 BuildHub Authorization Service is running" }))
         .route("/auth/register", post(register_handler))
         .route("/auth/login", post(login_handler))
         .route("/auth/refresh", post(refresh_token_handler))
-        .route("/auth/activate", get(activate_account_handler));
+        .route("/auth/activate", get(activate_account_handler))
+        .route("/auth/password-reset/request", post(password_reset_request_handler))
+        .route("/auth/password-reset/confirm", post(password_reset_confirm_handler));
+
+    // Apply rate limiter to all public routes if Redis is configured
+    if let Some(rate_limiter) = rate_limiter {
+        public_routes = public_routes.layer(rate_limiter);
+    }
 
     // Metrics route: exposes Prometheus metrics.
     let metrics_route = Router::new().route("/metrics", get(metrics_handler));
 
     log_debug!("App initialization", "Configuring protected routes", "success");
     // Protected routes (e.g., logout) that may require authentication middleware.
-    let protected_routes = Router::new().route("/auth/logout", post(logout_handler));
+    let protected_routes = Router::new()
+        .route("/auth/logout", post(logout_handler))
+        .route_layer(middleware::from_fn_with_state(state.clone(), jwt_auth::jwt_auth_middleware)); // Use the function from the module
+
+    log_debug!("App initialization", "Configuring health check routes", "success");
+    // Health check routes for liveness and readiness probes.
+    let health_routes = Router::new()
+        .route("/health", get(|| async { "ok" }))
+        .route("/ready", get({
+            let state = state.clone();
+            move || {
+                let state = state.clone();
+                async move {
+                    // Check DB
+                    let db_ok = state.pool.get().is_ok();
+                    // Check Redis (if configured)
+                    let redis_ok = state.redis_client.as_ref().map_or(true, |r| r.get_connection().is_ok());
+                    // Check Email config (if required)
+                    let email_ok = state.email_config.is_some();
+
+                    let ready = db_ok && redis_ok && email_ok;
+                    let status = if ready { "ok" } else { "not ready" };
+                    let code = if ready { 200 } else { 503 };
+                    (StatusCode::from_u16(code).unwrap(), Json(json!({ "status": status, "db": db_ok, "redis": redis_ok, "email": email_ok })))
+                }
+            }
+        }));
 
     log_debug!("App initialization", "Configuring CORS settings", "success");
     // Setup CORS layer: specify allowed origins, methods, headers, and credential sharing.
@@ -100,12 +162,13 @@ pub async fn build_app(
     ];
 
     log_info!("App initialization", "Building application router", "success");
-    // Merge all routes (public, protected, metrics) with shared state and CORS settings.
+    // Merge all routes (public, protected, metrics, health) with shared state and CORS settings.
     Router::new()
         .merge(public_routes)
         .merge(protected_routes)
         .merge(metrics_route)
-        .with_state(state)
+        .merge(health_routes)
+        .with_state(state.clone()) // FIX: pass Arc<AppState> by clone
         .layer(
             CorsLayer::new()
                 .allow_origin([

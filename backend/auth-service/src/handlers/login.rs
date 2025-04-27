@@ -1,7 +1,10 @@
-//! User login handler.
+//! User login handler with account lockout and login by username or email.
 //!
-//! Provides functionality for authenticating users with username/password
-//! credentials and issuing JWT tokens upon successful authentication.
+//! Provides functionality for authenticating users with username/email and password,
+//! issuing JWT tokens upon successful authentication, and implements account lockout
+//! after repeated failed logins.
+
+use std::sync::Arc;
 
 use axum::{
     extract::{State, Json},
@@ -11,12 +14,13 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use diesel::SqliteConnection;
+use redis::Commands;
 
 use crate::{log_info, log_warn, log_error};
 use crate::app::AppState;
 use crate::config::database::get_connection;
 use crate::db::users::User;
-use crate::utils::errors::{ApiError, AuthError, ServiceError};
+use crate::utils::errors::{ApiError, ApiStatus, AuthError, ServiceError};
 use crate::utils::jwt::{generate_token, TOKEN_TYPE_ACCESS, TOKEN_TYPE_REFRESH};
 use crate::utils::metrics::{
     AUTH_LOGIN_ATTEMPTS, TOKEN_OPERATIONS, RATE_LIMIT_BLOCKS,
@@ -24,13 +28,9 @@ use crate::utils::metrics::{
 };
 use crate::utils::rate_limit::check_and_increment;
 
-/// All possible label values for AUTH_LOGIN_ATTEMPTS:
-/// result: "success", "failure"
-/// All possible label values for TOKEN_OPERATIONS:
-/// type: "access", "refresh"; operation: "generate", "error"
 #[derive(Debug, Deserialize)]
 pub struct LoginRequest {
-    pub username: String,
+    pub login: String, // username or email
     pub password: String,
 }
 
@@ -47,30 +47,60 @@ pub struct LoginSuccessData {
     pub user: UserResponse,
 }
 
-/// Handler for processing user login requests.
-///
-/// Measures overall request duration through a RequestTimer and
-/// uses metrics to track the outcomes. Logging is kept minimal:
-/// errors and overall outcome are logged.
+const LOCKOUT_THRESHOLD: i32 = 5;
+const LOCKOUT_DURATION_SECS: usize = 15 * 60; // 15 minutes
+
+/// Handler for processing user login requests with account lockout.
 pub async fn login_handler(
-    State(app_state): State<AppState>,
+    State(app_state): State<Arc<AppState>>,
     Json(login_request): Json<LoginRequest>,
 ) -> impl IntoResponse {
     let mut timer = RequestTimer::start("/auth/login", "POST");
     REQUESTS_TOTAL.with_label_values(&["/auth/login", "POST", "pending"]).inc();
 
     // --- Rate limiting ---
-    // Use username as the key for rate limiting (could also use IP if available)
     let redis_client = match &app_state.redis_client {
         Some(client) => client,
         None => {
             log_error!("Authentication", "Missing Redis client for rate limiting", "failure");
             timer.set_status("500");
             REQUESTS_TOTAL.with_label_values(&["/auth/login", "POST", "500"]).inc();
-            return ApiError::internal_error("Redis unavailable for rate limiting").into_response();
+            return ApiError::internal("Redis unavailable for rate limiting").into_response();
         }
     };
-    let rate_key = format!("rate:login:{}", login_request.username);
+
+    // --- Account lockout check ---
+    let lock_key = format!("login:lock:{}", login_request.login);
+    let is_locked = {
+        let mut conn = match redis_client.get_connection() {
+            Ok(c) => c,
+            Err(_) => {
+                log_error!("Authentication", "Redis connection failed for lockout check", "failure");
+                timer.set_status("500");
+                REQUESTS_TOTAL.with_label_values(&["/auth/login", "POST", "500"]).inc();
+                return ApiError::internal("Redis unavailable for lockout check").into_response();
+            }
+        };
+        match conn.exists::<_, bool>(&lock_key) {
+            Ok(true) => true,
+            _ => false,
+        }
+    };
+    if is_locked {
+        log_warn!("Authentication", "Account is locked due to repeated failed logins", "failure");
+        timer.set_status("423");
+        REQUESTS_TOTAL.with_label_values(&["/auth/login", "POST", "423"]).inc();
+        return (
+            StatusCode::LOCKED,
+            Json(json!({
+                "status": "error",
+                "message": "Account is temporarily locked due to too many failed login attempts. Please try again later."
+            }))
+        ).into_response();
+    }
+
+    // --- Rate limiting (per login) ---
+    let rate_key = format!("rate:login:{}", login_request.login);
     let allowed = match check_and_increment(redis_client, &rate_key, 5, 60).await {
         Ok(true) => true,
         Ok(false) => {
@@ -88,13 +118,11 @@ pub async fn login_handler(
         }
         Err(e) => {
             log_error!("Authentication", &format!("Rate limit Redis error: {}", e), "failure");
-            // Fail open or closed based on policy; here, we allow login if Redis fails
             true
         }
     };
 
     if !allowed {
-        // Defensive: should not reach here, but double-check
         RATE_LIMIT_BLOCKS.with_label_values(&["/auth/login"]).inc();
         timer.set_status("429");
         REQUESTS_TOTAL.with_label_values(&["/auth/login", "POST", "429"]).inc();
@@ -107,7 +135,7 @@ pub async fn login_handler(
         ).into_response();
     }
 
-    let result = process_login(&app_state.pool, login_request).await;
+    let result = process_login(&app_state.pool, &login_request).await;
 
     match &result {
         Ok(_) => {
@@ -115,28 +143,48 @@ pub async fn login_handler(
             log_info!("Authentication", "User login complete", "success");
             timer.set_status("200");
             REQUESTS_TOTAL.with_label_values(&["/auth/login", "POST", "200"]).inc();
+            // On success, reset failed login counter and lock
+            let fail_key = format!("login:fail:{}", login_request.login);
+            let mut conn = redis_client.get_connection().ok();
+            if let Some(ref mut c) = conn {
+                let _: Result<(), _> = c.del(&fail_key);
+                let _: Result<(), _> = c.del(&lock_key);
+            }
         },
         Err(api_error) => {
             AUTH_LOGIN_ATTEMPTS.with_label_values(&["failure"]).inc();
             log_warn!("Authentication", &format!("User login failed: {}", api_error.message), "failure");
-            let status_code = match api_error.status.as_str() {
-                "unauthorized" => "401",
-                "internal_error" => "500",
+            let status_code = match api_error.status {
+                ApiStatus::Unauthorized => "401",
+                ApiStatus::InternalError => "500",
                 _ => "400",
             };
             timer.set_status(status_code);
             REQUESTS_TOTAL.with_label_values(&["/auth/login", "POST", status_code]).inc();
+
+            // On unauthorized (bad credentials), increment fail counter and possibly lock account
+            if matches!(api_error.status, ApiStatus::Unauthorized) {
+                let fail_key = format!("login:fail:{}", login_request.login);
+                let mut conn = redis_client.get_connection().ok();
+                if let Some(ref mut c) = conn {
+                    let fails: i32 = c.incr(&fail_key, 1).unwrap_or(0);
+                    let _: Result<(), _> = c.expire(&fail_key, LOCKOUT_DURATION_SECS);
+                    if fails >= LOCKOUT_THRESHOLD {
+                        let _: Result<(), _> = c.set_ex(&lock_key, 1, LOCKOUT_DURATION_SECS);
+                        log_warn!("Authentication", "Account locked due to repeated failed logins", "failure");
+                    }
+                }
+            }
         },
     }
 
-    // No need to call timer.complete(); Drop will handle it.
     result.into_response()
 }
 
 /// Separates out login processing into authentication and token generation.
 async fn process_login(
     pool: &crate::config::database::DbPool,
-    login_request: LoginRequest,
+    login_request: &LoginRequest,
 ) -> Result<impl IntoResponse, ApiError> {
     // Obtain a database connection (metrics track success/failure).
     let mut conn = match get_connection(pool) {
@@ -151,8 +199,8 @@ async fn process_login(
         }
     };
 
-    // Authenticate user using existing logic but with new error types
-    let user = authenticate_user(&mut conn, &login_request)?;
+    // Authenticate user by username or email
+    let user = authenticate_user(&mut conn, login_request)?;
     
     // Generate tokens for the authenticated user
     let (access_token, refresh_token) = generate_auth_tokens(&user.username)?;
@@ -175,14 +223,19 @@ async fn process_login(
     ))
 }
 
-/// Authenticates a user by looking up by username and verifying the password.
-/// This preserves the existing logic but with better error types.
+/// Authenticates a user by looking up by username or email and verifying the password.
 fn authenticate_user(
     conn: &mut SqliteConnection,
     login_request: &LoginRequest,
 ) -> Result<User, ApiError> {
-    // Find user by username
-    let user = match User::find_by_username(conn, &login_request.username) {
+    // Determine if login is email or username
+    let user = if login_request.login.contains('@') {
+        User::find_by_email(conn, &login_request.login)
+    } else {
+        User::find_by_username(conn, &login_request.login)
+    };
+
+    let user = match user {
         Ok(user) => {
             DB_OPERATIONS.with_label_values(&["query", "success"]).inc();
             user
@@ -224,7 +277,6 @@ fn authenticate_user(
 }
 
 /// Generates an access and refresh token for a user.
-/// Maps JWT errors to our domain-specific error types.
 fn generate_auth_tokens(username: &str) -> Result<(String, String), ApiError> {
     let access_token = match generate_token(username, TOKEN_TYPE_ACCESS, None) {
         Ok(token) => {
@@ -234,7 +286,6 @@ fn generate_auth_tokens(username: &str) -> Result<(String, String), ApiError> {
         Err(e) => {
             TOKEN_OPERATIONS.with_label_values(&["access", "error"]).inc();
             log_error!("Authentication", &format!("Access token generation failed: {}", e), "failure");
-            // Distinguish configuration errors if possible
             let msg = e.to_string();
             if msg.contains("secret") {
                 return Err(ServiceError::Auth(

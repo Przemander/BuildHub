@@ -176,4 +176,14 @@ impl User {
             Err(diesel::result::Error::NotFound)
         }
     }
+
+    /// Sets a new password (hashes it) and updates the user in the database.
+    pub fn set_password_and_update(
+        &mut self,
+        conn: &mut SqliteConnection,
+        new_password: &str,
+    ) -> Result<(), diesel::result::Error> {
+        self.password_hash = User::hash_password(new_password);
+        self.update(conn)
+    }
 }

@@ -1,9 +1,6 @@
 //! Error handling utilities for the API.
 //!
-//! This module provides a unified approach to error handling across the application,
-//! with consistent error responses, status codes, and serialization formats.
-//!
-//! Additionally, it logs error creation and (optionally) increments error metrics.
+//! Provides unified error types, conversions, and consistent API error responses.
 
 use axum::{response::IntoResponse, http::StatusCode};
 use serde::Serialize;
@@ -13,73 +10,78 @@ use tracing_error::SpanTrace;
 use diesel::result::Error as DieselError;
 use std::error::Error as StdError;
 
+/// Enum for API error status codes (compile-time safety, serializes as snake_case).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiStatus {
+    ValidationError,
+    UniqueConstraintError,
+    InternalError,
+    Unauthorized,
+    NotFound,
+    ConfigurationError,
+    BadRequest,
+    ServiceUnavailable,
+    RateLimitExceeded,
+}
+
+impl fmt::Display for ApiStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
 /// API error response structure.
 #[derive(Debug, Serialize)]
 pub struct ApiError {
-    pub status: String,
+    pub status: ApiStatus,
     pub message: String,
 }
 
 impl ApiError {
-    pub fn validation_error(field: &str, msg: &str) -> Self {
-        log_debug!("ApiError", &format!("Validation error on {}: {}", field, msg), "created");
-        ApiError {
-            status: "validation_error".to_string(),
-            message: format!("{}: {}", field, msg),
+    pub fn new(status: ApiStatus, msg: impl Into<String>) -> Self {
+        let msg_str = msg.into();
+        match status {
+            ApiStatus::InternalError | ApiStatus::Unauthorized | ApiStatus::ServiceUnavailable | ApiStatus::ConfigurationError => {
+                log_error!("ApiError", &msg_str, &format!("{:?} error created", status));
+            }
+            _ => {
+                log_debug!("ApiError", &msg_str, &format!("{:?} error created", status));
+            }
         }
+        ApiError { status, message: msg_str }
     }
-    pub fn unique_constraint_error(field: &str, msg: &str) -> Self {
-        log_debug!("ApiError", &format!("Unique constraint error on {}: {}", field, msg), "created");
-        ApiError {
-            status: "unique_constraint_error".to_string(),
-            message: format!("{}: {}", field, msg),
-        }
+    // Convenience constructors
+    pub fn validation(field: &str, msg: &str) -> Self {
+        Self::new(ApiStatus::ValidationError, format!("{}: {}", field, msg))
     }
-    pub fn internal_error(msg: &str) -> Self {
-        log_error!("ApiError", msg, "internal error created");
-        ApiError { 
-            status: "internal_error".to_string(), 
-            message: msg.to_string() 
-        }
+    pub fn unique_constraint(field: &str, msg: &str) -> Self {
+        Self::new(ApiStatus::UniqueConstraintError, format!("{}: {}", field, msg))
     }
-    pub fn unauthorized_error(msg: &str) -> Self {
-        log_error!("ApiError", msg, "unauthorized error created");
-        ApiError { 
-            status: "unauthorized".to_string(), 
-            message: msg.to_string() 
-        }
+    pub fn internal(msg: &str) -> Self {
+        Self::new(ApiStatus::InternalError, msg)
     }
-    pub fn not_found_error(resource: &str) -> Self {
-        log_debug!("ApiError", &format!("{} not found", resource), "not found error created");
-        ApiError {
-            status: "not_found".to_string(),
-            message: format!("{} not found", resource),
-        }
+    pub fn unauthorized(msg: &str) -> Self {
+        Self::new(ApiStatus::Unauthorized, msg)
     }
-    pub fn configuration_error(msg: &str) -> Self {
-        log_error!("ApiError", msg, "configuration error created");
-        ApiError {
-            status: "configuration_error".to_string(),
-            message: msg.to_string(),
-        }
+    pub fn not_found(resource: &str) -> Self {
+        Self::new(ApiStatus::NotFound, format!("{} not found", resource))
     }
-    pub fn bad_request_error(msg: &str) -> Self {
-        log_debug!("ApiError", msg, "bad request error created");
-        ApiError {
-            status: "bad_request".to_string(),
-            message: msg.to_string(),
-        }
+    pub fn configuration(msg: &str) -> Self {
+        Self::new(ApiStatus::ConfigurationError, msg)
     }
-    pub fn service_unavailable_error(msg: &str) -> Self {
-        log_error!("ApiError", msg, "service unavailable error created");
-        ApiError {
-            status: "service_unavailable".to_string(),
-            message: msg.to_string(),
-        }
+    pub fn bad_request(msg: &str) -> Self {
+        Self::new(ApiStatus::BadRequest, msg)
+    }
+    pub fn service_unavailable(msg: &str) -> Self {
+        Self::new(ApiStatus::ServiceUnavailable, msg)
+    }
+    pub fn rate_limit(msg: &str) -> Self {
+        Self::new(ApiStatus::RateLimitExceeded, msg)
     }
 }
 
-/// Database-related errors
+// --- Database Error ---
 #[derive(Debug, thiserror::Error)]
 pub enum DatabaseError {
     #[error("Database connection error: {source}\n{span:?}")]
@@ -116,33 +118,24 @@ impl From<DieselError> for DatabaseError {
 impl From<DatabaseError> for ApiError {
     fn from(err: DatabaseError) -> Self {
         match err {
-            DatabaseError::Connection { .. } => {
-                log_error!("Database", "Connection failed", "failure");
-                ApiError::service_unavailable_error("Database service unavailable")
-            },
-            DatabaseError::Migration { .. } => {
-                log_error!("Database", "Migration failed", "failure");
-                ApiError::internal_error("Database setup error")
-            },
+            DatabaseError::Connection { .. } => ApiError::service_unavailable("Database service unavailable"),
+            DatabaseError::Migration { .. } => ApiError::internal("Database setup error"),
             DatabaseError::Query { source, .. } => {
                 if let Some(diesel_err) = source.downcast_ref::<DieselError>() {
                     if let DieselError::DatabaseError(
                         diesel::result::DatabaseErrorKind::UniqueViolation, _
                     ) = diesel_err {
-                        return ApiError::unique_constraint_error("record", "already exists");
+                        return ApiError::unique_constraint("record", "already exists");
                     }
                 }
-                log_error!("Database", "Query failed", "failure");
-                ApiError::internal_error("Database operation failed")
+                ApiError::internal("Database operation failed")
             },
-            DatabaseError::NotFound => {
-                ApiError::not_found_error("Record")
-            },
+            DatabaseError::NotFound => ApiError::not_found("Record"),
         }
     }
 }
 
-/// Cache (Redis) related errors
+// --- Cache (Redis) Error ---
 #[derive(Debug, thiserror::Error)]
 pub enum CacheError {
     #[error("Redis connection error: {source}\n{span:?}")]
@@ -176,19 +169,13 @@ impl From<redis::RedisError> for CacheError {
 impl From<CacheError> for ApiError {
     fn from(err: CacheError) -> Self {
         match err {
-            CacheError::Connection { .. } => {
-                log_error!("Redis", "Connection failed", "failure");
-                ApiError::service_unavailable_error("Cache service unavailable")
-            },
-            CacheError::Operation { .. } => {
-                log_error!("Redis", "Operation failed", "failure");
-                ApiError::internal_error("Cache operation failed")
-            },
+            CacheError::Connection { .. } => ApiError::service_unavailable("Cache service unavailable"),
+            CacheError::Operation { .. } => ApiError::internal("Cache operation failed"),
         }
     }
 }
 
-/// Validation error types
+// --- Validation Error ---
 #[derive(Debug, thiserror::Error)]
 pub enum ValidationError {
     #[error("The value for field '{0}' is invalid: {1}")]
@@ -197,7 +184,7 @@ pub enum ValidationError {
     AlreadyExists(String),
 }
 
-/// Authentication related errors
+// --- Authentication Error ---
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
     #[error("Invalid credentials")]
@@ -208,7 +195,7 @@ pub enum AuthError {
     TokenError(String),
 }
 
-/// JWT-specific errors for token operations.
+// --- JWT Error ---
 #[derive(Debug, thiserror::Error)]
 pub enum JwtError {
     #[error("JWT secret is not configured")]
@@ -227,6 +214,7 @@ pub enum JwtError {
     Internal(String),
 }
 
+// --- Email Error ---
 #[derive(Debug, thiserror::Error)]
 pub enum EmailError {
     #[error("Email configuration error: {0}")]
@@ -237,7 +225,7 @@ pub enum EmailError {
     InvalidCode(String),
 }
 
-/// User management errors
+// --- User Error ---
 #[derive(Debug, thiserror::Error)]
 pub enum UserError {
     #[error("Database error: {source}\n{span:?}")]
@@ -256,40 +244,13 @@ pub enum UserError {
     },
 }
 
-/// Service-level errors that can be converted to ApiErrors
-#[derive(Debug, thiserror::Error)]
-pub enum ServiceError {
-    #[error("Database error: {0}")]
-    Database(#[from] DatabaseError),
-    #[error("Cache error: {0}")]
-    Cache(#[from] CacheError),
-    #[error("User error: {0}")]
-    User(#[from] UserError),
-    #[error("Authentication error: {0}")]
-    Auth(#[from] AuthError),
-    #[error("Validation error: {0}")]
-    Validation(#[from] ValidationError),
-    #[error("JWT error: {0}")]
-    Jwt(#[from] JwtError),
-    #[error("Internal error: {0}")]
-    Internal(String),
-    #[error("Email error: {0}")]
-    Email(#[from] EmailError),
-    #[error("Not found: {0}")]
-    NotFound(String),
-}
-
 impl From<diesel::result::Error> for UserError {
     fn from(err: diesel::result::Error) -> Self {
         match err {
-            diesel::result::Error::NotFound => {
-                UserError::NotFound("User record not found".to_string())
-            },
+            diesel::result::Error::NotFound => UserError::NotFound("User record not found".to_string()),
             diesel::result::Error::DatabaseError(
                 diesel::result::DatabaseErrorKind::UniqueViolation, _
-            ) => {
-                UserError::AlreadyExists("Username or email already exists".to_string())
-            },
+            ) => UserError::AlreadyExists("Username or email already exists".to_string()),
             _ => UserError::Database {
                 source: Box::new(err),
                 span: SpanTrace::capture(),
@@ -319,75 +280,86 @@ impl From<argon2::password_hash::Error> for UserError {
     }
 }
 
-// ServiceError to ApiError conversion
+// --- ServiceError ---
+#[derive(Debug, thiserror::Error)]
+pub enum ServiceError {
+    #[error("Database error: {0}")]
+    Database(#[from] DatabaseError),
+    #[error("Cache error: {0}")]
+    Cache(#[from] CacheError),
+    #[error("User error: {0}")]
+    User(#[from] UserError),
+    #[error("Authentication error: {0}")]
+    Auth(#[from] AuthError),
+    #[error("Validation error: {0}")]
+    Validation(#[from] ValidationError),
+    #[error("JWT error: {0}")]
+    Jwt(#[from] JwtError),
+    #[error("Internal error: {0}")]
+    Internal(String),
+    #[error("Email error: {0}")]
+    Email(#[from] EmailError),
+    #[error("Not found: {0}")]
+    NotFound(String),
+}
+
+// --- ServiceError to ApiError conversion ---
 impl From<ServiceError> for ApiError {
     fn from(err: ServiceError) -> Self {
         match err {
             ServiceError::Database(db_err) => db_err.into(),
             ServiceError::Cache(cache_err) => cache_err.into(),
-            ServiceError::User(user_err) => {
-                match user_err {
-                    UserError::NotFound(msg) => ApiError::not_found_error(&msg),
-                    UserError::AlreadyExists(msg) => ApiError::unique_constraint_error("user", &msg),
-                    UserError::Password { .. } => ApiError::internal_error("Password processing error"),
-                    UserError::Database { .. } => ApiError::internal_error("Database operation failed"),
-                }
+            ServiceError::User(user_err) => match user_err {
+                UserError::NotFound(msg) => ApiError::not_found(&msg),
+                UserError::AlreadyExists(msg) => ApiError::unique_constraint("user", &msg),
+                UserError::Password { .. } => ApiError::internal("Password processing error"),
+                UserError::Database { .. } => ApiError::internal("Database operation failed"),
             },
-            ServiceError::Auth(auth_err) => {
-                match auth_err {
-                    AuthError::InvalidCredentials => ApiError::unauthorized_error("Invalid credentials"),
-                    AuthError::AccountNotActivated => ApiError::unauthorized_error("Account not activated"),
-                    AuthError::TokenError(msg) => ApiError::unauthorized_error(&msg),
-                }
+            ServiceError::Auth(auth_err) => match auth_err {
+                AuthError::InvalidCredentials => ApiError::unauthorized("Invalid credentials"),
+                AuthError::AccountNotActivated => ApiError::unauthorized("Account not activated"),
+                AuthError::TokenError(msg) => ApiError::unauthorized(&msg),
             },
-            ServiceError::Validation(val_err) => {
-                match val_err {
-                    ValidationError::InvalidValue(field, msg) => ApiError::validation_error(&field, &msg),
-                    ValidationError::AlreadyExists(msg) => ApiError::unique_constraint_error("validation", &msg),
-                }
+            ServiceError::Validation(val_err) => match val_err {
+                ValidationError::InvalidValue(field, msg) => ApiError::validation(&field, &msg),
+                ValidationError::AlreadyExists(msg) => ApiError::unique_constraint("validation", &msg),
             },
-            ServiceError::Jwt(jwt_err) => {
-                match jwt_err {
-                    JwtError::Configuration(msg) => ApiError::configuration_error(&msg),
-                    JwtError::Expired => ApiError::unauthorized_error("JWT token is expired"),
-                    JwtError::Invalid => ApiError::unauthorized_error("JWT token is invalid"),
-                    JwtError::InvalidSignature => ApiError::unauthorized_error("JWT token has invalid signature"),
-                    JwtError::Revoked => ApiError::unauthorized_error("JWT token is revoked"),
-                    JwtError::InvalidIat => ApiError::unauthorized_error("JWT token has invalid issued-at time"),
-                    JwtError::Internal(msg) => ApiError::internal_error(&msg),
-                }
+            ServiceError::Jwt(jwt_err) => match jwt_err {
+                JwtError::Configuration(msg) => ApiError::configuration(&msg),
+                JwtError::Expired => ApiError::unauthorized("JWT token is expired"),
+                JwtError::Invalid => ApiError::unauthorized("JWT token is invalid"),
+                JwtError::InvalidSignature => ApiError::unauthorized("JWT token has invalid signature"),
+                JwtError::Revoked => ApiError::unauthorized("JWT token is revoked"),
+                JwtError::InvalidIat => ApiError::unauthorized("JWT token has invalid issued-at time"),
+                JwtError::Internal(msg) => ApiError::internal(&msg),
             },
-            ServiceError::Internal(msg) => ApiError::internal_error(&msg),
-            ServiceError::NotFound(msg) => ApiError::not_found_error(&msg),
-            ServiceError::Email(email_error) => {
-                match email_error {
-                    EmailError::Configuration(msg) => ApiError::configuration_error(&msg),
-                    EmailError::Internal(msg) => ApiError::internal_error(&msg),
-                    EmailError::InvalidCode(msg) => ApiError::bad_request_error(&msg),
-                }
-            }
+            ServiceError::Internal(msg) => ApiError::internal(&msg),
+            ServiceError::NotFound(msg) => ApiError::not_found(&msg),
+            ServiceError::Email(email_error) => match email_error {
+                EmailError::Configuration(msg) => ApiError::configuration(&msg),
+                EmailError::Internal(msg) => ApiError::internal(&msg),
+                EmailError::InvalidCode(msg) => ApiError::bad_request(&msg),
+            },
         }
     }
 }
 
 impl fmt::Display for ApiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.status, self.message)
+        write!(f, "{:?}: {}", self.status, self.message)
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        let status = match self.status.as_str() {
-            "validation_error" | "bad_request" => StatusCode::BAD_REQUEST,
-            "unauthorized" => StatusCode::UNAUTHORIZED,
-            "forbidden" => StatusCode::FORBIDDEN,
-            "not_found" => StatusCode::NOT_FOUND,
-            "unique_constraint_error" => StatusCode::CONFLICT,
-            "rate_limit_exceeded" => StatusCode::TOO_MANY_REQUESTS,
-            "configuration_error" | "internal_error" => StatusCode::INTERNAL_SERVER_ERROR,
-            "service_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        let status = match self.status {
+            ApiStatus::ValidationError | ApiStatus::BadRequest => StatusCode::BAD_REQUEST,
+            ApiStatus::Unauthorized => StatusCode::UNAUTHORIZED,
+            ApiStatus::NotFound => StatusCode::NOT_FOUND,
+            ApiStatus::UniqueConstraintError => StatusCode::CONFLICT,
+            ApiStatus::RateLimitExceeded => StatusCode::TOO_MANY_REQUESTS,
+            ApiStatus::ConfigurationError | ApiStatus::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
+            ApiStatus::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         };
 
         let body = serde_json::to_string(&self).unwrap_or_else(|_| {

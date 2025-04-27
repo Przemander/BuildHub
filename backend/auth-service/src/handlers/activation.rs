@@ -11,6 +11,8 @@
 //! Logging is focused on critical events (errors, warnings, process milestones).
 //! High-frequency operations are tracked with metrics.
 
+use std::sync::Arc;
+
 use axum::{
     extract::{Query, State},
     response::{Html, IntoResponse},
@@ -45,7 +47,7 @@ pub struct ActivationParams {
 /// Handler for account activation requests.
 pub async fn activate_account_handler(
     Query(params): Query<ActivationParams>,
-    State(app_state): State<AppState>,
+    State(app_state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
     let mut timer = RequestTimer::start("/auth/activate", "GET");
     REQUESTS_TOTAL.with_label_values(&["/auth/activate", "GET", "pending"]).inc();
@@ -61,7 +63,7 @@ pub async fn activate_account_handler(
             AUTH_ACTIVATIONS.with_label_values(&["service_unavailable"]).inc();
             timer.set_status("500");
             REQUESTS_TOTAL.with_label_values(&["/auth/activate", "GET", "500"]).inc();
-            return render_error_page(&ApiError::service_unavailable_error("Redis client not configured"));
+            return render_error_page(&ApiError::service_unavailable("Redis client not configured"));
         }
     };
 
@@ -79,12 +81,12 @@ pub async fn activate_account_handler(
         Err(err) => {
             log_warn!("Account Activation", "Activation failed", "failure");
             let api_error = ApiError::from(err); // FIX: pass owned ServiceError, not reference or clone
-            let status_code = match api_error.status.as_str() {
-                "bad_request" => {
+            let status_code = match &api_error.status {
+                crate::utils::errors::ApiStatus::BadRequest => {
                     AUTH_ACTIVATIONS.with_label_values(&["invalid_code"]).inc();
                     "400"
                 },
-                "not_found" => {
+                crate::utils::errors::ApiStatus::NotFound => {
                     AUTH_ACTIVATIONS.with_label_values(&["user_not_found"]).inc();
                     "404"
                 },
@@ -267,12 +269,12 @@ fn render_success_page() -> Html<String> {
 fn render_error_page(error: &ApiError) -> Html<String> {
     log_debug!("Account Activation", "Rendering error page", "debug");
 
-    let (heading, message) = match error.status.as_str() {
-        "bad_request" => (
+    let (heading, message) = match &error.status {
+        crate::utils::errors::ApiStatus::BadRequest => (
             "Invalid Activation Link",
             "The activation link is invalid or has expired. Please request a new activation link."
         ),
-        "not_found" => (
+        crate::utils::errors::ApiStatus::NotFound => (
             "Account Not Found",
             "We couldn't find an account associated with this activation link."
         ),

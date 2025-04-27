@@ -3,6 +3,8 @@
 //! Provides functionality for refreshing JWT tokens using a valid refresh token.
 //! Validates the provided refresh token, revokes it, and issues new tokens.
 
+use std::sync::Arc;
+
 use axum::{
     extract::{State, Json},
     http::StatusCode,
@@ -14,17 +16,13 @@ use redis::Client as RedisClient;
 
 use crate::{log_info, log_warn, log_error, log_debug};
 use crate::app::AppState;
-use crate::utils::errors::ApiError;
+use crate::utils::errors::{ApiError, ApiStatus};
 use crate::utils::jwt::{generate_token, validate_token, revoke_token, TOKEN_TYPE_ACCESS, TOKEN_TYPE_REFRESH};
 use crate::utils::metrics::{
     TOKEN_OPERATIONS, TOKEN_VALIDATIONS,
     REQUESTS_TOTAL, RequestTimer,
 };
 
-/// All possible label values for TOKEN_OPERATIONS:
-/// type: "access", "refresh", "any"
-/// operation: "issue", "revoke", "error"
-/// result: "success", "failure"
 #[derive(Debug, Deserialize)]
 pub struct TokenRequest {
     pub token: String,
@@ -39,7 +37,7 @@ pub struct RefreshSuccessData {
 /// Handler for token refresh requests.
 /// Logs overall outcome and critical errors while using metrics for each step.
 pub async fn refresh_token_handler(
-    State(app_state): State<AppState>,
+    State(app_state): State<Arc<AppState>>,
     Json(refresh_request): Json<TokenRequest>,
 ) -> impl IntoResponse {
     let mut timer = RequestTimer::start("/auth/refresh", "POST");
@@ -50,7 +48,7 @@ pub async fn refresh_token_handler(
         None => {
             log_error!("Token Management", "Missing Redis client", "failure");
             timer.set_status("500");
-            return ApiError::internal_error("Redis client not available").into_response();
+            return ApiError::internal("Redis client not available").into_response();
         },
     };
 
@@ -63,16 +61,16 @@ pub async fn refresh_token_handler(
             REQUESTS_TOTAL.with_label_values(&["/auth/refresh", "POST", "200"]).inc();
         },
         Err(api_error) => {
-            let status_code = match api_error.status.as_str() {
-                "unauthorized" => {
+            let status_code = match api_error.status {
+                ApiStatus::Unauthorized => {
                     log_warn!("Token Management", &format!("Token refresh unauthorized: {}", api_error.message), "failure");
                     "401"
                 },
-                "bad_request" => {
+                ApiStatus::BadRequest => {
                     log_warn!("Token Management", &format!("Token refresh bad request: {}", api_error.message), "failure");
                     "400"
                 },
-                "service_unavailable" => {
+                ApiStatus::ServiceUnavailable => {
                     log_error!("Token Management", &format!("Token refresh service unavailable: {}", api_error.message), "failure");
                     "503"
                 },
@@ -111,13 +109,13 @@ async fn process_token_refresh(
             // Provide more detailed error messages based on error type
             let msg = e.to_string();
             if msg.contains("expired") {
-                return Err(ApiError::unauthorized_error("Token has expired"));
+                return Err(ApiError::unauthorized("Token has expired"));
             } else if msg.contains("revoked") {
-                return Err(ApiError::unauthorized_error("Token has been revoked"));
+                return Err(ApiError::unauthorized("Token has been revoked"));
             } else if msg.contains("signature") {
-                return Err(ApiError::unauthorized_error("Invalid token signature"));
+                return Err(ApiError::unauthorized("Invalid token signature"));
             } else {
-                return Err(ApiError::unauthorized_error("Invalid token"));
+                return Err(ApiError::unauthorized("Invalid token"));
             }
         }
     };
@@ -126,7 +124,7 @@ async fn process_token_refresh(
     if claims.token_type != TOKEN_TYPE_REFRESH {
         TOKEN_VALIDATIONS.with_label_values(&["wrong_type"]).inc();
         log_warn!("Token Management", &format!("Incorrect token type: {}", claims.token_type), "failure");
-        return Err(ApiError::bad_request_error("Expected refresh token, got different token type"));
+        return Err(ApiError::bad_request("Expected refresh token, got different token type"));
     }
 
     log_info!("Token Management", "Token type verified", "success");
@@ -142,7 +140,7 @@ async fn process_token_refresh(
             TOKEN_OPERATIONS.with_label_values(&["access", "error"]).inc();
             log_error!("Token Management", &format!("Access token generation failed: {}", e), "failure");
             // Do not leak internal error details to client
-            return Err(ApiError::internal_error("Failed to generate access token"));
+            return Err(ApiError::internal("Failed to generate access token"));
         }
     };
 
@@ -170,7 +168,7 @@ async fn process_token_refresh(
             TOKEN_OPERATIONS.with_label_values(&["refresh", "error"]).inc();
             log_error!("Token Management", &format!("Refresh token generation failed: {}", e), "failure");
             // Do not leak internal error details to client
-            return Err(ApiError::internal_error("Failed to generate refresh token"));
+            return Err(ApiError::internal("Failed to generate refresh token"));
         }
     };
 

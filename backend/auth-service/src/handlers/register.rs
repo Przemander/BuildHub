@@ -10,6 +10,8 @@
 //! 4. Send an activation email to the user.
 //! 5. Return success (201) or appropriate error responses.
 
+use std::sync::Arc;
+
 use axum::{
     extract::{State, Json},
     http::StatusCode,
@@ -20,7 +22,7 @@ use crate::app::AppState;
 use crate::config::database::DbPool;
 use crate::db::users::{User, RegisterData};
 use crate::utils::email::{EmailConfig, generate_activation_code, store_activation_code};
-use crate::utils::errors::{ApiError, ServiceError};
+use crate::utils::errors::{ApiError, ServiceError, ApiStatus};
 use crate::utils::validators::{validate_username, validate_email, validate_password};
 use crate::{log_info, log_warn, log_error, log_debug};
 use redis::Client as RedisClient;
@@ -38,7 +40,7 @@ use crate::utils::metrics::{
 /// 4. Sends an activation email (non-fatal if it fails).
 /// 5. Returns a JSON response with status 201 on success.
 pub async fn register_handler(
-    State(app_state): State<AppState>,
+    State(app_state): State<Arc<AppState>>,
     Json(register_data): Json<RegisterData>,
 ) -> impl IntoResponse {
     let mut timer = RequestTimer::start("/auth/register", "POST");
@@ -51,9 +53,8 @@ pub async fn register_handler(
         None => {
             log_error!("Registration", "Missing Email configuration", "failure");
             timer.set_status("500");
-            // timer.complete(); // Drop will handle completion
             REQUESTS_TOTAL.with_label_values(&["/auth/register", "POST", "500"]).inc();
-            return ApiError::internal_error("Missing EmailConfig").into_response();
+            return ApiError::internal("Missing EmailConfig").into_response();
         }
     };
     let redis_client = match &app_state.redis_client {
@@ -61,9 +62,8 @@ pub async fn register_handler(
         None => {
             log_error!("Registration", "Missing Redis client", "failure");
             timer.set_status("500");
-            // timer.complete(); // Drop will handle completion
             REQUESTS_TOTAL.with_label_values(&["/auth/register", "POST", "500"]).inc();
-            return ApiError::internal_error("Missing RedisClient").into_response();
+            return ApiError::internal("Missing RedisClient").into_response();
         }
     };
 
@@ -72,23 +72,22 @@ pub async fn register_handler(
             log_info!("Registration", "Registration process complete", "success");
             AUTH_REGISTRATIONS.with_label_values(&["success"]).inc();
             timer.set_status("201");
-            // timer.complete(); // Drop will handle completion
             REQUESTS_TOTAL.with_label_values(&["/auth/register", "POST", "201"]).inc();
             response.into_response()
         },
         Err(service_error) => {
             log_warn!("Registration", "Registration process failed", "failure");
             let api_error = ApiError::from(service_error);
-            let status_code = match api_error.status.as_str() {
-                "bad_request" | "validation_error" => {
+            let status_code = match api_error.status {
+                ApiStatus::BadRequest | ApiStatus::ValidationError => {
                     AUTH_REGISTRATIONS.with_label_values(&["validation_error"]).inc();
                     "400"
                 },
-                "unique_constraint_error" | "already_exists" => {
+                ApiStatus::UniqueConstraintError => {
                     AUTH_REGISTRATIONS.with_label_values(&["already_exists"]).inc();
                     "409"
                 },
-                "internal_error" => {
+                ApiStatus::InternalError => {
                     AUTH_REGISTRATIONS.with_label_values(&["system_error"]).inc();
                     "500"
                 },
@@ -98,7 +97,6 @@ pub async fn register_handler(
                 }
             };
             timer.set_status(status_code);
-            // timer.complete(); // Drop will handle completion
             REQUESTS_TOTAL.with_label_values(&["/auth/register", "POST", status_code]).inc();
             api_error.into_response()
         },
