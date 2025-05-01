@@ -1,16 +1,20 @@
 //! Middleware for global and per-IP rate limiting using Redis.
+//!
+//! Logs all rate limit events and increments metrics for observability.
 
-use std::sync::Arc;
+use crate::utils::rate_limit::check_and_increment;
+use crate::utils::metrics::RATE_LIMIT_BLOCKS;
+use crate::{log_warn, log_error};
 use axum::{
     body::{Body, BoxBody},
     http::{Request, StatusCode},
     response::{IntoResponse, Response},
 };
 use redis::Client;
-use tower::{Layer, Service};
 use std::future::Future;
 use std::pin::Pin;
-use crate::utils::rate_limit::check_and_increment;
+use std::sync::Arc;
+use tower::{Layer, Service};
 
 /// RateLimiterLayer configures the rate limiting middleware.
 #[derive(Clone)]
@@ -70,15 +74,19 @@ where
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
-            let allowed = check_and_increment(&redis, &key, max_attempts, window_secs)
-                .await
-                .unwrap_or(true);
+            let allowed = match check_and_increment(&redis, &key, max_attempts, window_secs).await {
+                Ok(val) => val,
+                Err(e) => {
+                    log_error!("RateLimiter", &format!("Redis error: {}", e), "system_error");
+                    // Fail open on Redis error
+                    true
+                }
+            };
 
             if !allowed {
-                let resp = (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "Too many requests"
-                ).into_response();
+                log_warn!("RateLimiter", &format!("Rate limit exceeded for key: {}", key), "rate_limit");
+                RATE_LIMIT_BLOCKS.with_label_values(&["rate_limit"]).inc();
+                let resp = (StatusCode::TOO_MANY_REQUESTS, "Too many requests").into_response();
                 // Convert to BoxBody for compatibility
                 return Ok(resp.map(axum::body::boxed));
             }

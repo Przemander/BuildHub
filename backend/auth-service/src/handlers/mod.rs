@@ -1,7 +1,12 @@
 pub mod activation;
+pub mod activation_logic;
 pub mod login;
+pub mod login_logic;
 pub mod logout;
-pub mod refresh;
-pub mod register;
+pub mod logout_logic;
 pub mod password_reset;
-pub mod loginx;
+pub mod password_reset_logic;
+pub mod refresh;
+pub mod refresh_logic;
+pub mod register;
+pub mod register_logic;

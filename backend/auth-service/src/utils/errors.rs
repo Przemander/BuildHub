@@ -2,13 +2,13 @@
 //!
 //! Provides unified error types, conversions, and consistent API error responses.
 
-use axum::{response::IntoResponse, http::StatusCode};
-use serde::Serialize;
-use std::fmt;
-use crate::{log_error, log_debug};
-use tracing_error::SpanTrace;
+use crate::{log_debug, log_error};
+use axum::{http::StatusCode, response::IntoResponse};
 use diesel::result::Error as DieselError;
+use serde::Serialize;
 use std::error::Error as StdError;
+use std::fmt;
+use tracing_error::SpanTrace;
 
 /// Enum for API error status codes (compile-time safety, serializes as snake_case).
 #[derive(Debug, Serialize)]
@@ -22,7 +22,7 @@ pub enum ApiStatus {
     ConfigurationError,
     BadRequest,
     ServiceUnavailable,
-    RateLimitExceeded,
+    // RateLimitExceeded, // Removed as unused
 }
 
 impl fmt::Display for ApiStatus {
@@ -42,26 +42,35 @@ impl ApiError {
     pub fn new(status: ApiStatus, msg: impl Into<String>) -> Self {
         let msg_str = msg.into();
         match status {
-            ApiStatus::InternalError | ApiStatus::Unauthorized | ApiStatus::ServiceUnavailable | ApiStatus::ConfigurationError => {
+            ApiStatus::InternalError
+            | ApiStatus::Unauthorized
+            | ApiStatus::ServiceUnavailable
+            | ApiStatus::ConfigurationError => {
                 log_error!("ApiError", &msg_str, &format!("{:?} error created", status));
             }
             _ => {
                 log_debug!("ApiError", &msg_str, &format!("{:?} error created", status));
             }
         }
-        ApiError { status, message: msg_str }
+        ApiError {
+            status,
+            message: msg_str,
+        }
     }
     // Convenience constructors
     pub fn validation(field: &str, msg: &str) -> Self {
         Self::new(ApiStatus::ValidationError, format!("{}: {}", field, msg))
     }
     pub fn unique_constraint(field: &str, msg: &str) -> Self {
-        Self::new(ApiStatus::UniqueConstraintError, format!("{}: {}", field, msg))
+        Self::new(
+            ApiStatus::UniqueConstraintError,
+            format!("{}: {}", field, msg),
+        )
     }
-    pub fn internal(msg: &str) -> Self {
+    pub fn internal<M: Into<String>>(msg: M) -> Self {
         Self::new(ApiStatus::InternalError, msg)
     }
-    pub fn unauthorized(msg: &str) -> Self {
+    pub fn unauthorized<M: Into<String>>(msg: M) -> Self {
         Self::new(ApiStatus::Unauthorized, msg)
     }
     pub fn not_found(resource: &str) -> Self {
@@ -76,9 +85,9 @@ impl ApiError {
     pub fn service_unavailable(msg: &str) -> Self {
         Self::new(ApiStatus::ServiceUnavailable, msg)
     }
-    pub fn rate_limit(msg: &str) -> Self {
-        Self::new(ApiStatus::RateLimitExceeded, msg)
-    }
+    // pub fn rate_limit<M: Into<String>>(msg: M) -> Self {
+    //     Self::new(ApiStatus::RateLimitExceeded, msg)
+    // }
 }
 
 // --- Database Error ---
@@ -110,7 +119,7 @@ impl From<DieselError> for DatabaseError {
             _ => DatabaseError::Query {
                 source: Box::new(err),
                 span: SpanTrace::capture(),
-            }
+            },
         }
     }
 }
@@ -118,18 +127,22 @@ impl From<DieselError> for DatabaseError {
 impl From<DatabaseError> for ApiError {
     fn from(err: DatabaseError) -> Self {
         match err {
-            DatabaseError::Connection { .. } => ApiError::service_unavailable("Database service unavailable"),
+            DatabaseError::Connection { .. } => {
+                ApiError::service_unavailable("Database service unavailable")
+            }
             DatabaseError::Migration { .. } => ApiError::internal("Database setup error"),
             DatabaseError::Query { source, .. } => {
                 if let Some(diesel_err) = source.downcast_ref::<DieselError>() {
                     if let DieselError::DatabaseError(
-                        diesel::result::DatabaseErrorKind::UniqueViolation, _
-                    ) = diesel_err {
+                        diesel::result::DatabaseErrorKind::UniqueViolation,
+                        _,
+                    ) = diesel_err
+                    {
                         return ApiError::unique_constraint("record", "already exists");
                     }
                 }
                 ApiError::internal("Database operation failed")
-            },
+            }
             DatabaseError::NotFound => ApiError::not_found("Record"),
         }
     }
@@ -169,7 +182,9 @@ impl From<redis::RedisError> for CacheError {
 impl From<CacheError> for ApiError {
     fn from(err: CacheError) -> Self {
         match err {
-            CacheError::Connection { .. } => ApiError::service_unavailable("Cache service unavailable"),
+            CacheError::Connection { .. } => {
+                ApiError::service_unavailable("Cache service unavailable")
+            }
             CacheError::Operation { .. } => ApiError::internal("Cache operation failed"),
         }
     }
@@ -180,6 +195,7 @@ impl From<CacheError> for ApiError {
 pub enum ValidationError {
     #[error("The value for field '{0}' is invalid: {1}")]
     InvalidValue(String, String),
+    #[allow(dead_code)]
     #[error("{0} already exists")]
     AlreadyExists(String),
 }
@@ -187,10 +203,13 @@ pub enum ValidationError {
 // --- Authentication Error ---
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
+    #[allow(dead_code)]
     #[error("Invalid credentials")]
     InvalidCredentials,
+    #[allow(dead_code)]
     #[error("Account not activated")]
     AccountNotActivated,
+    #[allow(dead_code)]
     #[error("Token error: {0}")]
     TokenError(String),
 }
@@ -247,14 +266,17 @@ pub enum UserError {
 impl From<diesel::result::Error> for UserError {
     fn from(err: diesel::result::Error) -> Self {
         match err {
-            diesel::result::Error::NotFound => UserError::NotFound("User record not found".to_string()),
+            diesel::result::Error::NotFound => {
+                UserError::NotFound("User record not found".to_string())
+            }
             diesel::result::Error::DatabaseError(
-                diesel::result::DatabaseErrorKind::UniqueViolation, _
+                diesel::result::DatabaseErrorKind::UniqueViolation,
+                _,
             ) => UserError::AlreadyExists("Username or email already exists".to_string()),
             _ => UserError::Database {
                 source: Box::new(err),
                 span: SpanTrace::capture(),
-            }
+            },
         }
     }
 }
@@ -295,10 +317,13 @@ pub enum ServiceError {
     Validation(#[from] ValidationError),
     #[error("JWT error: {0}")]
     Jwt(#[from] JwtError),
+    #[allow(dead_code)]
     #[error("Internal error: {0}")]
     Internal(String),
+    #[allow(dead_code)]
     #[error("Email error: {0}")]
     Email(#[from] EmailError),
+    #[allow(dead_code)]
     #[error("Not found: {0}")]
     NotFound(String),
 }
@@ -322,15 +347,21 @@ impl From<ServiceError> for ApiError {
             },
             ServiceError::Validation(val_err) => match val_err {
                 ValidationError::InvalidValue(field, msg) => ApiError::validation(&field, &msg),
-                ValidationError::AlreadyExists(msg) => ApiError::unique_constraint("validation", &msg),
+                ValidationError::AlreadyExists(msg) => {
+                    ApiError::unique_constraint("validation", &msg)
+                }
             },
             ServiceError::Jwt(jwt_err) => match jwt_err {
                 JwtError::Configuration(msg) => ApiError::configuration(&msg),
                 JwtError::Expired => ApiError::unauthorized("JWT token is expired"),
                 JwtError::Invalid => ApiError::unauthorized("JWT token is invalid"),
-                JwtError::InvalidSignature => ApiError::unauthorized("JWT token has invalid signature"),
+                JwtError::InvalidSignature => {
+                    ApiError::unauthorized("JWT token has invalid signature")
+                }
                 JwtError::Revoked => ApiError::unauthorized("JWT token is revoked"),
-                JwtError::InvalidIat => ApiError::unauthorized("JWT token has invalid issued-at time"),
+                JwtError::InvalidIat => {
+                    ApiError::unauthorized("JWT token has invalid issued-at time")
+                }
                 JwtError::Internal(msg) => ApiError::internal(&msg),
             },
             ServiceError::Internal(msg) => ApiError::internal(&msg),
@@ -357,8 +388,10 @@ impl IntoResponse for ApiError {
             ApiStatus::Unauthorized => StatusCode::UNAUTHORIZED,
             ApiStatus::NotFound => StatusCode::NOT_FOUND,
             ApiStatus::UniqueConstraintError => StatusCode::CONFLICT,
-            ApiStatus::RateLimitExceeded => StatusCode::TOO_MANY_REQUESTS,
-            ApiStatus::ConfigurationError | ApiStatus::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
+            // ApiStatus::RateLimitExceeded => StatusCode::TOO_MANY_REQUESTS, // Removed as unused
+            ApiStatus::ConfigurationError | ApiStatus::InternalError => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
             ApiStatus::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         };
 

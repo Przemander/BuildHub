@@ -1,22 +1,22 @@
-//! Simple structured logging for auth service.
+//! Production-ready structured logging for BuildHub Auth Service.
 //!
-//! Provides a single consistent format for log messages with an "origin" field that specifies the source file.
-//! Logs are written to both stdout (via log crate) and a log file for collection by Filebeat asynchronously.
+//! - Logs are written in JSON format to both stdout and a log file (for Filebeat).
+//! - Non-blocking, buffered, and robust against log file rotation/deletion.
+//! - All log macros include a file origin for traceability.
 
-use log::{info, warn, error, debug};
-use serde_json::json;
 use chrono::Utc;
-use std::fs::OpenOptions;
-use std::io::{self, BufWriter, Write};
-use std::path::Path;
-use std::thread;
 use crossbeam_channel::{bounded, Sender};
+use log::{debug, error, info, warn};
 use once_cell::sync::Lazy;
+use serde_json::json;
+use std::fs::OpenOptions;
+use std::io::{BufWriter, Write};
+use std::thread;
 
 // Log message struct for the channel
 struct LogMessage {
     level: String,
-    process: String, 
+    process: String,
     event: String,
     result: String,
     origin: String,
@@ -29,47 +29,42 @@ struct LogChannel {
 
 // Global channel for sending log messages
 static LOG_CHANNEL: Lazy<Option<LogChannel>> = Lazy::new(|| {
-    // Create a bounded channel with appropriate capacity
     let (sender, receiver) = bounded::<LogMessage>(10000);
-    
+
     // Spawn a background thread for processing logs
     let _ = thread::Builder::new()
         .name("log-processor".to_string())
         .spawn(move || {
-            // Initialize the file handle
             let log_dir = std::env::var("LOG_DIR").unwrap_or_else(|_| "logs".to_string());
             let log_file_path = format!("{}/auth-service.log", log_dir);
-            
-            // Create logs directory if it doesn't exist
-            if !Path::new(&log_dir).exists() {
-                if let Err(e) = std::fs::create_dir_all(&log_dir) {
-                    eprintln!("Warning: Could not create log directory: {}", e);
-                    return;
-                }
+
+            // Ensure log directory exists
+            if let Err(e) = std::fs::create_dir_all(&log_dir) {
+                eprintln!("Warning: Could not create log directory: {}", e);
+                return;
             }
-            
-            // Try to open the log file
-            let file = match OpenOptions::new()
+
+            // Open the log file (create if missing)
+            let mut writer = match OpenOptions::new()
                 .create(true)
                 .append(true)
                 .write(true)
-                .open(&log_file_path) {
-                    Ok(file) => file,
-                    Err(e) => {
-                        eprintln!("Warning: Could not open log file: {}", e);
-                        return;
-                    }
-                };
-            
-            // Create a buffered writer for better performance
-            let mut writer = BufWriter::with_capacity(8192, file);
-            
+                .open(&log_file_path)
+                .map(|file| BufWriter::with_capacity(8192, file))
+            {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("Warning: Could not open log file: {}", e);
+                    return;
+                }
+            };
+
+            let mut counter = 0usize;
+
             // Process logs from the channel
             while let Ok(message) = receiver.recv() {
-                // Process the log message
                 let timestamp = Utc::now().to_rfc3339();
-                
-                // Create the structured log object
+
                 let log_data = json!({
                     "service": "auth-service",
                     "process": message.process,
@@ -77,47 +72,45 @@ static LOG_CHANNEL: Lazy<Option<LogChannel>> = Lazy::new(|| {
                     "result": message.result,
                     "level": message.level,
                     "timestamp": timestamp,
-                    "origin": {
-                        "file": message.origin
-                    }
+                    "origin": { "file": message.origin }
                 });
-                
+
                 let log_str = log_data.to_string();
-                
+
                 // Log to console through standard log macros
                 match message.level.as_str() {
                     "DEBUG" => debug!("{}", log_str),
-                    "INFO"  => info!("{}", log_str),
-                    "WARN"  => warn!("{}", log_str),
+                    "INFO" => info!("{}", log_str),
+                    "WARN" => warn!("{}", log_str),
                     "ERROR" => error!("{}", log_str),
-                    _       => warn!("Unknown log level: {}", log_str),
+                    _ => warn!("Unknown log level: {}", log_str),
                 }
-                
+
                 // Write to the file
-                if let Err(_) = writeln!(writer, "{}", log_str) {
-                    // If writing fails, try to reopen the file
-                    // This handles cases where the file might have been deleted/rotated
+                if writeln!(writer, "{}", log_str).is_err() {
+                    // Try to reopen the file if writing fails (e.g., after rotation)
                     if let Ok(new_file) = OpenOptions::new()
                         .create(true)
                         .append(true)
                         .write(true)
-                        .open(&log_file_path) {
+                        .open(&log_file_path)
+                    {
                         writer = BufWriter::with_capacity(8192, new_file);
                         let _ = writeln!(writer, "{}", log_str);
                     }
                 }
-                
-                // Periodically flush - every ~10 log messages
-                // This balances between performance and durability
-                if receiver.len() % 10 == 0 {
+
+                counter += 1;
+                // Periodically flush - every 10 log messages
+                if counter % 10 == 0 {
                     let _ = writer.flush();
                 }
             }
-            
+
             // Final flush when the channel is closed
             let _ = writer.flush();
         });
-    
+
     Some(LogChannel { sender })
 });
 
@@ -129,7 +122,6 @@ impl Log {
     /// This version is non-blocking and sends the log to a background thread.
     pub fn event(level: &str, process: &str, event: &str, result: &str, origin: &str) {
         if let Some(channel) = &*LOG_CHANNEL {
-            // Create log message
             let message = LogMessage {
                 level: level.to_string(),
                 process: process.to_string(),
@@ -137,12 +129,9 @@ impl Log {
                 result: result.to_string(),
                 origin: origin.to_string(),
             };
-            
-            // Try to send the log message, but don't block if the channel is full
             let _ = channel.sender.try_send(message);
         } else {
             // Fallback if the channel isn't initialized
-            // This should rarely happen
             let timestamp = Utc::now().to_rfc3339();
             let log_data = json!({
                 "service": "auth-service",
@@ -151,32 +140,22 @@ impl Log {
                 "result": result,
                 "level": level,
                 "timestamp": timestamp,
-                "origin": {
-                    "file": origin
-                }
+                "origin": { "file": origin }
             });
-            
+
             let log_str = log_data.to_string();
             match level {
                 "DEBUG" => debug!("{}", log_str),
-                "INFO"  => info!("{}", log_str),
-                "WARN"  => warn!("{}", log_str),
+                "INFO" => info!("{}", log_str),
+                "WARN" => warn!("{}", log_str),
                 "ERROR" => error!("{}", log_str),
-                _       => warn!("Unknown log level: {}", log_str),
+                _ => warn!("Unknown log level: {}", log_str),
             }
         }
     }
-    
-    /// Initialize the logging system.
-    /// This ensures the log directory exists and the log file is ready.
-    pub fn init() -> io::Result<()> {
-        // Force initialization of the lazy static
-        let _ = &*LOG_CHANNEL;
-        Ok(())
-    }
 }
 
-// Macros remain unchanged
+// Macros for ergonomic logging
 #[macro_export]
 macro_rules! log_debug {
     ($process:expr, $event:expr, $result:expr) => {

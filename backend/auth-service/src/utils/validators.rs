@@ -9,11 +9,11 @@
 //! - Time validation operations and update corresponding metrics.
 //! - Return early on error and use domain errors (ValidationError) for failures.
 
-use regex::Regex;
-use lazy_static::lazy_static;
-use crate::{log_debug, log_info, log_warn};
-use crate::utils::errors::{ValidationError};
+use crate::utils::errors::ValidationError;
 use crate::utils::metrics::{VALIDATION_OPERATIONS, VALIDATION_TIMING};
+use crate::{log_debug, log_info, log_warn};
+use lazy_static::lazy_static;
+use regex::Regex;
 
 /// Regex pattern definitions for validation.
 const USERNAME_PATTERN: &str = r"^[a-zA-Z0-9_-]{3,30}$"; // 3-30 alphanumeric characters, underscores, dashes.
@@ -62,22 +62,34 @@ fn validate_with_regex(
     error_message: &str,
 ) -> Result<(), ValidationError> {
     let timer = VALIDATION_TIMING.with_label_values(&[field]).start_timer();
-    VALIDATION_OPERATIONS.with_label_values(&[field, "attempt"]).inc();
+    VALIDATION_OPERATIONS
+        .with_label_values(&[field, "attempt"])
+        .inc();
 
     if value.is_empty() {
         log_warn!("Validation", "Empty input for field", "failure");
-        VALIDATION_OPERATIONS.with_label_values(&[field, "empty"]).inc();
-        let res = Err(ValidationError::InvalidValue(field.to_string(), format!("{} cannot be empty", field)));
+        VALIDATION_OPERATIONS
+            .with_label_values(&[field, "empty"])
+            .inc();
+        let res = Err(ValidationError::InvalidValue(
+            field.to_string(),
+            format!("{} cannot be empty", field),
+        ));
         timer.observe_duration();
         return res;
     }
 
     if value.len() > MAX_INPUT_LENGTH {
         log_warn!("Validation", "Input too long", "failure");
-        VALIDATION_OPERATIONS.with_label_values(&[field, "too_long"]).inc();
+        VALIDATION_OPERATIONS
+            .with_label_values(&[field, "too_long"])
+            .inc();
         let res = Err(ValidationError::InvalidValue(
             field.to_string(),
-            format!("{} is too long (max {} characters)", field, MAX_INPUT_LENGTH),
+            format!(
+                "{} is too long (max {} characters)",
+                field, MAX_INPUT_LENGTH
+            ),
         ));
         timer.observe_duration();
         return res;
@@ -85,13 +97,20 @@ fn validate_with_regex(
 
     if regex.is_match(value) {
         log_debug!("Validation", "Input format valid", "success");
-        VALIDATION_OPERATIONS.with_label_values(&[field, "success"]).inc();
+        VALIDATION_OPERATIONS
+            .with_label_values(&[field, "success"])
+            .inc();
         timer.observe_duration();
         Ok(())
     } else {
         log_warn!("Validation", "Input invalid format", "failure");
-        VALIDATION_OPERATIONS.with_label_values(&[field, "invalid_format"]).inc();
-        let res = Err(ValidationError::InvalidValue(field.to_string(), error_message.to_string()));
+        VALIDATION_OPERATIONS
+            .with_label_values(&[field, "invalid_format"])
+            .inc();
+        let res = Err(ValidationError::InvalidValue(
+            field.to_string(),
+            error_message.to_string(),
+        ));
         timer.observe_duration();
         res
     }
@@ -134,21 +153,32 @@ pub fn validate_username(username: &str) -> Result<(), ValidationError> {
 /// * `Ok(())` if valid.
 /// * `Err(ValidationError)` if invalid.
 pub fn validate_email(email: &str) -> Result<(), ValidationError> {
-    let timer = VALIDATION_TIMING.with_label_values(&["email"]).start_timer();
-    VALIDATION_OPERATIONS.with_label_values(&["email", "attempt"]).inc();
+    let timer = VALIDATION_TIMING
+        .with_label_values(&["email"])
+        .start_timer();
+    VALIDATION_OPERATIONS
+        .with_label_values(&["email", "attempt"])
+        .inc();
     log_debug!("Validation", "Starting email validation", "attempt");
 
     if email.is_empty() {
         log_warn!("Validation", "Email is empty", "failure");
-        VALIDATION_OPERATIONS.with_label_values(&["email", "empty"]).inc();
-        let res = Err(ValidationError::InvalidValue("email".to_string(), "Email cannot be empty".to_string()));
+        VALIDATION_OPERATIONS
+            .with_label_values(&["email", "empty"])
+            .inc();
+        let res = Err(ValidationError::InvalidValue(
+            "email".to_string(),
+            "Email cannot be empty".to_string(),
+        ));
         timer.observe_duration();
         return res;
     }
 
     if email.len() > MAX_INPUT_LENGTH {
         log_warn!("Validation", "Email exceeds maximum length", "failure");
-        VALIDATION_OPERATIONS.with_label_values(&["email", "too_long"]).inc();
+        VALIDATION_OPERATIONS
+            .with_label_values(&["email", "too_long"])
+            .inc();
         let res = Err(ValidationError::InvalidValue(
             "email".to_string(),
             format!("Email is too long (max {} characters)", MAX_INPUT_LENGTH),
@@ -159,16 +189,26 @@ pub fn validate_email(email: &str) -> Result<(), ValidationError> {
 
     if !EMAIL_REGEX.is_match(email) {
         log_warn!("Validation", "Email regex mismatch", "failure");
-        VALIDATION_OPERATIONS.with_label_values(&["email", "regex_mismatch"]).inc();
-        let res = Err(ValidationError::InvalidValue("email".to_string(), EMAIL_ERROR.to_string()));
+        VALIDATION_OPERATIONS
+            .with_label_values(&["email", "regex_mismatch"])
+            .inc();
+        let res = Err(ValidationError::InvalidValue(
+            "email".to_string(),
+            EMAIL_ERROR.to_string(),
+        ));
         timer.observe_duration();
         return res;
     }
 
     if !email.split('@').nth(1).unwrap_or("").contains('.') {
         log_warn!("Validation", "Email domain invalid", "failure");
-        VALIDATION_OPERATIONS.with_label_values(&["email", "invalid_domain"]).inc();
-        let res = Err(ValidationError::InvalidValue("email".to_string(), "Email domain appears invalid".to_string()));
+        VALIDATION_OPERATIONS
+            .with_label_values(&["email", "invalid_domain"])
+            .inc();
+        let res = Err(ValidationError::InvalidValue(
+            "email".to_string(),
+            "Email domain appears invalid".to_string(),
+        ));
         timer.observe_duration();
         return res;
     }
@@ -176,14 +216,21 @@ pub fn validate_email(email: &str) -> Result<(), ValidationError> {
     let tld = email.split('.').last().unwrap_or("");
     if tld.len() < 2 || tld.len() > 63 {
         log_warn!("Validation", "Email TLD invalid", "failure");
-        VALIDATION_OPERATIONS.with_label_values(&["email", "invalid_tld"]).inc();
-        let res = Err(ValidationError::InvalidValue("email".to_string(), "Email TLD appears invalid".to_string()));
+        VALIDATION_OPERATIONS
+            .with_label_values(&["email", "invalid_tld"])
+            .inc();
+        let res = Err(ValidationError::InvalidValue(
+            "email".to_string(),
+            "Email TLD appears invalid".to_string(),
+        ));
         timer.observe_duration();
         return res;
     }
 
     log_info!("Validation", "Email validation succeeded", "success");
-    VALIDATION_OPERATIONS.with_label_values(&["email", "success"]).inc();
+    VALIDATION_OPERATIONS
+        .with_label_values(&["email", "success"])
+        .inc();
     timer.observe_duration();
     Ok(())
 }
@@ -201,30 +248,49 @@ pub fn validate_email(email: &str) -> Result<(), ValidationError> {
 /// * `Ok(())` if valid.
 /// * `Err(ValidationError)` if invalid.
 pub fn validate_password(password: &str) -> Result<(), ValidationError> {
-    let timer = VALIDATION_TIMING.with_label_values(&["password"]).start_timer();
-    VALIDATION_OPERATIONS.with_label_values(&["password", "attempt"]).inc();
+    let timer = VALIDATION_TIMING
+        .with_label_values(&["password"])
+        .start_timer();
+    VALIDATION_OPERATIONS
+        .with_label_values(&["password", "attempt"])
+        .inc();
     log_debug!("Validation", "Starting password validation", "attempt");
 
     if password.is_empty() {
         log_warn!("Validation", "Password is empty", "failure");
-        VALIDATION_OPERATIONS.with_label_values(&["password", "empty"]).inc();
-        let res = Err(ValidationError::InvalidValue("password".to_string(), "Password cannot be empty".to_string()));
+        VALIDATION_OPERATIONS
+            .with_label_values(&["password", "empty"])
+            .inc();
+        let res = Err(ValidationError::InvalidValue(
+            "password".to_string(),
+            "Password cannot be empty".to_string(),
+        ));
         timer.observe_duration();
         return res;
     }
 
     if password.len() < 8 {
         log_warn!("Validation", "Password too short", "failure");
-        VALIDATION_OPERATIONS.with_label_values(&["password", "too_short"]).inc();
-        let res = Err(ValidationError::InvalidValue("password".to_string(), "Password must be at least 8 characters long".to_string()));
+        VALIDATION_OPERATIONS
+            .with_label_values(&["password", "too_short"])
+            .inc();
+        let res = Err(ValidationError::InvalidValue(
+            "password".to_string(),
+            "Password must be at least 8 characters long".to_string(),
+        ));
         timer.observe_duration();
         return res;
     }
 
     if password.len() > 128 {
         log_warn!("Validation", "Password too long", "failure");
-        VALIDATION_OPERATIONS.with_label_values(&["password", "too_long"]).inc();
-        let res = Err(ValidationError::InvalidValue("password".to_string(), "Password is too long (max 128 characters)".to_string()));
+        VALIDATION_OPERATIONS
+            .with_label_values(&["password", "too_long"])
+            .inc();
+        let res = Err(ValidationError::InvalidValue(
+            "password".to_string(),
+            "Password is too long (max 128 characters)".to_string(),
+        ));
         timer.observe_duration();
         return res;
     }
@@ -235,30 +301,51 @@ pub fn validate_password(password: &str) -> Result<(), ValidationError> {
 
     if !has_letter {
         log_warn!("Validation", "Password missing letter", "failure");
-        VALIDATION_OPERATIONS.with_label_values(&["password", "missing_letter"]).inc();
-        let res = Err(ValidationError::InvalidValue("password".to_string(), "Password must include at least one letter".to_string()));
+        VALIDATION_OPERATIONS
+            .with_label_values(&["password", "missing_letter"])
+            .inc();
+        let res = Err(ValidationError::InvalidValue(
+            "password".to_string(),
+            "Password must include at least one letter".to_string(),
+        ));
         timer.observe_duration();
         return res;
     }
 
     if !has_number {
         log_warn!("Validation", "Password missing number", "failure");
-        VALIDATION_OPERATIONS.with_label_values(&["password", "missing_number"]).inc();
-        let res = Err(ValidationError::InvalidValue("password".to_string(), "Password must include at least one number".to_string()));
+        VALIDATION_OPERATIONS
+            .with_label_values(&["password", "missing_number"])
+            .inc();
+        let res = Err(ValidationError::InvalidValue(
+            "password".to_string(),
+            "Password must include at least one number".to_string(),
+        ));
         timer.observe_duration();
         return res;
     }
 
     if !has_special {
-        log_warn!("Validation", "Password missing special character", "failure");
-        VALIDATION_OPERATIONS.with_label_values(&["password", "missing_special"]).inc();
-        let res = Err(ValidationError::InvalidValue("password".to_string(), PASSWORD_ERROR.to_string()));
+        log_warn!(
+            "Validation",
+            "Password missing special character",
+            "failure"
+        );
+        VALIDATION_OPERATIONS
+            .with_label_values(&["password", "missing_special"])
+            .inc();
+        let res = Err(ValidationError::InvalidValue(
+            "password".to_string(),
+            PASSWORD_ERROR.to_string(),
+        ));
         timer.observe_duration();
         return res;
     }
 
     log_info!("Validation", "Password validation succeeded", "success");
-    VALIDATION_OPERATIONS.with_label_values(&["password", "success"]).inc();
+    VALIDATION_OPERATIONS
+        .with_label_values(&["password", "success"])
+        .inc();
     timer.observe_duration();
     Ok(())
 }

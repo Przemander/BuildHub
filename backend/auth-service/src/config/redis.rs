@@ -6,12 +6,15 @@
 //! critical events and errors while metrics record operation attempts,
 //! successes, and failures.
 
+use crate::utils::errors::CacheError;
+use crate::utils::metrics::{REDIS_HEALTH, REDIS_OPERATIONS};
+use crate::{log_debug, log_error, log_info};
 use redis::{AsyncCommands, Client};
 use std::env;
 use tracing_error::SpanTrace;
-use crate::{log_info, log_error, log_debug};
-use crate::utils::errors::CacheError;
-use crate::utils::metrics::{REDIS_OPERATIONS, REDIS_HEALTH};
+
+/// Type alias for Redis async connection.
+pub type RedisConnection = redis::aio::Connection;
 
 /// Initializes the Redis client using the REDIS_URL environment variable.
 ///
@@ -32,7 +35,9 @@ pub fn init_redis() -> Result<Client, CacheError> {
     })?;
 
     log_debug!("Redis", "Client initialized", "success");
-    REDIS_OPERATIONS.with_label_values(&["init", "success"]).inc();
+    REDIS_OPERATIONS
+        .with_label_values(&["init", "success"])
+        .inc();
     Ok(client)
 }
 
@@ -47,8 +52,10 @@ pub async fn check_redis_connection(redis_client: &Client) -> bool {
         Ok(con) => con,
         Err(e) => {
             log_error!("Redis", &format!("Connect to server: {}", e), "failure");
-            REDIS_OPERATIONS.with_label_values(&["connection", "failure"]).inc();
-            REDIS_HEALTH.set(0.0); // Update health metric
+            REDIS_OPERATIONS
+                .with_label_values(&["connection", "failure"])
+                .inc();
+            REDIS_HEALTH.set(0.0);
             return false;
         }
     };
@@ -56,14 +63,18 @@ pub async fn check_redis_connection(redis_client: &Client) -> bool {
     match redis::cmd("PING").query_async::<_, String>(&mut con).await {
         Ok(resp) if resp == "PONG" => {
             log_info!("Redis", "Connection check", "success");
-            REDIS_OPERATIONS.with_label_values(&["ping", "success"]).inc();
-            REDIS_HEALTH.set(1.0); // Update health metric
+            REDIS_OPERATIONS
+                .with_label_values(&["ping", "success"])
+                .inc();
+            REDIS_HEALTH.set(1.0);
             true
-        },
+        }
         Ok(_) | Err(_) => {
             log_error!("Redis", "PING command", "failure");
-            REDIS_OPERATIONS.with_label_values(&["ping", "failure"]).inc();
-            REDIS_HEALTH.set(0.0); // Update health metric
+            REDIS_OPERATIONS
+                .with_label_values(&["ping", "failure"])
+                .inc();
+            REDIS_HEALTH.set(0.0);
             false
         }
     }
@@ -77,10 +88,12 @@ pub async fn check_redis_connection(redis_client: &Client) -> bool {
 /// # Returns
 /// * `Ok(Connection)` if connection succeeded.
 /// * `Err(CacheError)` if connection failed.
-pub async fn get_redis_connection(client: &Client) -> Result<redis::aio::Connection, CacheError> {
+pub async fn get_redis_connection(client: &Client) -> Result<RedisConnection, CacheError> {
     client.get_async_connection().await.map_err(|e| {
         log_error!("Redis", &format!("Get connection: {}", e), "failure");
-        REDIS_OPERATIONS.with_label_values(&["get_connection", "failure"]).inc();
+        REDIS_OPERATIONS
+            .with_label_values(&["get_connection", "failure"])
+            .inc();
         CacheError::Connection {
             source: Box::new(e),
             span: SpanTrace::capture(),
@@ -99,16 +112,20 @@ pub async fn block_token(redis: &Client, token: &str, exp: usize) -> Result<(), 
     log_debug!("Token Management", "Block token", "attempt");
     let mut conn = get_redis_connection(redis).await?;
 
-    conn.set_ex::<&str, &str, ()>(token, "blocked", exp).await.map_err(|e| {
-        log_error!("Redis", &format!("Block token failed: {}", e), "failure");
-        CacheError::Operation {
-            source: Box::new(e),
-            span: SpanTrace::capture(),
-        }
-    })?;
+    conn.set_ex::<&str, &str, ()>(token, "blocked", exp)
+        .await
+        .map_err(|e| {
+            log_error!("Redis", &format!("Block token failed: {}", e), "failure");
+            CacheError::Operation {
+                source: Box::new(e),
+                span: SpanTrace::capture(),
+            }
+        })?;
 
     log_debug!("Token Management", "Token successfully blocked", "success");
-    REDIS_OPERATIONS.with_label_values(&["block_token", "success"]).inc();
+    REDIS_OPERATIONS
+        .with_label_values(&["block_token", "success"])
+        .inc();
     Ok(())
 }
 
@@ -135,6 +152,11 @@ pub async fn is_token_blocked(redis: &Client, token: &str) -> Result<bool, Cache
     } else {
         log_debug!("Token Management", "Token is valid", "success");
     }
-    REDIS_OPERATIONS.with_label_values(&["is_token_blocked", if exists { "blocked" } else { "not_blocked" }]).inc();
+    REDIS_OPERATIONS
+        .with_label_values(&[
+            "is_token_blocked",
+            if exists { "blocked" } else { "not_blocked" },
+        ])
+        .inc();
     Ok(exists)
 }
