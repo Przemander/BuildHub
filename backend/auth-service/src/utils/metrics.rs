@@ -84,7 +84,7 @@ lazy_static! {
     pub static ref TOKEN_VALIDATIONS: CounterVec = register_counter_vec!(
         "auth_token_validations_total",
         "Number of token validations",
-        &["result"] // result: "valid", "invalid", "expired", "revoked", "wrong_type"
+        &["operation", "result"] // was just &["result"]
     ).expect("Failed to register TOKEN_VALIDATIONS");
 
     pub static ref ACTIVE_TOKENS: GaugeVec = register_gauge_vec!(

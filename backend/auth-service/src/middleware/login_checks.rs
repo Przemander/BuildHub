@@ -94,3 +94,69 @@ pub async fn enforce_rate_limit(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::StatusCode;
+    use redis::{AsyncCommands, cmd};
+    use uuid::Uuid;
+
+    /// Flush Redis and return a client.
+    async fn setup_redis() -> redis::Client {
+        let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+        let mut conn = client.get_async_connection().await.unwrap();
+        // FLUSHDB via generic command (AsyncCommands::flushdb may not be in scope)
+        let _: () = cmd("FLUSHDB").query_async(&mut conn).await.unwrap();
+        client
+    }
+
+    #[tokio::test]
+    async fn enforce_rate_limit_allows_and_blocks() {
+        let client = setup_redis().await;
+        let login = Uuid::new_v4().to_string();
+
+        // Under limit (5 attempts) => Ok
+        for i in 1..=5 {
+            assert!(
+                enforce_rate_limit(&client, &login).await.is_ok(),
+                "attempt #{} should pass",
+                i
+            );
+        }
+
+        // 6th attempt => Err(Response 400)
+        let err = enforce_rate_limit(&client, &login)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn enforce_rate_limit_fail_open_on_redis_error() {
+        // Bad port => fail-open => Ok
+        let client = redis::Client::open("redis://127.0.0.1:6380/").unwrap();
+        let login = "user".to_string();
+        assert!(enforce_rate_limit(&client, &login).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn enforce_lockout_allows_and_blocks() {
+        let client = setup_redis().await;
+        let mut conn = client.get_async_connection().await.unwrap();
+        let login = Uuid::new_v4().to_string();
+
+        // No lockout => Ok
+        assert!(enforce_lockout(&client, &login).await.is_ok());
+
+        // Set lockout key with 60s TTL
+        let key = format!("lockout:{}", login);
+        let _: () = conn.set_ex(&key, 1, 60).await.unwrap();
+
+        // Now should Err(Response 401)
+        let err = enforce_lockout(&client, &login)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+    }
+}

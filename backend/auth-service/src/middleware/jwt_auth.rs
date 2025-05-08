@@ -63,3 +63,85 @@ pub async fn jwt_auth_middleware<B>(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::AppState;
+    use crate::config::database::{init_pool, run_migrations};
+    // bring in the token helpers and the ACCESS constant
+    use crate::utils::jwt::{self, TOKEN_TYPE_ACCESS};
+    // chrono is already a project dependency
+    use chrono::Duration;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+        response::IntoResponse,
+        routing::get,
+        Router,
+        middleware::from_fn_with_state,
+    };
+    use redis::Client;
+    use std::sync::Arc;
+    use std::env;
+    use tower::ServiceExt;
+
+    // a dummy handler that returns "OK"
+    async fn ok_handler() -> &'static str {
+        "OK"
+    }
+
+    // build AppState with optional redis URL, using an in-memory SQLite DB for tests
+    fn make_state(redis_url: Option<&str>) -> Arc<AppState> {
+        // 0) configure a JWT secret for token generation/validation
+        env::set_var("JWT_SECRET", "test-secret");
+        // 1) force SQLite to use in-memory
+        env::set_var("DATABASE_URL", ":memory:");
+        // 2) init pool and run migrations
+        let pool = init_pool();
+        run_migrations(&pool).expect("Failed to run migrations on in-memory DB");
+        // 3) optional redis client
+        let redis_client = redis_url.map(Client::open).transpose().unwrap();
+        Arc::new(AppState { pool, redis_client, email_config: None })
+    }
+
+    #[tokio::test]
+    async fn missing_auth_header_returns_401() {
+        let state = make_state(Some("redis://127.0.0.1/"));
+        let app = Router::new()
+            .route("/", get(ok_handler))
+            .layer(from_fn_with_state(state.clone(), jwt_auth_middleware));
+
+        let resp = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn valid_token_calls_next() {
+        let state = make_state(Some("redis://127.0.0.1/"));
+        // use the real TOKEN_TYPE_ACCESS and chrono::Duration
+        let token = jwt::generate_token("test-user", TOKEN_TYPE_ACCESS, Some(Duration::hours(1))).unwrap();
+
+        let app = Router::new()
+            .route("/", get(ok_handler))
+            .layer(from_fn_with_state(state.clone(), jwt_auth_middleware));
+
+        let req = Request::builder()
+            .uri("/")
+            .header("authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = hyper::body::to_bytes(resp.into_response().into_body())
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"OK");
+    }
+}
