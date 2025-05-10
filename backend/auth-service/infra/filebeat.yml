@@ -1,56 +1,57 @@
-filebeat.inputs:
-- type: log
-  enabled: true
-  paths:
-    - /logs/*.log
-  json.keys_under_root: true
-  json.add_error_key: true
-  json.message_key: message
-  fields:
-    service: auth-service
-  fields_under_root: true
-  scan_frequency: 5s
+######################  
+# 1. Disable ILM & default template
+######################
+setup.ilm.enabled: false
+setup.template.enabled: false
 
-filebeat.config.modules:
-  path: ${path.config}/modules.d/*.yml
-  reload.enabled: false
+######################  
+# 2. Inputs: use Filebeat’s newer filestream (not deprecated log)
+######################
+filebeat.inputs:
+  - type: filestream
+    enabled: true
+    paths:
+      - /var/log/auth-service/*.log
+    # parse each line as JSON
+    json.keys_under_root: true
+    json.add_error_key: true
+    json.message_key: message
+    # tag it so you can filter in ES if you want
+    fields_under_root: true
 
 processors:
-  - add_host_metadata:
-      when.not.contains.tags: forwarded
-  - add_docker_metadata: ~
-  - add_cloud_metadata: ~
-  - add_fields:
-      target: ''
-      fields:
-        environment: ${ENVIRONMENT:development}
-  - timestamp:
-      field: timestamp
-      layouts:
-        - '2006-01-02T15:04:05.999Z07:00' # RFC3339
+  - decode_json_fields:
+      fields: ["message"]       # The field that holds your nested JSON
+      target: ""                # Merge decoded keys at the root level
+      overwrite_keys: true      # Overwrite existing keys with decoded ones
+      add_error_key: true       # Add an error key if decoding fails
+
+  # Drop unnecessary metadata fields
   - drop_fields:
-      fields: ["agent", "ecs", "input", "log"]
-      ignore_missing: true
+      fields: ["log", "input", "agent", "ecs", "host"]
 
-output.opensearch:
-  hosts: ["${OPENSEARCH_HOSTS:opensearch:9200}"]
-  index: "logs-auth-service-%{+yyyy.MM.dd}"
-  protocol: http
-  timeout: 30s
-  ssl.enabled: false
-  bulk_max_size: 1000
-  compression_level: 5
-  worker: 2
+######################  
+# 3. Template registration for your custom index
+######################
+setup.template.name: "auth-service-logs"
+setup.template.pattern: "auth-service-logs-*"
+# You can point at your own template JSON if you have one:
+# setup.template.file: "auth-service-template.json"
 
-setup.template.name: "logs-auth-service"
-setup.template.pattern: "logs-auth-service-*"
-setup.template.overwrite: true
-setup.ilm.enabled: false
+######################  
+# 4. Ship straight into ES with your index name
+######################
+output.elasticsearch:
+  hosts: ["elasticsearch:9200"]
+  index: "auth-service-logs-%{+yyyy.MM.dd}"
 
+######################  
+# 5. Filebeat’s own logs (optional)
+######################
 logging.level: info
 logging.to_files: true
 logging.files:
-  path: /var/log/filebeat
+  path: /usr/share/filebeat/logs
   name: filebeat
   keepfiles: 7
   permissions: 0644
