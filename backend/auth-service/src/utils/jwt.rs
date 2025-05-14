@@ -91,15 +91,19 @@ pub fn generate_token(
         jti: Some(uuid::Uuid::new_v4().to_string()),
     };
 
-    let secret = env::var("JWT_SECRET").map_err(|_| {
-        log_error!("Token Management", "JWT secret configuration", "failure");
-        TOKEN_OPERATIONS
-            .with_label_values(&["generate", "failure"])
-            .inc();
-        ServiceError::Jwt(JwtError::Configuration(
-            "JWT secret is not configured".to_string(),
-        ))
-    })?;
+    // pull secret, fail if missing or empty
+    let secret = match env::var("JWT_SECRET") {
+        Ok(s) if !s.trim().is_empty() => s,
+        _ => {
+            log_error!("Token Management", "JWT secret configuration", "failure");
+            TOKEN_OPERATIONS
+                .with_label_values(&["generate", "failure"])
+                .inc();
+            return Err(ServiceError::Jwt(JwtError::Configuration(
+                "JWT secret is not configured".to_string(),
+            )));
+        }
+    };
 
     let mut header = Header::default();
     header.alg = Algorithm::HS256;
@@ -284,4 +288,90 @@ pub async fn revoke_token(token: &str, redis_client: &redis::Client) -> Result<(
         .with_label_values(&["revoke", "success"])
         .inc();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+    use std::{env, thread};
+    use redis::Client;
+    use crate::config::redis::is_token_blocked;
+
+    // Ensure we always use a test secret
+    fn init_secret() {
+        env::set_var("JWT_SECRET", "test-secret");
+    }
+
+    #[test]
+    fn generate_and_decode_token_roundtrip() {
+        init_secret();
+        let tok = generate_token("alice", TOKEN_TYPE_ACCESS, Some(Duration::hours(1)))
+            .expect("should generate");
+        let claims = decode_token(&tok).expect("should decode");
+        assert_eq!(claims.sub, "alice");
+        assert_eq!(claims.token_type, TOKEN_TYPE_ACCESS);
+    }
+
+    #[test]
+    fn generate_fails_without_secret() {
+        // leave the var present, but empty => still treated as “not configured”
+        env::set_var("JWT_SECRET", "");
+
+        let err = generate_token("u", TOKEN_TYPE_ACCESS, Some(Duration::hours(1))).unwrap_err();
+        match err {
+            ServiceError::Jwt(JwtError::Configuration(_)) => {}
+            _ => panic!("expected Configuration error"),
+        }
+    }
+
+    #[test]
+    fn decode_invalid_token_errors() {
+        init_secret();
+        let bad = "not-a.jwt.token";
+        let err = decode_token(bad).unwrap_err();
+        match err {
+            ServiceError::Jwt(JwtError::Invalid) => {}
+            _ => panic!("expected Invalid token error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_token_ok_and_revoked() {
+        init_secret();
+        // generate a short‐lived token
+        let tok = generate_token("bob", TOKEN_TYPE_ACCESS, Some(Duration::hours(1)))
+            .unwrap();
+        let client = Client::open("redis://127.0.0.1/").unwrap();
+
+        // Should validate before revocation
+        let claims = validate_token(&tok, &client).await.unwrap();
+        assert_eq!(claims.sub, "bob");
+
+        // Revoke it
+        revoke_token(&tok, &client).await.unwrap();
+        // small sleep to let Redis write
+        thread::sleep(std::time::Duration::from_millis(50));
+
+        // Now validate_token should Err(Revoked)
+        let err = validate_token(&tok, &client).await.unwrap_err();
+        match err {
+            ServiceError::Jwt(JwtError::Revoked) => {}
+            _ => panic!("expected Revoked"),
+        }
+    }
+
+    #[tokio::test]
+    async fn revoke_token_on_expired_is_noop() {
+        init_secret();
+        // expiry in the past
+        let tok = generate_token("x", TOKEN_TYPE_ACCESS, Some(Duration::seconds(-1)))
+            .unwrap();
+        let client = Client::open("redis://127.0.0.1/").unwrap();
+        // Should be Ok and not error
+        revoke_token(&tok, &client).await.unwrap();
+        // And blocklist should _not_ contain it
+        let blocked = is_token_blocked(&client, &tok).await.unwrap();
+        assert!(!blocked);
+    }
 }

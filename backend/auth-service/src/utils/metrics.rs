@@ -220,7 +220,6 @@ pub static RATE_LIMIT_BLOCKS: Lazy<CounterVec> = Lazy::new(|| {
 
 /// Initialize all metrics.
 /// Call this function early in the application startup to force registration.
-#[allow(dead_code)]
 pub fn init() {
     let _ = &AUTH_LOGIN_ATTEMPTS;
     let _ = &AUTH_REGISTRATIONS;

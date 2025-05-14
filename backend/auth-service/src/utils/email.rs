@@ -121,6 +121,19 @@ impl EmailConfig {
     }
 }
 
+#[cfg(test)]
+impl EmailConfig {
+    /// Used only in unit tests to avoid real SMTP work.
+    pub fn dummy() -> Self {
+        EmailConfig {
+            from_address: "test@example.com".into(),
+            mailer: SmtpTransport::builder_dangerous("localhost")
+                .port(1025)
+                .build(),
+        }
+    }
+}
+
 /// Sends a password reset email with a reset link containing the token.
 pub async fn send_password_reset_email(
     email_config: &EmailConfig,
@@ -270,6 +283,92 @@ pub async fn verify_activation_code(
             Err(ServiceError::Email(EmailError::InvalidCode(
                 "Invalid or expired activation code".to_string(),
             )))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use redis::Client;
+    
+    use std::env;
+
+    /// Helper to get a Redis client pointing at localhost.
+    async fn make_redis_client() -> Client {
+        Client::open("redis://127.0.0.1/")
+            .expect("Redis must be running on localhost:6379")
+    }
+
+    #[test]
+    fn generate_activation_code_non_empty() {
+        let code = generate_activation_code();
+        assert!(!code.is_empty(), "Activation code should not be empty");
+        // UUID v4 has at least 36 characters
+        assert!(code.len() >= 36);
+    }
+
+    #[test]
+    fn generate_activation_link_defaults_to_localhost() {
+        env::remove_var("FRONTEND_URL");
+        let code = "testcode";
+        let link = generate_activation_link(code);
+        assert!(
+            link.starts_with("http://localhost:3000/activate?code="),
+            "Expected default localhost URL"
+        );
+        assert!(link.ends_with(code), "Should include the activation code");
+    }
+
+    #[test]
+    fn generate_activation_link_respects_env() {
+        env::set_var("FRONTEND_URL", "https://example.org");
+        let code = "abc123";
+        let link = generate_activation_link(code);
+        assert_eq!(
+            link,
+            "https://example.org/activate?code=abc123",
+            "Should use FRONTEND_URL"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_and_verify_activation_code_roundtrip() {
+        let client = make_redis_client().await;
+        let code = generate_activation_code();
+        // ensure no leftover key
+        let mut conn = client.get_async_connection().await.expect("Failed to get connection");
+        let _ : Option<String> = conn.get(&format!("activation:code:{}", code)).await.ok();
+
+        // store it
+        store_activation_code(&client, "user@example.com", &code)
+            .await
+            .expect("store_activation_code should succeed");
+
+        // verify it
+        let email = verify_activation_code(&client, &code)
+            .await
+            .expect("verify_activation_code should succeed");
+        assert_eq!(email, "user@example.com");
+
+        // second verify should fail
+        let err = verify_activation_code(&client, &code).await.unwrap_err();
+        match err {
+            ServiceError::Email(EmailError::InvalidCode(_)) => {}
+            _ => panic!("Expected InvalidCode error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_activation_code_not_found() {
+        let client = make_redis_client().await;
+        let fake_code = "doesnotexist";
+        let err = verify_activation_code(&client, fake_code).await.unwrap_err();
+        match err {
+            ServiceError::Email(EmailError::InvalidCode(msg)) => {
+                assert!(msg.contains("Invalid or expired"));
+            }
+            _ => panic!("Expected InvalidCode error"),
         }
     }
 }

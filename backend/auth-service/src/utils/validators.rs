@@ -349,3 +349,196 @@ pub fn validate_password(password: &str) -> Result<(), ValidationError> {
     timer.observe_duration();
     Ok(())
 }
+
+// …existing code…
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::errors::ValidationError;
+
+    #[test]
+    fn validate_username_ok() {
+        assert!(validate_username("user_123").is_ok());
+    }
+
+    #[test]
+    fn validate_username_empty() {
+        let err = validate_username("").unwrap_err();
+        match err {
+            ValidationError::InvalidValue(field, msg) => {
+                assert_eq!(field, "username");
+                assert!(msg.contains("cannot be empty"));
+            }
+            _ => panic!("expected InvalidValue"),
+        }
+    }
+
+    #[test]
+    fn validate_username_too_long() {
+        let long = "a".repeat(MAX_INPUT_LENGTH + 1);
+        let err = validate_username(&long).unwrap_err();
+        match err {
+            ValidationError::InvalidValue(field, msg) => {
+                assert_eq!(field, "username");
+                assert!(msg.contains("too long"));
+            }
+            _ => panic!("expected InvalidValue"),
+        }
+    }
+
+    #[test]
+    fn validate_username_bad_format() {
+        let err = validate_username("no spaces!").unwrap_err();
+        match err {
+            ValidationError::InvalidValue(field, _) => {
+                assert_eq!(field, "username");
+            }
+            _ => panic!("expected InvalidValue"),
+        }
+    }
+
+    #[test]
+    fn validate_email_ok() {
+        assert!(validate_email("test@example.com").is_ok());
+    }
+
+    #[test]
+    fn validate_email_empty() {
+        let err = validate_email("").unwrap_err();
+        match err {
+            ValidationError::InvalidValue(field, msg) => {
+                assert_eq!(field, "email");
+                assert!(msg.contains("cannot be empty"));
+            }
+            _ => panic!("expected InvalidValue"),
+        }
+    }
+
+    #[test]
+    fn validate_email_too_long() {
+        let long = "a".repeat(257) + "@x.com";
+        let err = validate_email(&long).unwrap_err();
+        match err {
+            ValidationError::InvalidValue(field, msg) => {
+                assert_eq!(field, "email");
+                assert!(msg.contains("too long"));
+            }
+            _ => panic!("expected InvalidValue"),
+        }
+    }
+
+    #[test]
+    fn validate_email_regex_mismatch() {
+        let err = validate_email("not-an-email").unwrap_err();
+        match err {
+            ValidationError::InvalidValue(field, _) => {
+                assert_eq!(field, "email");
+            }
+            _ => panic!("expected InvalidValue"),
+        }
+    }
+
+    #[test]
+    fn validate_email_invalid_domain() {
+        let err = validate_email("user@domain").unwrap_err();
+        match err {
+            ValidationError::InvalidValue(field, msg) => {
+                assert_eq!(field, "email");
+                assert!(msg.contains("invalid"));
+            }
+            _ => panic!("expected InvalidValue"),
+        }
+    }
+
+    #[test]
+    fn validate_email_invalid_tld() {
+        let err = validate_email("user@domain.c").unwrap_err();
+        match err {
+            ValidationError::InvalidValue(field, msg) => {
+                assert_eq!(field, "email");
+                assert!(msg.contains("invalid"));
+            }
+            _ => panic!("expected InvalidValue"),
+        }
+    }
+
+    #[test]
+    fn validate_password_ok() {
+        assert!(validate_password("Abcd1234!").is_ok());
+    }
+
+    #[test]
+    fn validate_password_empty() {
+        let err = validate_password("").unwrap_err();
+        match err {
+            ValidationError::InvalidValue(field, msg) => {
+                assert_eq!(field, "password");
+                assert!(msg.contains("cannot be empty"));
+            }
+            _ => panic!("expected InvalidValue"),
+        }
+    }
+
+    #[test]
+    fn validate_password_too_short() {
+        let err = validate_password("Ab1!").unwrap_err();
+        match err {
+            ValidationError::InvalidValue(field, msg) => {
+                assert_eq!(field, "password");
+                assert!(msg.contains("at least 8 characters"));
+            }
+            _ => panic!("expected InvalidValue"),
+        }
+    }
+
+    #[test]
+    fn validate_password_missing_letter() {
+        let err = validate_password("12345678!").unwrap_err();
+        match err {
+            ValidationError::InvalidValue(field, msg) => {
+                assert_eq!(field, "password");
+                assert!(msg.contains("include at least one letter"));
+            }
+            _ => panic!("expected InvalidValue"),
+        }
+    }
+
+    #[test]
+    fn validate_password_missing_number() {
+        let err = validate_password("Abcdefgh!").unwrap_err();
+        match err {
+            ValidationError::InvalidValue(field, msg) => {
+                assert_eq!(field, "password");
+                assert!(msg.contains("include at least one number"));
+            }
+            _ => panic!("expected InvalidValue"),
+        }
+    }
+
+    #[test]
+    fn validate_password_missing_special() {
+        let err = validate_password("Abcd1234").unwrap_err();
+        match err {
+            ValidationError::InvalidValue(field, msg) => {
+                assert_eq!(field, "password");
+                // PASSWORD_ERROR is the generic message including special-char requirement
+                assert!(msg.contains("special character"));
+            }
+            _ => panic!("expected InvalidValue"),
+        }
+    }
+
+    #[test]
+    fn validate_password_too_long() {
+        let too_long = "A1!".repeat(50); // length > 128
+        let err = validate_password(&too_long).unwrap_err();
+        match err {
+            ValidationError::InvalidValue(field, msg) => {
+                assert_eq!(field, "password");
+                assert!(msg.contains("too long"));
+            }
+            _ => panic!("expected InvalidValue"),
+        }
+    }
+}

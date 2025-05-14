@@ -6,10 +6,11 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use hyper::body::{to_bytes, Bytes};
+use redis::AsyncCommands;
 use std::sync::Arc;
 use crate::app::AppState;
 use crate::utils::errors::ApiError;
-use redis::AsyncCommands;
+use crate::utils::rate_limit::check_and_increment;
 
 /// Middleware for login lockout and rate limiting.
 pub async fn login_guard_middleware(
@@ -74,21 +75,13 @@ pub async fn enforce_rate_limit(
     redis: &redis::Client,
     login: &str,
 ) -> Result<(), Response> {
-    let mut conn = match redis.get_async_connection().await {
-        Ok(c) => c,
-        Err(_) => return Ok(()), // fail open
-    };
     let key = format!("rate:login:{}", login);
-    let max_attempts = 5u32;
-    let window_secs = 60usize;
-
-    // Atomic INCR and EXPIRE
-    let count: u32 = conn.incr(&key, 1).await.unwrap_or(0);
-    if count == 1 {
-        let _: () = conn.expire(&key, window_secs).await.unwrap_or(());
-    }
-    if count > max_attempts {
-        // Use bad_request (429) instead of non‑existent too_many_requests
+    // max_attempts=5, window_secs=60; fail-open on error
+    let allowed = match check_and_increment(redis, &key, 5, 60).await {
+        Ok(v) => v,
+        Err(_) => true,
+    };
+    if !allowed {
         let err = ApiError::bad_request("Too many login attempts; please try again later");
         return Err(err.into_response());
     }

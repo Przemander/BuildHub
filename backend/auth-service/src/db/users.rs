@@ -26,7 +26,7 @@ pub struct User {
 }
 
 /// Data structure for receiving registration data.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]  // added Clone
 pub struct RegisterData {
     pub username: String,
     pub email: String,
@@ -34,7 +34,7 @@ pub struct RegisterData {
 }
 
 /// Data structure for receiving login data.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]  // added Clone
 pub struct LoginData {
     pub username: String,
     pub password: String,
@@ -221,7 +221,89 @@ impl User {
         conn: &mut SqliteConnection,
         new_password: &str,
     ) -> Result<(), diesel::result::Error> {
+        // hash the new password
         self.password_hash = User::hash_password(new_password);
+
+        // if we don't yet have an id, fetch it from the DB
+        if self.id.is_none() {
+            let persisted = User::find_by_username(conn, &self.username)?;
+            self.id = persisted.id;
+        }
+
+        // now safe to call update
         self.update(conn)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use diesel::connection::SimpleConnection;
+    use diesel::sqlite::SqliteConnection;
+
+    /// Helper to spin up an in-memory SQLite DB with a `users` table.
+    fn get_in_memory_conn() -> SqliteConnection {
+        let mut conn = SqliteConnection::establish(":memory:").unwrap();
+        conn.batch_execute(r#"
+            CREATE TABLE users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                email TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                is_active BOOLEAN
+            );
+        "#).unwrap();
+        conn
+    }
+
+    #[test]
+    fn new_and_verify_password() {
+        let user = User::new("alice", "alice@example.com", "Secret123!");
+        assert_eq!(user.username, "alice");
+        assert_eq!(user.email, "alice@example.com");
+        assert_eq!(user.is_active, Some(false));
+        assert!(user.verify_password("Secret123!").unwrap());
+        assert!(!user.verify_password("bad password").unwrap());
+    }
+
+    #[test]
+    fn save_and_find_by_username_and_email() {
+        let mut conn = get_in_memory_conn();
+        let user = User::new("bob", "bob@example.com", "Password1!");
+        assert_eq!(user.save(&mut conn).unwrap(), 1);
+
+        let by_user = User::find_by_username(&mut conn, "bob").unwrap();
+        assert_eq!(by_user.email, "bob@example.com");
+
+        let by_email = User::find_by_email(&mut conn, "bob@example.com").unwrap();
+        assert_eq!(by_email.username, "bob");
+    }
+
+    #[test]
+    fn activate_and_update_record() {
+        let mut conn = get_in_memory_conn();
+        let user = User::new("carol", "carol@example.com", "Pwd123!");
+        user.save(&mut conn).unwrap();
+
+        user.activate(&mut conn).unwrap();
+        let activated = User::find_by_email(&mut conn, "carol@example.com").unwrap();
+        assert_eq!(activated.is_active, Some(true));
+
+        let mut updated = activated;
+        updated.username = "carol2".into();
+        updated.update(&mut conn).unwrap();
+        let fetched = User::find_by_username(&mut conn, "carol2").unwrap();
+        assert_eq!(fetched.email, "carol@example.com");
+    }
+
+    #[test]
+    fn set_password_and_update() {
+        let mut conn = get_in_memory_conn();
+        let mut user = User::new("dan", "dan@example.com", "OldPass1!");
+        user.save(&mut conn).unwrap();
+
+        user.set_password_and_update(&mut conn, "NewPass2!").unwrap();
+        let fetched = User::find_by_username(&mut conn, "dan").unwrap();
+        assert!(fetched.verify_password("NewPass2!").unwrap());
     }
 }

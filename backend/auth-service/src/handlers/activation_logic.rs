@@ -90,3 +90,95 @@ pub async fn process_activation(
     AUTH_ACTIVATIONS.with_label_values(&["success"]).inc();
     ActivationLogicResult::Success
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::test_utils::{state_no_redis, state_with_redis};
+    use crate::db::users::User;
+    use redis::cmd;
+
+    #[tokio::test]
+    async fn missing_redis_returns_service_unavailable() {
+        let state = state_no_redis();
+        let res = process_activation(&state, "anycode").await;
+        assert!(matches!(res, ActivationLogicResult::ServiceUnavailable));
+    }
+
+    #[tokio::test]
+    async fn invalid_code_returns_invalid_or_expired() {
+        let state = state_with_redis();
+        // flush any old keys
+        let mut conn = state.redis_client
+            .as_ref().unwrap()
+            .get_async_connection().await.unwrap();
+        let _: () = cmd("FLUSHDB").query_async(&mut conn).await.unwrap();
+
+        let res = process_activation(&state, "no-such-code").await;
+        assert!(matches!(res, ActivationLogicResult::InvalidOrExpired));
+    }
+
+    #[tokio::test]
+    async fn user_not_found_returns_not_found() {
+        let state = state_with_redis();
+        // seed an activation code for a non‐existent email
+        let mut r = state.redis_client
+            .as_ref().unwrap()
+            .get_async_connection().await.unwrap();
+        let code = "code123";
+        let email = "nouser@example.com";
+        let _: () = cmd("FLUSHDB").query_async(&mut r).await.unwrap();
+        let _: () = r.set_ex(format!("activation:code:{}", code), email, 60).await.unwrap();
+
+        let res = process_activation(&state, code).await;
+        assert!(matches!(res, ActivationLogicResult::NotFound));
+    }
+
+    #[tokio::test]
+    async fn already_active_returns_already_active() {
+        let state = state_with_redis();
+        let mut r = state.redis_client
+            .as_ref().unwrap()
+            .get_async_connection().await.unwrap();
+        let _: () = cmd("FLUSHDB").query_async(&mut r).await.unwrap();
+
+        // insert and activate user
+        let mut db = state.pool.get().unwrap();
+        let mut u = User::new("joe", "joe@x.com", "Pwd1!");
+        u.is_active = Some(true);
+        u.save(&mut db).unwrap();
+
+        let code = "codeJoe";
+        let _: () = r.set_ex(format!("activation:code:{}", code), &u.email, 60).await.unwrap();
+
+        let res = process_activation(&state, code).await;
+        assert!(matches!(res, ActivationLogicResult::AlreadyActive));
+    }
+
+    #[tokio::test]
+    async fn successful_activation_returns_success() {
+        let state = state_with_redis();
+        // flush + seed code→email
+        let mut r = state.redis_client
+            .as_ref().unwrap()
+            .get_async_connection().await.unwrap();
+        let _: () = cmd("FLUSHDB").query_async(&mut r).await.unwrap();
+
+        // create inactive user
+        let mut db = state.pool.get().unwrap();
+        let mut u = User::new("sam", "sam@x.com", "Pwd1!");
+        u.is_active = Some(false);
+        u.save(&mut db).unwrap();
+
+        let code = "codeSam";
+        let _: () = r.set_ex(format!("activation:code:{}", code), &u.email, 60).await.unwrap();
+
+        let res = process_activation(&state, code).await;
+        assert!(matches!(res, ActivationLogicResult::Success));
+
+        // verify DB updated
+        let mut db2 = state.pool.get().unwrap();
+        let reloaded = User::find_by_email(&mut db2, &u.email).unwrap();
+        assert!(reloaded.is_active.unwrap_or(false));
+    }
+}

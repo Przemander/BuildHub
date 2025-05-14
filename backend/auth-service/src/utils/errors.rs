@@ -40,7 +40,7 @@ pub struct ApiError {
 
 impl ApiError {
     pub fn new(status: ApiStatus, msg: impl Into<String>) -> Self {
-        let msg_str = msg.into();
+        let msg_str: String = msg.into();
         match status {
             ApiStatus::InternalError
             | ApiStatus::Unauthorized
@@ -406,3 +406,4 @@ impl IntoResponse for ApiError {
             .unwrap()
     }
 }
+

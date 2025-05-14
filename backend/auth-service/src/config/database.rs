@@ -126,3 +126,61 @@ pub fn run_migrations(pool: &DbPool) -> Result<(), DatabaseError> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{env, time::{SystemTime, UNIX_EPOCH}};
+    
+
+    /// Generate a unique file path in the temp directory.
+    fn make_db_url() -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let mut path = env::temp_dir();
+        path.push(format!("test_db_{}.sqlite", nanos));
+        path.to_str().unwrap().to_string()
+    }
+
+    #[test]
+    #[should_panic(expected = "DATABASE_URL must be set")]
+    fn init_pool_no_env_panics() {
+        env::remove_var("DATABASE_URL");
+        // should panic because DATABASE_URL is missing
+        init_pool();
+    }
+
+    #[test]
+    fn init_pool_and_get_connection_success() {
+        let url = make_db_url();
+        env::set_var("DATABASE_URL", &url);
+        let pool = init_pool();
+        // Pool must yield a connection
+        assert!(pool.get().is_ok());
+    }
+
+    #[test]
+    #[should_panic(expected = "Failed to create database connection pool")]
+    fn get_connection_failure_returns_error() {
+        // point at a non‐existent directory so init_pool() panics
+        let mut bad = env::temp_dir();
+        bad.push("no_such_dir");
+        bad.push("db.sqlite");
+        env::set_var("DATABASE_URL", bad.to_str().unwrap());
+        // pool creation will attempt to open and then panic
+        let _ = init_pool();
+    }
+
+    #[test]
+    fn run_migrations_is_idempotent() {
+        let url = make_db_url();
+        env::set_var("DATABASE_URL", &url);
+        let pool = init_pool();
+        // first run
+        assert!(run_migrations(&pool).is_ok());
+        // second run (no new migrations) should still succeed
+        assert!(run_migrations(&pool).is_ok());
+    }
+}

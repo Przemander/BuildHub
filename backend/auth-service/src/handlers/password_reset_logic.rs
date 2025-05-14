@@ -26,7 +26,7 @@ pub async fn process_password_reset_request(
         Some(c) => c,
         None => {
             log_error!("PasswordReset", "Missing Redis client", "system_error");
-            AUTH_PASSWORD_RESETS.with_label_values(&["system_error"]).inc();
+            AUTH_PASSWORD_RESETS.with_label_values(&["request", "system_error"]).inc();
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 json!({
@@ -42,7 +42,7 @@ pub async fn process_password_reset_request(
         Ok(c) => c,
         Err(e) => {
             log_error!("PasswordReset", &format!("DB connection failed: {}", e), "system_error");
-            AUTH_PASSWORD_RESETS.with_label_values(&["system_error"]).inc();
+            AUTH_PASSWORD_RESETS.with_label_values(&["request", "system_error"]).inc();
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 json!({
@@ -68,20 +68,20 @@ pub async fn process_password_reset_request(
                 .await
             {
                 log_error!("PasswordReset", &format!("Failed to store reset token: {}", e), "failure");
-                AUTH_PASSWORD_RESETS.with_label_values(&["failure"]).inc();
+                AUTH_PASSWORD_RESETS.with_label_values(&["request", "failure"]).inc();
             } else if let Some(cfg) = &app_state.email_config {
                 // Send email (non-fatal)
                 if let Err(e) = send_password_reset_email(cfg, &user.email, &token).await {
                     log_warn!("PasswordReset", &format!("Failed to send reset email: {}", e), "failure");
-                    AUTH_PASSWORD_RESETS.with_label_values(&["failure"]).inc();
+                    AUTH_PASSWORD_RESETS.with_label_values(&["request", "failure"]).inc();
                 } else {
                     log_info!("PasswordReset", "Reset email sent", "success");
-                    AUTH_PASSWORD_RESETS.with_label_values(&["success"]).inc();
+                    AUTH_PASSWORD_RESETS.with_label_values(&["request", "success"]).inc();
                 }
             }
         } else {
             log_error!("PasswordReset", "Redis connection failed", "failure");
-            AUTH_PASSWORD_RESETS.with_label_values(&["failure"]).inc();
+            AUTH_PASSWORD_RESETS.with_label_values(&["request", "failure"]).inc();
         }
     }
 
@@ -106,7 +106,7 @@ pub async fn process_password_reset_confirm(
         Some(c) => c,
         None => {
             log_error!("PasswordReset", "Missing Redis client", "system_error");
-            AUTH_PASSWORD_RESETS.with_label_values(&["system_error"]).inc();
+            AUTH_PASSWORD_RESETS.with_label_values(&["confirm", "system_error"]).inc();
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 json!({
@@ -123,7 +123,7 @@ pub async fn process_password_reset_confirm(
         Ok(conn) => conn,
         Err(e) => {
             log_error!("PasswordReset", &format!("Redis connection failed: {}", e), "system_error");
-            AUTH_PASSWORD_RESETS.with_label_values(&["system_error"]).inc();
+            AUTH_PASSWORD_RESETS.with_label_values(&["confirm", "system_error"]).inc();
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 json!({
@@ -139,7 +139,7 @@ pub async fn process_password_reset_confirm(
         Ok(opt) => opt,
         Err(e) => {
             log_error!("PasswordReset", &format!("Redis get failed: {}", e), "system_error");
-            AUTH_PASSWORD_RESETS.with_label_values(&["system_error"]).inc();
+            AUTH_PASSWORD_RESETS.with_label_values(&["confirm", "system_error"]).inc();
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 json!({
@@ -154,7 +154,7 @@ pub async fn process_password_reset_confirm(
         Some(e) => e,
         None => {
             log_warn!("PasswordReset", "Invalid or expired reset token", "invalid_token");
-            AUTH_PASSWORD_RESETS.with_label_values(&["invalid_token"]).inc();
+            AUTH_PASSWORD_RESETS.with_label_values(&["confirm", "invalid_token"]).inc();
             return (
                 StatusCode::BAD_REQUEST,
                 json!({
@@ -168,7 +168,7 @@ pub async fn process_password_reset_confirm(
     // Validate new password
     if let Err(e) = validate_password(new_password) {
         log_warn!("PasswordReset", &format!("Password validation failed: {}", e), "validation_failed");
-        AUTH_PASSWORD_RESETS.with_label_values(&["validation_failed"]).inc();
+        AUTH_PASSWORD_RESETS.with_label_values(&["confirm", "validation_failed"]).inc();
         return (
             StatusCode::BAD_REQUEST,
             json!({
@@ -183,7 +183,7 @@ pub async fn process_password_reset_confirm(
         Ok(c) => c,
         Err(e) => {
             log_error!("PasswordReset", &format!("DB connection failed: {}", e), "system_error");
-            AUTH_PASSWORD_RESETS.with_label_values(&["system_error"]).inc();
+            AUTH_PASSWORD_RESETS.with_label_values(&["confirm", "system_error"]).inc();
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 json!({
@@ -198,7 +198,7 @@ pub async fn process_password_reset_confirm(
         Ok(u) => u,
         Err(e) => {
             log_warn!("PasswordReset", &format!("User not found: {}", e), "user_not_found");
-            AUTH_PASSWORD_RESETS.with_label_values(&["user_not_found"]).inc();
+            AUTH_PASSWORD_RESETS.with_label_values(&["confirm", "user_not_found"]).inc();
             return (
                 StatusCode::BAD_REQUEST,
                 json!({
@@ -211,7 +211,7 @@ pub async fn process_password_reset_confirm(
 
     if let Err(e) = user.set_password_and_update(&mut db_conn, new_password) {
         log_error!("PasswordReset", &format!("Password update failed: {}", e), "failure");
-        AUTH_PASSWORD_RESETS.with_label_values(&["failure"]).inc();
+        AUTH_PASSWORD_RESETS.with_label_values(&["confirm", "failure"]).inc();
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             json!({
@@ -227,7 +227,7 @@ pub async fn process_password_reset_confirm(
     }
 
     log_info!("PasswordReset", "Password has been reset successfully", "success");
-    AUTH_PASSWORD_RESETS.with_label_values(&["success"]).inc();
+    AUTH_PASSWORD_RESETS.with_label_values(&["confirm", "success"]).inc();
     (
         StatusCode::OK,
         json!({
@@ -235,4 +235,134 @@ pub async fn process_password_reset_confirm(
             "message": "Password has been reset successfully."
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::test_utils::{init_jwt_secret, state_no_redis, state_with_redis};
+    use axum::http::StatusCode;
+    use serde_json::json;
+    use redis::cmd;
+
+    #[tokio::test]
+    async fn missing_redis_request_returns_500() {
+        init_jwt_secret();
+        let state = state_no_redis();
+        let (status, body) = process_password_reset_request(&state, "user@example.com").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, json!({
+            "status":"error",
+            "message":"Redis unavailable"
+        }));
+    }
+
+    #[tokio::test]
+    async fn request_nonexistent_email_returns_200() {
+        init_jwt_secret();
+        let state = state_with_redis();
+        let (status, body) =
+            process_password_reset_request(&state, "no-user@domain").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({
+            "status":"success",
+            "message":"If the email exists, a password reset link has been sent."
+        }));
+    }
+
+    #[tokio::test]
+    async fn missing_redis_confirm_returns_500() {
+        init_jwt_secret();
+        let state = state_no_redis();
+        let (status, body) =
+            process_password_reset_confirm(&state, "some-token", "NewPass1!").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, json!({
+            "status":"error",
+            "message":"Redis unavailable"
+        }));
+    }
+
+    #[tokio::test]
+    #[ignore] // requires Redis + JWT_SECRET
+    async fn invalid_token_confirm_returns_400() {
+        init_jwt_secret();
+        let state = state_with_redis();
+        // no such token in Redis
+        let (status, body) =
+            process_password_reset_confirm(&state, "bad-token", "NewPass1!").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, json!({
+            "status":"error",
+            "message":"Invalid or expired reset token"
+        }));
+    }
+
+    #[tokio::test]
+    #[ignore] // requires Redis + JWT_SECRET
+    async fn validation_error_confirm_returns_400() {
+        init_jwt_secret();
+        let state = state_with_redis();
+        // seed Redis so token is recognized
+        let mut redis_conn = state
+            .redis_client
+            .as_ref()
+            .unwrap()
+            .get_async_connection()
+            .await
+            .unwrap();
+        let email = "u@d.com";
+        let token = "tok123";
+        let key = format!("pwreset:{}", token);
+        redis_conn.set_ex::<_, _, ()>(&key, email, RESET_TOKEN_TTL_SECS).await.unwrap();
+
+        // invalid new password
+        let (status, body) =
+            process_password_reset_confirm(&state, token, "short").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.get("message").unwrap().as_str().unwrap().contains("password"));
+    }
+
+    #[tokio::test]
+    #[ignore] // requires Redis + real DB + JWT_SECRET
+    async fn successful_confirm_resets_password() {
+        init_jwt_secret();
+        let state = state_with_redis();
+
+        // flush redis
+        let mut redis_conn = state
+            .redis_client
+            .as_ref()
+            .unwrap()
+            .get_async_connection()
+            .await
+            .unwrap();
+        let _: () = cmd("FLUSHDB").query_async(&mut redis_conn).await.unwrap();
+
+        // prepare DB user
+        let mut conn = state.pool.get().unwrap();
+        let mut user = User::new("alice", "a@b.com", "OldPass1!");
+        user.is_active = Some(true);
+        user.save(&mut conn).unwrap();
+
+        // seed Redis token→email
+        let token = "tok456";
+        let key = format!("pwreset:{}", token);
+        redis_conn.set_ex::<_, _, ()>(&key, &user.email, RESET_TOKEN_TTL_SECS).await.unwrap();
+
+        // confirm with new valid password
+        let new_pw = "NewStrong1!";
+        let (status, body) =
+            process_password_reset_confirm(&state, token, new_pw).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({
+            "status":"success",
+            "message":"Password has been reset successfully."
+        }));
+
+        // verify DB update
+        let mut conn2 = state.pool.get().unwrap();
+        let updated = User::find_by_email(&mut conn2, &user.email).unwrap();
+        assert!(updated.verify_password(new_pw).unwrap());
+    }
 }

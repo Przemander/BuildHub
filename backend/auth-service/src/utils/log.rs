@@ -2,7 +2,7 @@
 //!
 //! - Logs are written in JSON format to both stdout and a log file (for Filebeat).
 //! - Non-blocking, buffered, and robust against log file rotation/deletion.
-//! - All log macros include a file origin for traceability.
+//! - Emits Elastic Common Schema (ECS) field names.
 
 use chrono::Utc;
 use crossbeam_channel::{bounded, Sender};
@@ -29,7 +29,7 @@ struct LogChannel {
 
 // Global channel for sending log messages
 static LOG_CHANNEL: Lazy<Option<LogChannel>> = Lazy::new(|| {
-    let (sender, receiver) = bounded::<LogMessage>(10000);
+    let (sender, receiver) = bounded::<LogMessage>(10_000);
 
     // Spawn a background thread for processing logs
     let _ = thread::Builder::new()
@@ -50,7 +50,7 @@ static LOG_CHANNEL: Lazy<Option<LogChannel>> = Lazy::new(|| {
                 .append(true)
                 .write(true)
                 .open(&log_file_path)
-                .map(|file| BufWriter::with_capacity(8192, file))
+                .map(|file| BufWriter::with_capacity(8_192, file))
             {
                 Ok(w) => w,
                 Err(e) => {
@@ -65,14 +65,15 @@ static LOG_CHANNEL: Lazy<Option<LogChannel>> = Lazy::new(|| {
             while let Ok(message) = receiver.recv() {
                 let timestamp = Utc::now().to_rfc3339();
 
+                // Elastic Common Schema fields
                 let log_data = json!({
-                    "service": "auth-service",
-                    "process": message.process,
-                    "event": message.event,
-                    "result": message.result,
-                    "level": message.level,
-                    "timestamp": timestamp,
-                    "origin": { "file": message.origin }
+                    "@timestamp":     timestamp,
+                    "log.level":      message.level,
+                    "log.logger":     message.process,
+                    "message":        message.event,
+                    "event.outcome":  message.result,
+                    "service.name":   "auth-service",
+                    "code.filepath":  message.origin,
                 });
 
                 let log_str = log_data.to_string();
@@ -80,10 +81,10 @@ static LOG_CHANNEL: Lazy<Option<LogChannel>> = Lazy::new(|| {
                 // Log to console through standard log macros
                 match message.level.as_str() {
                     "DEBUG" => debug!("{}", log_str),
-                    "INFO" => info!("{}", log_str),
-                    "WARN" => warn!("{}", log_str),
+                    "INFO"  => info!("{}", log_str),
+                    "WARN"  => warn!("{}", log_str),
                     "ERROR" => error!("{}", log_str),
-                    _ => warn!("Unknown log level: {}", log_str),
+                    _       => warn!("Unknown log level: {}", log_str),
                 }
 
                 // Write to the file
@@ -95,13 +96,13 @@ static LOG_CHANNEL: Lazy<Option<LogChannel>> = Lazy::new(|| {
                         .write(true)
                         .open(&log_file_path)
                     {
-                        writer = BufWriter::with_capacity(8192, new_file);
+                        writer = BufWriter::with_capacity(8_192, new_file);
                         let _ = writeln!(writer, "{}", log_str);
                     }
                 }
 
                 counter += 1;
-                // Periodically flush - every 10 log messages
+                // Periodically flush every 10 messages
                 if counter % 10 == 0 {
                     let _ = writer.flush();
                 }
@@ -117,9 +118,8 @@ static LOG_CHANNEL: Lazy<Option<LogChannel>> = Lazy::new(|| {
 pub struct Log;
 
 impl Log {
-    /// Log an event with structured format.
-    /// The `origin` parameter will be included inside an "origin" bracket.
-    /// This version is non-blocking and sends the log to a background thread.
+    /// Log an event with ECS-compliant structured format.
+    /// Non-blocking: sends the log to a background thread if initialized.
     pub fn event(level: &str, process: &str, event: &str, result: &str, origin: &str) {
         if let Some(channel) = &*LOG_CHANNEL {
             let message = LogMessage {
@@ -134,22 +134,21 @@ impl Log {
             // Fallback if the channel isn't initialized
             let timestamp = Utc::now().to_rfc3339();
             let log_data = json!({
-                "service": "auth-service",
-                "process": process,
-                "event": event,
-                "result": result,
-                "level": level,
-                "timestamp": timestamp,
-                "origin": { "file": origin }
+                "@timestamp":     timestamp,
+                "log.level":      level,
+                "log.logger":     process,
+                "message":        event,
+                "event.outcome":  result,
+                "service.name":   "auth-service",
+                "code.filepath":  origin,
             });
-
             let log_str = log_data.to_string();
             match level {
                 "DEBUG" => debug!("{}", log_str),
-                "INFO" => info!("{}", log_str),
-                "WARN" => warn!("{}", log_str),
+                "INFO"  => info!("{}", log_str),
+                "WARN"  => warn!("{}", log_str),
                 "ERROR" => error!("{}", log_str),
-                _ => warn!("Unknown log level: {}", log_str),
+                _       => warn!("Unknown log level: {}", log_str),
             }
         }
     }

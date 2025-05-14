@@ -59,9 +59,13 @@ pub async fn process_logout(
             log_error!("Auth", &format!("Failed to revoke token: {}", e), "failure");
             AUTH_LOGOUTS.with_label_values(&["failure"]).inc();
             let msg = e.to_string();
-            let (status, message) = if msg.contains("connection") {
+            let msg_lc = msg.to_lowercase();
+            // treat connection errors (e.g. “connection refused” or generic I/O failure) as 503
+            let (status, message) = if msg_lc.contains("connection refused")
+                || msg_lc.contains("io error")
+            {
                 (StatusCode::SERVICE_UNAVAILABLE, "Redis unavailable")
-            } else if msg.contains("not found") {
+            } else if msg_lc.contains("not found") {
                 (StatusCode::NOT_FOUND, "Token not found or already expired")
             } else {
                 (StatusCode::INTERNAL_SERVER_ERROR, "Failed to logout")
@@ -74,5 +78,60 @@ pub async fn process_logout(
                 }),
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::test_utils::{state_no_redis, state_with_redis};
+    use axum::http::StatusCode;
+    use serde_json::json;
+    use crate::utils::jwt::{generate_token, TOKEN_TYPE_ACCESS};
+
+    #[tokio::test]
+    async fn missing_redis_returns_503() {
+        let state = state_no_redis();
+        let (status, body) = process_logout(&state, "any-token").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body,
+            json!({
+                "status": "error",
+                "message": "Redis client not available"
+            })
+        );
+    }
+
+    #[tokio::test]
+    #[ignore] // requires Redis + JWT_SECRET
+    async fn successful_logout_returns_200() {
+        let state = state_with_redis();
+        let token = generate_token("user1", TOKEN_TYPE_ACCESS, None).unwrap();
+        let (status, body) = process_logout(&state, &token).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({
+                "status": "success",
+                "message": "Logged out successfully"
+            })
+        );
+    }
+
+    #[tokio::test]
+    #[ignore] // requires Redis + JWT_SECRET
+    async fn invalid_token_returns_500() {
+        let state = state_with_redis();
+        let bad = "bad.token.signature";
+        let (status, body) = process_logout(&state, bad).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            body,
+            json!({
+                "status": "error",
+                "message": "Failed to logout"
+            })
+        );
     }
 }

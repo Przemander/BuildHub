@@ -124,3 +124,65 @@ pub async fn process_token_refresh(
         }),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::StatusCode;
+    use serde_json::{json, Value};
+    use crate::utils::test_utils::{state_with_redis, state_no_redis};
+
+    #[tokio::test]
+    async fn missing_redis_returns_500() {
+        // state_no_redis() already sets JWT_SECRET internally
+        let state = state_no_redis();
+        let (status, body) = process_token_refresh(&state, "whatever").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, json!({
+            "status": "error",
+            "message": "Redis unavailable"
+        }));
+    }
+
+    #[tokio::test]
+    async fn invalid_token_returns_401() {
+        let state = state_with_redis();
+        let (status, body) = process_token_refresh(&state, "not-a-jwt").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body, json!({
+            "status": "error",
+            "message": "Invalid token"
+        }));
+    }
+
+    #[tokio::test]
+    async fn wrong_token_type_returns_400() {
+        let state = state_with_redis();
+        // issue an access token instead of a refresh
+        let access = generate_token("user1", TOKEN_TYPE_ACCESS, None).unwrap();
+        let (status, body) = process_token_refresh(&state, &access).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, json!({
+            "status": "error",
+            "message": "Expected a refresh token"
+        }));
+    }
+
+    #[tokio::test]
+    #[ignore] // requires real Redis & JWT_SECRET
+    async fn successful_refresh_returns_200_and_new_tokens() {
+        let state = state_with_redis();
+        // issue a real refresh token
+        let refresh = generate_token("user42", TOKEN_TYPE_REFRESH, None).unwrap();
+        let (status, body) = process_token_refresh(&state, &refresh).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let data = body.get("data").unwrap();
+        let at = data.get("access_token").and_then(Value::as_str).unwrap();
+        let rt = data.get("refresh_token").and_then(Value::as_str).unwrap();
+        let tt = data.get("token_type").and_then(Value::as_str).unwrap();
+        assert!(!at.is_empty());
+        assert!(!rt.is_empty());
+        assert_eq!(tt, "Bearer");
+    }
+}

@@ -160,3 +160,92 @@ pub async fn is_token_blocked(redis: &Client, token: &str) -> Result<bool, Cache
         .inc();
     Ok(exists)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use redis::Client;
+    use std::env;
+    use tokio;
+
+    /// Ensure init_redis errors if REDIS_URL is not set.
+    #[test]
+    fn init_redis_missing_url() {
+        env::remove_var("REDIS_URL");
+        let err = init_redis().unwrap_err();
+        match err {
+            CacheError::Connection { .. } => {}
+            _ => panic!("expected CacheError::Connection"),
+        }
+    }
+
+    /// Ensure init_redis errors on invalid URL.
+    #[test]
+    fn init_redis_invalid_url() {
+        env::set_var("REDIS_URL", "not-a-valid-url");
+        let err = init_redis().unwrap_err();
+        match err {
+            CacheError::Connection { .. } => {}
+            _ => panic!("expected CacheError::Connection"),
+        }
+    }
+
+    /// Happy path when REDIS_URL is valid (requires local Redis).
+    #[test]
+    #[ignore] // requires a running Redis on REDIS_URL
+    fn init_redis_success() {
+        env::set_var("REDIS_URL", "redis://127.0.0.1/");
+        init_redis().unwrap();
+    }
+
+    /// PING returns false for unreachable server.
+    #[tokio::test]
+    async fn check_redis_ping_failure() {
+        // point to an invalid port
+        let client = Client::open("redis://127.0.0.1:6390/").unwrap();
+        assert_eq!(check_redis_connection(&client).await, false);
+    }
+
+    /// PING returns true when Redis is up.
+    #[tokio::test]
+    #[ignore] // requires a running Redis on REDIS_URL
+    async fn check_redis_ping_success() {
+        env::set_var("REDIS_URL", "redis://127.0.0.1/");
+        let client = init_redis().unwrap();
+        assert_eq!(check_redis_connection(&client).await, true);
+    }
+
+    /// get_redis_connection maps errors properly.
+    #[tokio::test]
+    async fn get_redis_connection_failure() {
+        let client = Client::open("redis://127.0.0.1:6391/").unwrap();
+        let result = get_redis_connection(&client).await;
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        match err {
+            CacheError::Connection { .. } => {}
+            _ => panic!("expected CacheError::Connection"),
+        }
+    }
+
+    /// block_token and is_token_blocked roundtrip (requires Redis).
+    #[tokio::test]
+    #[ignore] // requires a running Redis on REDIS_URL
+    async fn block_and_check_token() {
+        env::set_var("REDIS_URL", "redis://127.0.0.1/");
+        let client = init_redis().unwrap();
+        // flush DB
+        let mut con = client.get_async_connection().await.unwrap();
+        let _: () = redis::cmd("FLUSHDB").query_async(&mut con).await.unwrap();
+
+        let key = "test-token-123";
+        // initially not blocked
+        let before = is_token_blocked(&client, key).await.unwrap();
+        assert_eq!(before, false);
+
+        // block token for 1s
+        block_token(&client, key, 1).await.unwrap();
+        let blocked = is_token_blocked(&client, key).await.unwrap();
+        assert_eq!(blocked, true);
+    }
+}

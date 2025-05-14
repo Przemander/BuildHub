@@ -11,7 +11,7 @@ use axum::{
     http::{header::HeaderName, Method, StatusCode},
     middleware::from_fn_with_state,
     routing::{get, post},
-    Json, Router,
+    Json, Router, response::IntoResponse,
 };
 use redis::Client as RedisClient;
 use serde_json::json;
@@ -30,6 +30,7 @@ use crate::{
     middleware::{jwt_auth, rate_limiter::RateLimiterLayer},
     middleware::login_checks::login_guard_middleware,
     utils::email::EmailConfig,
+    utils::metrics,
 };
 
 /// Shared application state for all handlers and middleware.
@@ -38,6 +39,16 @@ pub struct AppState {
     pub pool: DbPool,
     pub redis_client: Option<RedisClient>,
     pub email_config: Option<EmailConfig>,
+}
+
+// Handler for metrics, using the existing gather_metrics function
+async fn metrics_handler() -> impl IntoResponse {
+    let metrics = metrics::gather_metrics();
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        metrics,
+    )
 }
 
 /// Build the main Axum application router.
@@ -121,6 +132,7 @@ pub async fn build_app(
                 .layer(from_fn_with_state(state.clone(), jwt_auth::jwt_auth_middleware)),
         )
         .route("/health", get(|| async { "ok" }))
+        .route("/metrics", get(metrics_handler))
         .route("/ready", get({
             let state = state.clone();
             move || {

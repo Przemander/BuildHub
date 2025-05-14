@@ -96,13 +96,20 @@ where
             };
 
             if !allowed {
-                log_warn!("RateLimiter", &format!("Rate limit exceeded for key: {}", key), "rate_limit");
+                log_warn!(
+                    "RateLimiter",
+                    &format!("Rate limit exceeded for key: {}", key),
+                    "rate_limit"
+                );
                 RATE_LIMIT_BLOCKS.with_label_values(&["rate_limit"]).inc();
-                let resp = (StatusCode::TOO_MANY_REQUESTS, "Too many requests").into_response();
-                // Convert to BoxBody for compatibility
+
+                // return a 429 immediately
+                let resp = (StatusCode::TOO_MANY_REQUESTS, "Too many requests")
+                    .into_response();
                 return Ok(resp.map(axum::body::boxed));
             }
 
+            // otherwise forward to inner service
             inner.call(req).await
         })
     }

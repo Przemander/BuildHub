@@ -5,7 +5,6 @@
 
 use axum::Server;
 use dotenvy::dotenv;
-use metrics_exporter_prometheus::PrometheusBuilder;
 use redis::Client as RedisClient;
 use std::{env, net::SocketAddr};
 use tokio::signal;
@@ -22,6 +21,7 @@ use crate::app::build_app;
 use crate::config::database::{init_pool, run_migrations, DbPool};
 use crate::config::redis::{check_redis_connection, init_redis};
 use crate::utils::email::EmailConfig;
+use crate::utils::metrics;
 
 mod app;
 mod config;
@@ -32,10 +32,13 @@ mod utils;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1) Install Prometheus metrics exporter on :9000 (/metrics)
-    PrometheusBuilder::new()
-        .with_http_listener(([0, 0, 0, 0], 9000))
-        .install()?;
+    // Initialize Prometheus metrics
+    metrics::init();
+    
+    // Usuwamy lub komentujemy niedziałający kod:
+    // PrometheusBuilder::new()
+    //     .with_http_listener(([0, 0, 0, 0], 9000))
+    //     .install()?;
 
     // 2) Initialize tracing_subscriber to write JSON logs to stdout
     let (non_blocking, _guard) = non_blocking(std::io::stdout());
