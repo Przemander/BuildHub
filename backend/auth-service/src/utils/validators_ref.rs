@@ -8,6 +8,7 @@ use crate::utils::metrics::{VALIDATION_OPERATIONS, VALIDATION_TIMING};
 use crate::{log_debug, log_info, log_warn};
 use once_cell::sync::Lazy;
 use regex::Regex;
+use crate::test_utils::{assert_invalid, assert_valid};
 
 /// Maximum length for any input to prevent abuse.
 const MAX_INPUT_LENGTH: usize = 256;
@@ -17,13 +18,13 @@ static USERNAME_REGEX: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"^[a-zA-Z0-9_-]{3,30}$").expect("Invalid USERNAME regex")
 });
 static EMAIL_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@" \
-                r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?" \
-                r"(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$")
+    Regex::new(r"^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+                r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
+                r"(?:\\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$")
         .expect("Invalid EMAIL regex")
 });
 static PASSWORD_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"^(?=.*[A-Za-z])(?=.*\d)(?=.*[@#$%^&+=!*]).{8,128}$")
+    Regex::new(r"^(?=.*[A-Za-z])(?=.*\\d)(?=.*[@#$%^&+=!*]).{8,128}$")
         .expect("Invalid PASSWORD regex")
 });
 
@@ -52,10 +53,6 @@ where
     result
 }
 
-/// Validates a username:
-/// - Non-empty
-/// - <= MAX_INPUT_LENGTH
-/// - Matches USERNAME_REGEX
 #[inline]
 pub fn validate_username(username: &str) -> Result<(), ValidationError> {
     instrument("username", || {
@@ -86,11 +83,6 @@ pub fn validate_username(username: &str) -> Result<(), ValidationError> {
     })
 }
 
-/// Validates an email address:
-/// - Non-empty
-/// - <= MAX_INPUT_LENGTH
-/// - Matches EMAIL_REGEX
-/// - Domain contains '.' and TLD length is 2–63
 #[inline]
 pub fn validate_email(email: &str) -> Result<(), ValidationError> {
     instrument("email", || {
@@ -136,10 +128,6 @@ pub fn validate_email(email: &str) -> Result<(), ValidationError> {
     })
 }
 
-/// Validates a password:
-/// - Non-empty
-/// - 8–128 characters
-/// - Matches PASSWORD_REGEX
 #[inline]
 pub fn validate_password(password: &str) -> Result<(), ValidationError> {
     instrument("password", || {
@@ -180,27 +168,14 @@ pub fn validate_password(password: &str) -> Result<(), ValidationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::errors::ValidationError;
-
-    fn assert_invalid<F>(field: &str, input: &str, msg: &str, f: F)
-    where
-        F: Fn(&str) -> Result<(), ValidationError>,
-    {
-        match f(input).unwrap_err() {
-            ValidationError::InvalidValue(fld, m) => {
-                assert_eq!(fld, field);
-                assert!(m.contains(msg));
-            }
-            _ => panic!("Expected InvalidValue for field {field}"),
-        }
-    }
+    use crate::test_utils::{assert_invalid, assert_valid};
 
     mod username {
         use super::*;
 
         #[test]
         fn valid_username_should_pass() {
-            assert!(validate_username("user_123").is_ok());
+            assert_valid("user_123", validate_username);
         }
 
         #[test]
@@ -225,7 +200,7 @@ mod tests {
 
         #[test]
         fn valid_should_pass() {
-            assert!(validate_email("test@example.com").is_ok());
+            assert_valid("test@example.com", validate_email);
         }
 
         #[test]
@@ -260,7 +235,7 @@ mod tests {
 
         #[test]
         fn valid_should_pass() {
-            assert!(validate_password("Abcd1234!").is_ok());
+            assert_valid("Abcd1234!", validate_password);
         }
 
         #[test]
