@@ -1,158 +1,190 @@
 //! Business logic for user registration.
+//!
+//! This module implements a comprehensive registration flow with:
+//! - Input validation for username, email, and password
+//! - Uniqueness checks to prevent duplicate accounts
+//! - User creation with secure password hashing
+//! - Activation code generation and storage in Redis
+//! - Email delivery for account activation
+//! - Structured error handling with appropriate HTTP status codes
+//! - Full observability through metrics and structured logging
 
 use crate::{
     app::AppState,
     db::users::{RegisterData, User},
-    utils::email::{generate_activation_code, store_activation_code},
-    utils::metrics::AUTH_REGISTRATIONS,
-    utils::validators::{validate_email, validate_password, validate_username},
-    log_info, log_error, log_warn,
+    log_error, log_info, log_warn,
+    utils::{
+        email::{generate_activation_code, store_activation_code},
+        metrics::AUTH_REGISTRATIONS,
+        validators::{validate_email, validate_password, validate_username},
+    },
 };
 use axum::http::StatusCode;
+use redis::Client as RedisClient;
 use serde_json::json;
+use std::fmt::Display;
+
+/// Error types specific to the registration process
+#[derive(Debug)]
+enum RegistrationError {
+    /// Missing required service dependencies
+    MissingDependency(&'static str),
+    /// Input validation failures
+    ValidationFailure(&'static str, String),
+    /// User already exists (email or username conflict)
+    AlreadyExists(&'static str),
+    /// Database or system error
+    SystemError(&'static str, String),
+}
+
+impl RegistrationError {
+    /// Converts error to HTTP status code and response body
+    fn into_response(self) -> (StatusCode, serde_json::Value) {
+        // Log and record metrics based on error type
+        match &self {
+            Self::MissingDependency(dep) => {
+                log_error!("Register", &format!("Missing dependency: {}", dep), "system_error");
+                AUTH_REGISTRATIONS.with_label_values(&["system_error"]).inc();
+            }
+            Self::ValidationFailure(field, msg) => {
+                log_warn!("Register", &format!("{} validation failed: {}", field, msg), "validation_failed");
+                AUTH_REGISTRATIONS.with_label_values(&["validation_failed"]).inc();
+            }
+            Self::AlreadyExists(field) => {
+                log_warn!("Register", &format!("{} already exists", field), "already_exists");
+                AUTH_REGISTRATIONS.with_label_values(&["already_exists"]).inc();
+            }
+            Self::SystemError(context, err) => {
+                log_error!("Register", &format!("{}: {}", context, err), "failure");
+                AUTH_REGISTRATIONS.with_label_values(&["failure"]).inc();
+            }
+        };
+
+        // Convert to appropriate HTTP status and JSON response
+        let (status, message) = match self {
+            Self::MissingDependency(dep) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Missing {}", dep)),
+            Self::ValidationFailure(_, msg) => (StatusCode::BAD_REQUEST, msg),
+            Self::AlreadyExists(field) => (StatusCode::CONFLICT, format!("{} already exists", field)),
+            Self::SystemError(context, _) => (StatusCode::INTERNAL_SERVER_ERROR, context.to_string()),
+        };
+
+        (status, json!({ "status": "error", "message": message }))
+    }
+}
+
+impl Display for RegistrationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingDependency(dep) => write!(f, "Missing dependency: {}", dep),
+            Self::ValidationFailure(field, msg) => write!(f, "{} validation error: {}", field, msg),
+            Self::AlreadyExists(field) => write!(f, "{} already exists", field),
+            Self::SystemError(context, err) => write!(f, "{}: {}", context, err),
+        }
+    }
+}
 
 /// Processes registration: validates, creates user, stores activation code, sends email, logs and metrics.
 ///
-/// Returns (StatusCode, JSON body) for the handler to respond.
+/// # Parameters
+/// * `app_state` - Application state containing DB pool, Redis client, and email config
+/// * `data` - Registration data from the client request
+///
+/// # Returns
+/// A tuple containing HTTP status code and JSON response body
+///
+/// # Flow
+/// 1. Validate dependencies (Email config, Redis)
+/// 2. Validate input fields (username, email, password)
+/// 3. Check uniqueness (email, username)
+/// 4. Create inactive user in database
+/// 5. Generate and store activation code
+/// 6. Send activation email
+/// 7. Return success response
 pub async fn process_registration(
     app_state: &AppState,
     data: RegisterData,
 ) -> (StatusCode, serde_json::Value) {
-    // Check email configuration
-    let email_cfg = match &app_state.email_config {
-        Some(cfg) => cfg.clone(),
-        None => {
-            log_error!("Register", "Missing EmailConfig", "system_error");
-            AUTH_REGISTRATIONS.with_label_values(&["system_error"]).inc();
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                json!({
-                    "status": "error",
-                    "message": "Missing EmailConfig"
-                }),
-            );
+    // Check required dependencies and perform registration
+    let result = async {
+        // Get email configuration
+        let email_cfg = app_state
+            .email_config
+            .as_ref()
+            .ok_or(RegistrationError::MissingDependency("EmailConfig"))?
+            .clone();
+
+        // Get Redis client
+        let redis_client = app_state
+            .redis_client
+            .as_ref()
+            .ok_or(RegistrationError::MissingDependency("RedisClient"))?;
+
+        // Obtain a DB connection
+        let mut conn = app_state
+            .pool
+            .get()
+            .map_err(|e| RegistrationError::SystemError("Database connection failed", e.to_string()))?;
+
+        // Validate input fields
+        validate_username(&data.username)
+            .map_err(|e| RegistrationError::ValidationFailure("username", e.to_string()))?;
+        validate_email(&data.email)
+            .map_err(|e| RegistrationError::ValidationFailure("email", e.to_string()))?;
+        validate_password(&data.password)
+            .map_err(|e| RegistrationError::ValidationFailure("password", e.to_string()))?;
+
+        // Check uniqueness
+        if User::find_by_email(&mut conn, &data.email).is_ok() {
+            return Err(RegistrationError::AlreadyExists("Email"));
         }
-    };
-
-    // Check Redis availability
-    let redis_client = match &app_state.redis_client {
-        Some(client) => client,
-        None => {
-            log_error!("Register", "Missing Redis client", "system_error");
-            AUTH_REGISTRATIONS.with_label_values(&["system_error"]).inc();
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                json!({
-                    "status": "error",
-                    "message": "Missing RedisClient"
-                }),
-            );
+        if User::find_by_username(&mut conn, &data.username).is_ok() {
+            return Err(RegistrationError::AlreadyExists("Username"));
         }
-    };
 
-    // Obtain a DB connection
-    let mut conn = match app_state.pool.get() {
-        Ok(c) => c,
-        Err(e) => {
-            log_error!("Register", &format!("Database connection failed: {}", e), "system_error");
-            AUTH_REGISTRATIONS.with_label_values(&["system_error"]).inc();
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
+        // Create inactive user
+        let mut user = User::new(&data.username, &data.email, &data.password);
+        user.is_active = Some(false);
+        user.save(&mut conn)
+            .map_err(|e| RegistrationError::SystemError("Saving user failed", e.to_string()))?;
+
+        // Generate and store activation code
+        create_and_send_activation(&user, redis_client, &email_cfg).await?;
+
+        Ok(())
+    }
+    .await;
+
+    // Handle result and return appropriate response
+    match result {
+        Ok(()) => {
+            log_info!("Register", "User registration successful", "success");
+            AUTH_REGISTRATIONS.with_label_values(&["success"]).inc();
+            (
+                StatusCode::CREATED,
                 json!({
-                    "status": "error",
-                    "message": "Database connection failed"
+                    "status": "success",
+                    "message": "Registration successful! Please check your email to activate your account."
                 }),
-            );
+            )
         }
-    };
+        Err(err) => err.into_response(),
+    }
+}
 
-    // Validate input
-    if let Err(e) = validate_username(&data.username) {
-        log_warn!("Register", &format!("Username validation failed: {}", e), "validation_failed");
-        AUTH_REGISTRATIONS.with_label_values(&["validation_failed"]).inc();
-        return (
-            StatusCode::BAD_REQUEST,
-            json!({
-                "status": "error",
-                "message": e.to_string()
-            }),
-        );
-    }
-    if let Err(e) = validate_email(&data.email) {
-        log_warn!("Register", &format!("Email validation failed: {}", e), "validation_failed");
-        AUTH_REGISTRATIONS.with_label_values(&["validation_failed"]).inc();
-        return (
-            StatusCode::BAD_REQUEST,
-            json!({
-                "status": "error",
-                "message": e.to_string()
-            }),
-        );
-    }
-    if let Err(e) = validate_password(&data.password) {
-        log_warn!("Register", &format!("Password validation failed: {}", e), "validation_failed");
-        AUTH_REGISTRATIONS.with_label_values(&["validation_failed"]).inc();
-        return (
-            StatusCode::BAD_REQUEST,
-            json!({
-                "status": "error",
-                "message": e.to_string()
-            }),
-        );
-    }
-
-    // Check uniqueness
-    if User::find_by_email(&mut conn, &data.email).is_ok() {
-        log_warn!("Register", "Email already exists", "already_exists");
-        AUTH_REGISTRATIONS.with_label_values(&["already_exists"]).inc();
-        return (
-            StatusCode::CONFLICT,
-            json!({
-                "status": "error",
-                "message": "Email already exists"
-            }),
-        );
-    }
-    if User::find_by_username(&mut conn, &data.username).is_ok() {
-        log_warn!("Register", "Username already exists", "already_exists");
-        AUTH_REGISTRATIONS.with_label_values(&["already_exists"]).inc();
-        return (
-            StatusCode::CONFLICT,
-            json!({
-                "status": "error",
-                "message": "Username already exists"
-            }),
-        );
-    }
-
-    // Create inactive user
-    let mut user = User::new(&data.username, &data.email, &data.password);
-    user.is_active = Some(false);
-    if let Err(e) = user.save(&mut conn) {
-        log_error!("Register", &format!("Saving user failed: {}", e), "failure");
-        AUTH_REGISTRATIONS.with_label_values(&["failure"]).inc();
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json!({
-                "status": "error",
-                "message": "Saving user failed"
-            }),
-        );
-    }
-
+/// Helper function to generate activation code, store it, and send email
+///
+/// Returns Ok if both storage and sending succeed, otherwise returns the first error
+/// encountered but ensures both operations are attempted.
+async fn create_and_send_activation(
+    user: &User,
+    redis_client: &RedisClient,
+    email_cfg: &crate::utils::email::EmailConfig,
+) -> Result<(), RegistrationError> {
     // Generate and store activation code
     let code = generate_activation_code();
-    if let Err(e) = store_activation_code(redis_client, &user.email, &code).await {
-        log_error!("Register", &format!("Storing activation code failed: {}", e), "failure");
-        AUTH_REGISTRATIONS.with_label_values(&["failure"]).inc();
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json!({
-                "status": "error",
-                "message": "Failed to store activation code"
-            }),
-        );
-    }
+    store_activation_code(redis_client, &user.email, &code)
+        .await
+        .map_err(|e| RegistrationError::SystemError("Storing activation code failed", e.to_string()))?;
 
     // Send activation email (non-fatal)
     if let Err(e) = email_cfg
@@ -160,26 +192,19 @@ pub async fn process_registration(
         .await
     {
         log_warn!("Register", &format!("Activation email failed: {}", e), "email_failed");
-        // Do not return error, just log and continue
+        // Do not return error for email failures, just log and continue
     }
 
-    log_info!("Register", "User registration successful", "success");
-    AUTH_REGISTRATIONS.with_label_values(&["success"]).inc();
-    (
-        StatusCode::CREATED,
-        json!({
-            "status": "success",
-            "message": "Registration successful! Please check your email to activate your account."
-        }),
-    )
+    Ok(())
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::users::{RegisterData, User};
-    use crate::utils::test_utils::state_with_redis;
     use crate::app::AppState;
+    use crate::db::users::{RegisterData, User};
     use crate::utils::email::EmailConfig;
+    use crate::utils::test_utils::state_with_redis;
     use axum::http::StatusCode;
     use serde_json::json;
 
