@@ -74,3 +74,25 @@ Thumbs.db
 **/.vercel
 **/.netlify
 **/.serverless
+
+# Integration tests
+integration-tests/__pycache__/
+integration-tests/.pytest_cache/
+integration-tests/venv/
+integration-tests/*.pyc
+integration-tests/**/__pycache__/
+integration-tests/**/*.pyc
+integration-tests/.env
+integration-tests/report.html
+integration-tests/.coverage
+integration-tests/htmlcov/
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment files
+.env
+.env.local
