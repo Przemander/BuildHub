@@ -33,7 +33,7 @@ use serde_json::json;
 const RESET_TOKEN_TTL_SECS: usize = 60 * 30;
 
 /// Redis key prefix for password reset tokens
-const REDIS_KEY_PREFIX: &str = "pwreset:";
+pub const REDIS_KEY_PREFIX: &str = "pwreset:";
 
 /// Processes a password reset link request.
 ///

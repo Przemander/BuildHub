@@ -45,6 +45,7 @@ use crate::{
         password_reset::{password_reset_confirm_handler, password_reset_request_handler},
         refresh::refresh_token_handler,
         register::register_handler,
+        debug::debug_routes, // Add this line to import debug routes
     },
     middleware::{jwt_auth, rate_limiter::{RateLimiterLayer, RateLimitConfig}},
     middleware::login_checks::login_guard_middleware,
@@ -166,8 +167,8 @@ pub async fn build_app(
         Method::OPTIONS,
     ];
 
-    // Build the router with all routes and middleware
-    Router::new()
+    // Create the base router with all standard routes
+    let mut app = Router::new()
         // Root route - service information
         .route("/", get(|| async { "🚀 BuildHub Authorization Service is running" }))
         
@@ -252,10 +253,15 @@ pub async fn build_app(
                     )
                 }
             }
-        }))
-        // Attach shared state to all routes
-        .with_state(state.clone())
-        // Configure CORS for web clients
+        }));
+        
+    // Add debug routes in non-production environments
+    if std::env::var("APP_ENV").unwrap_or_else(|_| "development".to_string()) != "production" {
+        app = app.nest("/", debug_routes());
+    }
+        
+    // Add shared state and CORS layer to the final router
+    app.with_state(state.clone())
         .layer(
             CorsLayer::new()
                 .allow_origin([

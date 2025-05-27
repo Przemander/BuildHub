@@ -141,6 +141,7 @@ fn render_page(title: &str, message: &str, status: &str) -> String {
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'unsafe-inline'">
     <title>{title}</title>
     <style>
         body {{

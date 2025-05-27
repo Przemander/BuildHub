@@ -1,7 +1,8 @@
-import pytest
 import os
 import time
+import pytest
 import requests
+from typing import Generator
 from utils.api_client import AuthApiClient
 
 # Base URL for the auth service API
@@ -34,5 +35,14 @@ def wait_for_api() -> None:
 
 @pytest.fixture
 def client(api_base_url: str, wait_for_api: None) -> AuthApiClient:
-    """Fixture that provides an API client for testing."""
+    """Create API client instance for testing"""
     return AuthApiClient(api_base_url)
+
+@pytest.fixture(scope="session", autouse=True)
+def cleanup_after_tests(api_base_url: str, wait_for_api: None) -> Generator[None, None, None]:
+    """Clean up all test data after tests are complete"""
+    yield  # Let the tests run first
+    
+    # Reset rate limiter after all tests
+    client = AuthApiClient(api_base_url)
+    client.reset_rate_limiter()

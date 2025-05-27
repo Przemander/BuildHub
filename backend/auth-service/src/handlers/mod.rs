@@ -10,3 +10,4 @@ pub mod refresh;
 pub mod refresh_logic;
 pub mod register;
 pub mod register_logic;
+pub mod debug;

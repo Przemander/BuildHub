@@ -44,18 +44,21 @@ impl std::fmt::Debug for EmailConfig {
 
 impl EmailConfig {
     /// Creates a new EmailConfig instance from environment variables.
-    ///
-    /// # Environment Variables
-    /// - `SMTP_SERVER`: SMTP server hostname (required)
-    /// - `SMTP_USERNAME`: SMTP authentication username (required)
-    /// - `SMTP_PASSWORD`: SMTP authentication password (required)
-    /// - `SMTP_FROM_ADDRESS`: Sender email address (defaults to "no-reply@example.com")
-    ///
-    /// # Returns
-    /// - `Ok(EmailConfig)` on successful configuration
-    /// - `Err(ServiceError)` if any required variables are missing or connection fails
     pub fn new() -> Result<Self, ServiceError> {
         log_info!("Email Configuration", "Initializing email service", "attempt");
+        
+        // Sprawdź, czy jesteśmy w trybie testowym
+        if std::env::var("TEST_MODE").is_ok_and(|v| v == "true") {
+            log_info!("Email Configuration", "Running in TEST_MODE - emails will be logged but not sent", "info");
+            
+            // Zamiast używać funkcji dummy(), tworzymy tutaj konfigurację testową bezpośrednio
+            return Ok(Self {
+                from_address: "test@example.com".into(),
+                mailer: SmtpTransport::builder_dangerous("localhost")
+                    .port(1025)
+                    .build(),
+            });
+        }
         
         // Helper function to get environment variables with consistent error handling
         fn get_env_var(name: &str) -> Result<String, ServiceError> {
@@ -138,26 +141,26 @@ impl EmailConfig {
                 "failure"
             );
             // Don't return early - still try to send the email
-            // This provides a better user experience even if Redis is having issues
         }
 
-        // Build the email message
-        let email = match self.build_email(
+        // W trybie testowym, tylko zapisuj do logów zamiast wysyłać
+        if std::env::var("TEST_MODE").is_ok_and(|v| v == "true") {
+            log_info!(
+                "Account Activation", 
+                &format!("TEST MODE: Would send activation email to {} with link {}", to_email, activation_link), 
+                "success"
+            );
+            EMAILS_SENT.with_label_values(&["activation", "test_mode"]).inc();
+            return Ok(());
+        }
+
+        // Normalny kod wysyłki e-maila bez zmian...
+        let email = self.build_email(
             to_email, 
             "Activate Your BuildHub Account",
             &email_body,
             "activation"
-        ) {
-            Ok(email) => email,
-            Err(e) => {
-                log_error!(
-                    "Account Activation", 
-                    &format!("Failed to build activation email: {}", e), 
-                    "failure"
-                );
-                return Err(e);
-            }
-        };
+        )?;
 
         // Send the email
         EMAILS_SENT.with_label_values(&["activation", "attempt"]).inc();
