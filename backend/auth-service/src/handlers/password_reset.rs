@@ -18,20 +18,21 @@
 //! - Rate limiting protection
 //! - Secure password requirements enforcement
 //! - Same response timing regardless of whether email exists (prevents user enumeration)
+//! - Unified error handling with automatic HTTP response conversion
 
 use std::sync::Arc;
 use axum::{
     extract::{Json, State},
     response::IntoResponse,
-    Json as AxumJson,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tracing::instrument;
 
 use crate::app::AppState;
 use crate::handlers::password_reset_logic::{
     process_password_reset_confirm, process_password_reset_request,
 };
+use crate::utils::error_new::AuthServiceError; // ← Add unified error system
 
 /// Request payload for initiating a password reset.
 ///
@@ -54,16 +55,6 @@ pub struct PasswordResetConfirm {
     
     /// The new password to set for the account
     pub new_password: String,
-}
-
-/// Standardized response structure for password reset operations.
-#[derive(Debug, Serialize)]
-pub struct PasswordResetResponse {
-    /// Operation status ("success" or "error")
-    pub status: String,
-    
-    /// Human-readable message about the operation result
-    pub message: String,
 }
 
 /// Handles password reset link requests.
@@ -90,6 +81,22 @@ pub struct PasswordResetResponse {
 ///
 /// Always returns 200 OK even if the email doesn't exist, to prevent
 /// user enumeration attacks. The actual email is only sent if the account exists.
+///
+/// ## Example success response
+/// ```json
+/// {
+///   "status": "success",
+///   "message": "If the email exists, a password reset link has been sent."
+/// }
+/// ```
+///
+/// ## Example error response
+/// ```json
+/// {
+///   "status": "configuration_error",
+///   "message": "Redis client not available for password reset operations"
+/// }
+/// ```
 #[instrument(
     name = "password_reset_request",
     level = "info",
@@ -103,17 +110,15 @@ pub struct PasswordResetResponse {
 pub async fn password_reset_request_handler(
     State(app_state): State<Arc<AppState>>,
     Json(req): Json<PasswordResetRequest>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, AuthServiceError> { // ← Changed return type
     // Log email domain for debugging without exposing full PII
     if let Some(domain) = req.email.split('@').nth(1) {
         tracing::Span::current().record("email_domain", &tracing::field::display(domain));
     }
     
-    // Process the password reset request
-    let (status, body) = process_password_reset_request(&app_state, &req.email).await;
-    
-    // Return the response with appropriate status code
-    (status, AxumJson(body))
+    // Process the password reset request using unified error system
+    // The ? operator will automatically convert AuthServiceError to HTTP response
+    process_password_reset_request(&app_state, &req.email).await
 }
 
 /// Handles password reset confirmations.
@@ -141,6 +146,28 @@ pub async fn password_reset_request_handler(
 ///
 /// The token is single-use and will be invalidated after a successful reset.
 /// The new password must meet the system's password strength requirements.
+///
+/// ## Example success response
+/// ```json
+/// {
+///   "status": "success",
+///   "message": "Password has been reset successfully."
+/// }
+/// ```
+///
+/// ## Example error responses
+/// ```json
+/// {
+///   "status": "validation_error",
+///   "message": "token: Invalid or expired reset token"
+/// }
+/// ```
+/// ```json
+/// {
+///   "status": "validation_error", 
+///   "message": "password: Password must be at least 8 characters long"
+/// }
+/// ```
 #[instrument(
     name = "password_reset_confirm",
     level = "info",
@@ -155,21 +182,15 @@ pub async fn password_reset_request_handler(
 pub async fn password_reset_confirm_handler(
     State(app_state): State<Arc<AppState>>,
     Json(req): Json<PasswordResetConfirm>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, AuthServiceError> { // ← Changed return type
     // Log metadata without exposing sensitive information
     tracing::Span::current()
         .record("token_length", &tracing::field::display(req.token.len()))
         .record("password_length", &tracing::field::display(req.new_password.len()));
     
-    // Process the password reset confirmation
-    let (status, body) = process_password_reset_confirm(
-        &app_state, 
-        &req.token, 
-        &req.new_password
-    ).await;
-    
-    // Return the response with appropriate status code
-    (status, AxumJson(body))
+    // Process the password reset confirmation using unified error system
+    // The ? operator will automatically convert AuthServiceError to HTTP response
+    process_password_reset_confirm(&app_state, &req.token, &req.new_password).await
 }
 
 #[cfg(test)]
@@ -226,10 +247,14 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         
         assert_eq!(body["status"], "success");
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .contains("If the email exists"));
     }
 
     #[tokio::test]
-    async fn reset_request_with_invalid_email_returns_error() {
+    async fn reset_request_with_invalid_email_returns_success() {
         // Arrange
         let app = app();
         let request_body = json!({
@@ -249,7 +274,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Assert - adjust assertion to match the actual behavior
+        // Assert - Should return success regardless of email validity (security feature)
         assert_eq!(response.status(), StatusCode::OK);
         
         let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
@@ -262,7 +287,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reset_confirm_with_invalid_token_returns_unauthorized() {
+    async fn reset_confirm_with_invalid_token_returns_validation_error() {
         // Arrange
         let app = app();
         let request_body = json!({
@@ -284,20 +309,22 @@ mod tests {
             .unwrap();
 
         // Assert
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         
         let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         
-        assert_eq!(body["status"], "error");
+        // With unified error system, invalid token is a validation error
+        assert_eq!(body["status"], "validation_error");
+        assert!(body["message"].as_str().unwrap().contains("token"));
     }
 
     #[tokio::test]
-    async fn reset_confirm_with_weak_password_returns_bad_request() {
+    async fn reset_confirm_with_weak_password_returns_validation_error() {
         // Arrange
         let app = app();
         let request_body = json!({
-            "token": "some-valid-token",  // Token validation is mocked in tests
+            "token": "some-valid-token",  // Token validation will fail first
             "new_password": "weak"        // Too short, doesn't meet requirements
         });
 
@@ -314,12 +341,14 @@ mod tests {
             .await
             .unwrap();
 
-        // Assert - This may be 401 if token validation happens before password validation
-        // So we check for either 400 or 401
-        assert!(
-            response.status() == StatusCode::BAD_REQUEST || 
-            response.status() == StatusCode::UNAUTHORIZED
-        );
+        // Assert - Token validation happens first, so we get validation error
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        
+        // With unified error system, both token and password issues are validation errors
+        assert_eq!(body["status"], "validation_error");
     }
 
     #[tokio::test]
@@ -343,10 +372,88 @@ mod tests {
             .await
             .unwrap();
 
-        // Assert - accept either 400 or 422 as both are used for validation errors
+        // Assert - accept either 400 or 422 as both are used for validation errors by Axum JSON extractor
         assert!(
-            response.status() == StatusCode::BAD_REQUEST || response.status() == StatusCode::UNPROCESSABLE_ENTITY,
+            response.status() == StatusCode::BAD_REQUEST || 
+            response.status() == StatusCode::UNPROCESSABLE_ENTITY,
             "Response status should be 400 Bad Request or 422 Unprocessable Entity"
         );
+    }
+
+    #[tokio::test]
+    async fn missing_redis_returns_configuration_error() {
+        // Arrange - Create state without Redis
+        let mut state = state_with_redis();
+        state.redis_client = None; // Remove Redis client
+        state.email_config = Some(EmailConfig::dummy());
+        
+        let app = Router::new()
+            .route("/auth/password-reset/request", post(password_reset_request_handler))
+            .with_state(Arc::new(state));
+
+        let request_body = json!({
+            "email": "test@example.com"
+        });
+
+        // Act
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/password-reset/request")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        
+        assert_eq!(body["status"], "configuration_error");
+        assert!(body["message"].as_str().unwrap().contains("Redis"));
+    }
+
+    #[tokio::test]
+    async fn missing_redis_confirm_returns_configuration_error() {
+        // Arrange - Create state without Redis
+        let mut state = state_with_redis();
+        state.redis_client = None; // Remove Redis client
+        state.email_config = Some(EmailConfig::dummy());
+        
+        let app = Router::new()
+            .route("/auth/password-reset/confirm", post(password_reset_confirm_handler))
+            .with_state(Arc::new(state));
+
+        let request_body = json!({
+            "token": "any-token",
+            "new_password": "ValidPass123!"
+        });
+
+        // Act
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/password-reset/confirm")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        
+        assert_eq!(body["status"], "configuration_error");
+        assert!(body["message"].as_str().unwrap().contains("Redis"));
     }
 }

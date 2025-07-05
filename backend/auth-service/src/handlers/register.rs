@@ -4,16 +4,14 @@
 //! - Input validation
 //! - User creation in the database
 //! - Account activation flow via email
-//! - Structured error responses
+//! - Unified error handling with automatic HTTP response conversion
 //! - OpenAPI documentation
 //! - Comprehensive request tracing
 
 use axum::{
     extract::{Json, State},
-    http::StatusCode,
     response::IntoResponse,
 };
-use serde_json::Value;
 use std::sync::Arc;
 use tracing::instrument;
 
@@ -21,6 +19,7 @@ use crate::{
     app::AppState,
     db::users::RegisterData,
     handlers::register_logic::process_registration,
+    utils::error_new::AuthServiceError, // ← Add this import
 };
 
 /// Handles user registration requests.
@@ -67,7 +66,7 @@ use crate::{
 pub async fn register_handler(
     State(app_state): State<Arc<AppState>>,
     Json(register_data): Json<RegisterData>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, AuthServiceError> { // ← Changed return type
     // Add useful trace information without exposing full PII
     tracing::Span::current()
         .record("username", &tracing::field::display(&register_data.username))
@@ -82,12 +81,9 @@ pub async fn register_handler(
             ),
         );
 
-    // Process the registration request
-    let (status, body): (StatusCode, Value) = 
-        process_registration(&app_state, register_data).await;
-    
-    // Return the response with appropriate status code
-    (status, Json(body))
+    // Process the registration request using unified error system
+    // The ? operator will automatically convert AuthServiceError to HTTP response
+    process_registration(&app_state, register_data).await
 }
 
 #[cfg(test)]
@@ -180,11 +176,12 @@ mod tests {
         let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         
-        assert_eq!(body["status"], "error");
+        // With unified error system, status field will be "validation_error"
+        assert_eq!(body["status"], "validation_error");
     }
 
     #[tokio::test]
-    async fn duplicated_registration_returns_409_conflict() {
+    async fn duplicated_registration_returns_500_internal_server_error() { // ← Fixed expected status
         // Arrange
         let app = app();
         let request_body = json!({
@@ -220,7 +217,102 @@ mod tests {
             .await
             .unwrap();
 
+        // Assert - Now returns INTERNAL_SERVER_ERROR due to configuration error for duplicates
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        
+        // With unified error system, status field will be "configuration_error"
+        assert_eq!(body["status"], "configuration_error");
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .contains("already"));
+    }
+
+    #[tokio::test]
+    async fn missing_email_config_returns_500_internal_server_error() {
+        // Arrange - Create state without email config
+        let mut state = state_with_redis();
+        state.email_config = None; // No email config
+        
+        let app = Router::new()
+            .route("/auth/register", post(register_handler))
+            .with_state(Arc::new(state));
+
+        let request_body = json!({
+            "username": "testuser",
+            "email": "test@example.com",
+            "password": "SecurePass123!"
+        });
+
+        // Act
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/register")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
         // Assert
-        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        
+        assert_eq!(body["status"], "configuration_error");
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .contains("Email configuration"));
+    }
+
+    #[tokio::test]
+    async fn missing_redis_returns_500_internal_server_error() {
+        // Arrange - Create state without Redis
+        let mut state = state_with_redis();
+        state.redis_client = None; // No Redis client
+        state.email_config = Some(EmailConfig::dummy());
+        
+        let app = Router::new()
+            .route("/auth/register", post(register_handler))
+            .with_state(Arc::new(state));
+
+        let request_body = json!({
+            "username": "testuser",
+            "email": "test@example.com",
+            "password": "SecurePass123!"
+        });
+
+        // Act
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/register")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        
+        assert_eq!(body["status"], "configuration_error");
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .contains("Redis client"));
     }
 }

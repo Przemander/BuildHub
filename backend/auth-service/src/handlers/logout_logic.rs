@@ -5,18 +5,22 @@
 //! - Adds the token to Redis blocklist to prevent reuse
 //! - Provides detailed error handling for different failure scenarios
 //! - Records comprehensive metrics and logging for auditing
+//! - Unified error handling with automatic HTTP response conversion
 //!
 //! The logout flow is designed to be robust, handling various edge cases
 //! including invalid tokens, already-logged-out users, and Redis unavailability.
 
 use crate::{
     app::AppState,
-    utils::jwt::{revoke_token, validate_token},
-    utils::metrics::AUTH_LOGOUTS,
-    log_info, log_error, log_warn,
+    utils::{
+        error_new::AuthServiceError, // ← Add unified error system
+        jwt::{revoke_token, validate_token},
+        metrics::AUTH_LOGOUTS,
+    },
+    log_info, log_warn,
 };
-use axum::http::StatusCode;
-use serde_json::{json, Value};
+use axum::{http::StatusCode, response::IntoResponse, Json}; // ← Add IntoResponse
+use serde_json::json;
 
 /// Processes the logout logic: validates and revokes the token, logs and increments metrics.
 ///
@@ -27,7 +31,7 @@ use serde_json::{json, Value};
 ///
 /// # Returns
 ///
-/// A tuple containing HTTP status code and JSON response body
+/// Result that can be converted to HTTP response via unified error system
 ///
 /// # Flow
 ///
@@ -38,22 +42,12 @@ use serde_json::{json, Value};
 pub async fn process_logout(
     app_state: &AppState,
     token: &str,
-) -> (StatusCode, Value) {
-    // Ensure Redis is available
-    let redis_client = match &app_state.redis_client {
-        Some(c) => c,
-        None => {
-            log_error!("Auth", "Missing Redis client for logout operation", "system_error");
-            AUTH_LOGOUTS.with_label_values(&["system_error"]).inc();
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                json!({
-                    "status": "error",
-                    "message": "Redis client not available"
-                }),
-            );
-        }
-    };
+) -> Result<impl IntoResponse, AuthServiceError> { // ← Changed return type
+    // Ensure Redis is available - automatic conversion via ? operator
+    let redis_client = app_state
+        .redis_client
+        .as_ref()
+        .ok_or_else(|| AuthServiceError::configuration("Redis client not available for logout operation"))?;
 
     // Try to validate token (for logging), but proceed regardless of result
     // This helps with audit trails and identifying potential abuse
@@ -68,207 +62,172 @@ pub async fn process_logout(
         }
     }
 
-    // Revoke the token by adding to blocklist
-    match revoke_token(token, redis_client).await {
-        Ok(_) => {
-            log_info!("Auth", "Token revoked successfully", "success");
-            AUTH_LOGOUTS.with_label_values(&["success"]).inc();
-            (
-                StatusCode::OK,
-                json!({
-                    "status": "success",
-                    "message": "Logged out successfully"
-                }),
-            )
-        }
-        Err(e) => {
-            // Categorize the error for appropriate response code and message
-            log_error!("Auth", &format!("Failed to revoke token: {}", e), "failure");
-            AUTH_LOGOUTS.with_label_values(&["failure"]).inc();
-            
-            // Map error message to appropriate HTTP status and user-friendly message
-            let error_message = e.to_string().to_lowercase();
-            let (status, message) = categorize_revocation_error(&error_message);
-            
-            (
-                status,
-                json!({
-                    "status": "error",
-                    "message": message
-                }),
-            )
-        }
-    }
-}
+    // Revoke the token by adding to blocklist - automatic conversion via ? operator
+    revoke_token(token, redis_client).await?;
 
-/// Categorizes token revocation errors into appropriate HTTP status codes and messages.
-///
-/// # Arguments
-///
-/// * `error_message` - The lowercase error message from the revocation attempt
-///
-/// # Returns
-///
-/// A tuple containing the appropriate HTTP status code and user-friendly message
-fn categorize_revocation_error(error_message: &str) -> (StatusCode, &'static str) {
-    if error_message.contains("connection refused") || error_message.contains("io error") {
-        // Redis connection issues
-        (StatusCode::SERVICE_UNAVAILABLE, "Redis unavailable")
-    } else if error_message.contains("not found") {
-        // Token not found in blocklist (might be expired or already revoked)
-        (StatusCode::NOT_FOUND, "Token not found or already expired")
-    } else {
-        // Other unspecified errors
-        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to logout")
-    }
+    // Log success and record metrics
+    log_info!("Auth", "Token revoked successfully", "success");
+    AUTH_LOGOUTS.with_label_values(&["success"]).inc();
+
+    // Return success response using Axum's Json wrapper
+    Ok((
+        StatusCode::OK,
+        Json(json!({
+            "status": "success",
+            "message": "Logged out successfully"
+        })),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::test_utils::{init_jwt_secret, state_no_redis, state_with_redis};
-    use axum::http::StatusCode;
-    use serde_json::json;
     use crate::utils::jwt::{generate_token, TOKEN_TYPE_ACCESS};
-
-    #[test]
-    fn categorizes_connection_errors_as_503() {
-        // Arrange & Act
-        let (status, message) = categorize_revocation_error("connection refused");
-        
-        // Assert
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(message, "Redis unavailable");
-    }
-
-    #[test]
-    fn categorizes_io_errors_as_503() {
-        // Arrange & Act
-        let (status, message) = categorize_revocation_error("io error: timeout");
-        
-        // Assert
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(message, "Redis unavailable");
-    }
-
-    #[test]
-    fn categorizes_not_found_errors_as_404() {
-        // Arrange & Act
-        let (status, message) = categorize_revocation_error("key not found");
-        
-        // Assert
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(message, "Token not found or already expired");
-    }
-
-    #[test]
-    fn categorizes_unknown_errors_as_500() {
-        // Arrange & Act
-        let (status, message) = categorize_revocation_error("some unexpected error");
-        
-        // Assert
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(message, "Failed to logout");
-    }
+    use crate::utils::test_utils::{init_jwt_secret, state_no_redis, state_with_redis};
 
     #[tokio::test]
-    async fn missing_redis_returns_503() {
+    async fn missing_redis_returns_configuration_error() {
         // Arrange
         let state = state_no_redis();
         
         // Act
-        let (status, body) = process_logout(&state, "any-token").await;
+        let result = process_logout(&state, "any-token").await;
         
         // Assert
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(
-            body,
-            json!({
-                "status": "error",
-                "message": "Redis client not available"
-            })
-        );
+        assert!(result.is_err());
+        
+        // Check that it's a configuration error
+        match result.err().unwrap() {
+            AuthServiceError::Configuration(msg) => {
+                assert!(msg.contains("Redis client"));
+            }
+            other => panic!("Expected configuration error, got: {:?}", other),
+        }
     }
 
     #[tokio::test]
     #[ignore] // requires Redis + JWT_SECRET
-    async fn successful_logout_returns_200() {
+    async fn successful_logout_returns_success() {
         // Arrange
         init_jwt_secret();
         let state = state_with_redis();
         let token = generate_token("user1", TOKEN_TYPE_ACCESS, None).unwrap();
         
         // Act
-        let (status, body) = process_logout(&state, &token).await;
+        let result = process_logout(&state, &token).await;
         
         // Assert
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            body,
-            json!({
-                "status": "success",
-                "message": "Logged out successfully"
-            })
-        );
+        assert!(result.is_ok());
+        // Since we can't easily extract the JSON from impl IntoResponse in tests,
+        // we just verify the result is Ok. In integration tests, we'd verify
+        // the actual HTTP response structure.
     }
 
     #[tokio::test]
     #[ignore] // requires Redis + JWT_SECRET
-    async fn invalid_token_returns_500() {
+    async fn invalid_token_proceeds_with_revocation() {
         // Arrange
         init_jwt_secret();
         let state = state_with_redis();
-        let bad = "bad.token.signature";
+        let bad_token = "bad.token.signature";
         
         // Act
-        let (status, body) = process_logout(&state, bad).await;
+        let result = process_logout(&state, bad_token).await;
         
-        // Assert - Implementation may handle invalid tokens either way
-        assert!(
-            status == StatusCode::INTERNAL_SERVER_ERROR || status == StatusCode::OK,
-            "Invalid tokens should either return 500 or 200"
-        );
-        
-        if status == StatusCode::INTERNAL_SERVER_ERROR {
-            assert_eq!(
-                body,
-                json!({
-                    "status": "error",
-                    "message": "Failed to logout"
-                })
-            );
+        // Assert - Invalid tokens should still attempt revocation
+        // The result depends on whether the revocation succeeds or fails
+        // This test verifies that we don't fail early on token validation
+        match result {
+            Ok(_) => {
+                // Token revocation succeeded (token was added to blocklist)
+            }
+            Err(AuthServiceError::Jwt(_)) => {
+                // JWT error during revocation process - acceptable
+            }
+            Err(AuthServiceError::Cache(_)) => {
+                // Cache error during revocation process - acceptable
+            }
+            Err(other) => {
+                panic!("Unexpected error type: {:?}", other);
+            }
         }
     }
     
     #[tokio::test]
     #[ignore] // requires Redis + JWT_SECRET
-    async fn already_revoked_token_returns_404() {
+    async fn double_logout_handles_gracefully() {
         // Arrange
         init_jwt_secret();
         let state = state_with_redis();
         let token = generate_token("user1", TOKEN_TYPE_ACCESS, None).unwrap();
         
-        // Revoke the token first
-        let _ = process_logout(&state, &token).await;
+        // First logout
+        let result1 = process_logout(&state, &token).await;
+        assert!(result1.is_ok(), "First logout should succeed");
         
-        // Act - Try to revoke again
-        let (status, body) = process_logout(&state, &token).await;
+        // Act - Second logout with same token
+        let result2 = process_logout(&state, &token).await;
         
-        // Assert - we may get either a success response (200) or not found (404)
-        // as the implementation may allow re-revocation of tokens
-        assert!(
-            status == StatusCode::OK || status == StatusCode::NOT_FOUND,
-            "Status should be either 200 (OK) or 404 (Not Found)"
-        );
+        // Assert - Second logout behavior depends on implementation
+        // It may succeed (idempotent) or fail (already revoked)
+        match result2 {
+            Ok(_) => {
+                // Idempotent logout - acceptable behavior
+            }
+            Err(AuthServiceError::Jwt(_)) => {
+                // JWT error due to revoked token - acceptable behavior
+            }
+            Err(AuthServiceError::Cache(_)) => {
+                // Cache error during second revocation - acceptable behavior
+            }
+            Err(other) => {
+                panic!("Unexpected error type for double logout: {:?}", other);
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore] // requires Redis + JWT_SECRET
+    async fn empty_token_returns_jwt_error() {
+        // Arrange
+        init_jwt_secret();
+        let state = state_with_redis();
         
-        if status == StatusCode::NOT_FOUND {
-            assert_eq!(
-                body,
-                json!({
-                    "status": "error",
-                    "message": "Token not found or already expired"
-                })
-            );
+        // Act
+        let result = process_logout(&state, "").await;
+        
+        // Assert
+        assert!(result.is_err());
+        
+        // Check that it's a JWT error (empty token should fail validation/revocation)
+        match result.err().unwrap() {
+            AuthServiceError::Jwt(_) => {
+                // Expected - empty token should cause JWT error
+            }
+            other => panic!("Expected JWT error for empty token, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore] // requires Redis + JWT_SECRET
+    async fn malformed_token_returns_jwt_error() {
+        // Arrange
+        init_jwt_secret();
+        let state = state_with_redis();
+        let malformed_token = "not.a.valid.jwt.format.at.all";
+        
+        // Act
+        let result = process_logout(&state, malformed_token).await;
+        
+        // Assert
+        assert!(result.is_err());
+        
+        // Check that it's a JWT error (malformed token should fail validation/revocation)
+        match result.err().unwrap() {
+            AuthServiceError::Jwt(_) => {
+                // Expected - malformed token should cause JWT error
+            }
+            other => panic!("Expected JWT error for malformed token, got: {:?}", other),
         }
     }
 }

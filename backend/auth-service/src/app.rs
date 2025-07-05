@@ -267,6 +267,8 @@ pub async fn build_app(
                 .allow_origin([
                     "http://localhost:3000".parse().unwrap(),
                     "http://127.0.0.1:3000".parse().unwrap(),
+                    "http://localhost:8080".parse().unwrap(), // Add Vue.js frontend URL
+                    "http://127.0.0.1:8080".parse().unwrap(), // Add alternative localhost notation
                 ])
                 .allow_methods(allowed_methods)
                 .allow_headers(allowed_headers)

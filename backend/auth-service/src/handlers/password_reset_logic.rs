@@ -12,18 +12,21 @@
 //! - Anti-enumeration protection (consistent responses)
 //! - Password strength validation
 //! - Comprehensive audit logging
+//! - Unified error handling with automatic HTTP response conversion
 
 use crate::{
     app::AppState,
+    config::redis::{verify_reset_token, invalidate_reset_token}, // ← POPRAWKA: Z config/redis.rs
     db::users::User,
     utils::{
         email::send_password_reset_email,
+        error_new::AuthServiceError,
         metrics::AUTH_PASSWORD_RESETS,
         validators::validate_password,
     },
-    log_error, log_info, log_warn,
+    log_info, log_warn,
 };
-use axum::http::StatusCode;
+use axum::{http::StatusCode, response::IntoResponse, Json};
 use base64::{engine::general_purpose, Engine as _};
 use rand::{rngs::OsRng, RngCore};
 use redis::AsyncCommands;
@@ -33,55 +36,40 @@ use serde_json::json;
 const RESET_TOKEN_TTL_SECS: usize = 60 * 30;
 
 /// Redis key prefix for password reset tokens
-pub const REDIS_KEY_PREFIX: &str = "pwreset:";
+pub const REDIS_KEY_PREFIX: &str = "password_reset:token:"; // ← POPRAWKA: Dopasowane do config/redis.rs
 
-/// Processes a password reset link request.
+/// Processes a password reset link request using the unified error system.
 ///
 /// # Arguments
 /// * `app_state` - Application state containing Redis client and DB pool
 /// * `email` - Email address for which to generate a reset token
 ///
 /// # Returns
-/// A tuple containing HTTP status code and JSON response body
+/// Result that can be converted to HTTP response via unified error system
 ///
 /// # Security Note
 /// Always returns 200 OK even if the email doesn't exist to prevent
 /// user enumeration attacks. The actual email is only sent if the email exists.
+///
+/// # Flow
+/// 1. Check required dependencies (Redis client)
+/// 2. Get database connection
+/// 3. Look up user by email (silently)
+/// 4. Generate secure token and store in Redis
+/// 5. Send reset email if email config available
+/// 6. Return consistent success response
 pub async fn process_password_reset_request(
     app_state: &AppState,
     email: &str,
-) -> (StatusCode, serde_json::Value) {
-    // Check Redis availability
-    let redis_client = match &app_state.redis_client {
-        Some(client) => client,
-        None => {
-            log_error!("PasswordReset", "Missing Redis client", "system_error");
-            AUTH_PASSWORD_RESETS.with_label_values(&["request", "system_error"]).inc();
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                json!({
-                    "status": "error",
-                    "message": "Redis unavailable"
-                }),
-            );
-        }
-    };
+) -> Result<impl IntoResponse, AuthServiceError> {
+    // Check Redis availability - automatic conversion via ? operator
+    let redis_client = app_state
+        .redis_client
+        .as_ref()
+        .ok_or_else(|| AuthServiceError::configuration("Redis client not available for password reset operations"))?;
 
-    // Get database connection
-    let mut db_conn = match app_state.pool.get() {
-        Ok(conn) => conn,
-        Err(e) => {
-            log_error!("PasswordReset", &format!("DB connection failed: {}", e), "system_error");
-            AUTH_PASSWORD_RESETS.with_label_values(&["request", "system_error"]).inc();
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                json!({
-                    "status": "error",
-                    "message": "Database unavailable"
-                }),
-            );
-        }
-    };
+    // Get database connection - automatic conversion via ? operator
+    let mut db_conn = app_state.pool.get()?;
 
     // Look up user by email silently - do not reveal if email exists or not
     if let Ok(user) = User::find_by_email(&mut db_conn, email) {
@@ -89,36 +77,25 @@ pub async fn process_password_reset_request(
         let token = generate_secure_token();
         let redis_key = format!("{}{}", REDIS_KEY_PREFIX, &token);
 
-        // Store token → email mapping in Redis with expiration
-        if let Ok(mut redis_conn) = redis_client.get_async_connection().await {
-            match redis_conn
-                .set_ex::<_, _, ()>(&redis_key, &user.email, RESET_TOKEN_TTL_SECS)
-                .await
-            {
+        // Store token → email mapping in Redis with expiration - automatic conversion via ? operator
+        let mut redis_conn = redis_client.get_async_connection().await?;
+        redis_conn
+            .set_ex::<_, _, ()>(&redis_key, &user.email, RESET_TOKEN_TTL_SECS)
+            .await?;
+
+        // If Redis storage succeeded, attempt to send email
+        if let Some(email_config) = &app_state.email_config {
+            match send_password_reset_email(email_config, &user.email, &token, redis_client).await {
                 Ok(_) => {
-                    // If Redis storage succeeded, attempt to send email
-                    if let Some(email_config) = &app_state.email_config {
-                        match send_password_reset_email(email_config, &user.email, &token).await {
-                            Ok(_) => {
-                                log_info!("PasswordReset", &format!("Reset email sent to {}", mask_email(&user.email)), "success");
-                                AUTH_PASSWORD_RESETS.with_label_values(&["request", "success"]).inc();
-                            }
-                            Err(e) => {
-                                // Email sending failure is non-fatal but logged
-                                log_warn!("PasswordReset", &format!("Failed to send reset email: {}", e), "email_failed");
-                                AUTH_PASSWORD_RESETS.with_label_values(&["request", "email_failed"]).inc();
-                            }
-                        }
-                    }
+                    log_info!("PasswordReset", &format!("Reset email sent to {}", mask_email(&user.email)), "success");
+                    AUTH_PASSWORD_RESETS.with_label_values(&["request", "success"]).inc();
                 }
                 Err(e) => {
-                    log_error!("PasswordReset", &format!("Failed to store reset token in Redis: {}", e), "redis_error");
-                    AUTH_PASSWORD_RESETS.with_label_values(&["request", "redis_error"]).inc();
+                    // Email sending failure is non-fatal but logged
+                    log_warn!("PasswordReset", &format!("Failed to send reset email: {}", e), "email_failed");
+                    AUTH_PASSWORD_RESETS.with_label_values(&["request", "email_failed"]).inc();
                 }
             }
-        } else {
-            log_error!("PasswordReset", "Redis connection failed", "redis_error");
-            AUTH_PASSWORD_RESETS.with_label_values(&["request", "redis_error"]).inc();
         }
     } else {
         // Don't reveal that email doesn't exist, but log it
@@ -127,16 +104,16 @@ pub async fn process_password_reset_request(
     }
 
     // Always return 200 OK to prevent email enumeration attacks
-    (
+    Ok((
         StatusCode::OK,
-        json!({
+        Json(json!({
             "status": "success",
             "message": "If the email exists, a password reset link has been sent."
-        }),
-    )
+        })),
+    ))
 }
 
-/// Processes a password reset confirmation.
+/// Processes a password reset confirmation using the unified error system.
 ///
 /// # Arguments
 /// * `app_state` - Application state containing Redis client and DB pool
@@ -144,164 +121,72 @@ pub async fn process_password_reset_request(
 /// * `new_password` - The new password to set
 ///
 /// # Returns
-/// A tuple containing HTTP status code and JSON response body
+/// Result that can be converted to HTTP response via unified error system
 ///
 /// # Flow
-/// 1. Validate token existence and get associated email from Redis
-/// 2. Validate new password strength
-/// 3. Update user password in database
-/// 4. Invalidate the token to prevent reuse
+/// 1. Check required dependencies (Redis client)
+/// 2. Validate token existence and get associated email from Redis
+/// 3. Validate new password strength
+/// 4. Update user password in database
+/// 5. Invalidate the token to prevent reuse
+/// 6. Return success response
 pub async fn process_password_reset_confirm(
     app_state: &AppState,
     token: &str,
     new_password: &str,
-) -> (StatusCode, serde_json::Value) {
-    // Check Redis availability
-    let redis_client = match &app_state.redis_client {
-        Some(client) => client,
-        None => {
-            log_error!("PasswordReset", "Missing Redis client", "system_error");
-            AUTH_PASSWORD_RESETS.with_label_values(&["confirm", "system_error"]).inc();
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                json!({
-                    "status": "error",
-                    "message": "Redis unavailable"
-                }),
-            );
-        }
-    };
+) -> Result<impl IntoResponse, AuthServiceError> {
+    // Check Redis availability - automatic conversion via ? operator
+    let redis_client = app_state
+        .redis_client
+        .as_ref()
+        .ok_or_else(|| AuthServiceError::configuration("Redis client not available for password reset operations"))?;
 
-    // Build Redis key and get async connection
-    let redis_key = format!("{}{}", REDIS_KEY_PREFIX, token);
-    let mut redis_conn = match redis_client.get_async_connection().await {
-        Ok(conn) => conn,
-        Err(e) => {
-            log_error!("PasswordReset", &format!("Redis connection failed: {}", e), "system_error");
-            AUTH_PASSWORD_RESETS.with_label_values(&["confirm", "system_error"]).inc();
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                json!({
-                    "status": "error",
-                    "message": "Redis unavailable"
-                }),
-            );
-        }
-    };
+    // POPRAWKA: Verify token using config/redis.rs function
+    let email = verify_reset_token(redis_client, token).await.map_err(|_| {
+        log_warn!("PasswordReset", "Invalid or expired reset token", "invalid_token");
+        AUTH_PASSWORD_RESETS.with_label_values(&["confirm", "invalid_token"]).inc();
+        
+        // Return validation error for invalid/expired tokens
+        AuthServiceError::validation("token", "Invalid or expired reset token")
+    })?;
 
-    // Retrieve stored email associated with token
-    let email_opt = match redis_conn.get::<_, Option<String>>(&redis_key).await {
-        Ok(opt) => opt,
-        Err(e) => {
-            log_error!("PasswordReset", &format!("Redis get failed: {}", e), "system_error");
-            AUTH_PASSWORD_RESETS.with_label_values(&["confirm", "system_error"]).inc();
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                json!({
-                    "status": "error",
-                    "message": "Redis unavailable"
-                }),
-            );
-        }
-    };
+    // Validate new password strength before proceeding - automatic conversion via ? operator
+    validate_password(new_password)?;
 
-    // Check if token exists and is valid
-    let email = match email_opt {
-        Some(email) => email,
-        None => {
-            log_warn!("PasswordReset", "Invalid or expired reset token", "invalid_token");
-            AUTH_PASSWORD_RESETS.with_label_values(&["confirm", "invalid_token"]).inc();
-            return (
-                StatusCode::UNAUTHORIZED,  // Changed from BAD_REQUEST to more appropriate UNAUTHORIZED
-                json!({
-                    "status": "error",
-                    "message": "Invalid or expired reset token"
-                }),
-            );
-        }
-    };
+    // Get database connection - automatic conversion via ? operator
+    let mut db_conn = app_state.pool.get()?;
 
-    // Validate new password strength before proceeding
-    if let Err(e) = validate_password(new_password) {
-        log_warn!("PasswordReset", &format!("Password validation failed: {}", e), "validation_failed");
-        AUTH_PASSWORD_RESETS.with_label_values(&["confirm", "validation_failed"]).inc();
-        return (
-            StatusCode::BAD_REQUEST,
-            json!({
-                "status": "error",
-                "message": e.to_string()
-            }),
-        );
-    }
+    // Find the user by email - automatic conversion via ? operator
+    let mut user = User::find_by_email(&mut db_conn, &email).map_err(|_| {
+        log_warn!("PasswordReset", "User not found for valid token", "user_not_found");
+        AUTH_PASSWORD_RESETS.with_label_values(&["confirm", "user_not_found"]).inc();
+        
+        // Use validation error instead of exposing internal details
+        AuthServiceError::validation("token", "Invalid reset token")
+    })?;
 
-    // Get database connection
-    let mut db_conn = match app_state.pool.get() {
-        Ok(conn) => conn,
-        Err(e) => {
-            log_error!("PasswordReset", &format!("DB connection failed: {}", e), "system_error");
-            AUTH_PASSWORD_RESETS.with_label_values(&["confirm", "system_error"]).inc();
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                json!({
-                    "status": "error",
-                    "message": "Database unavailable"
-                }),
-            );
-        }
-    };
+    // Update the user's password - automatic conversion via ? operator
+    user.set_password_and_update(&mut db_conn, new_password)?;
 
-    // Find the user by email
-    let mut user = match User::find_by_email(&mut db_conn, &email) {
-        Ok(user) => user,
-        Err(e) => {
-            log_warn!("PasswordReset", &format!("User not found: {}", e), "user_not_found");
-            AUTH_PASSWORD_RESETS.with_label_values(&["confirm", "user_not_found"]).inc();
-            return (
-                StatusCode::UNAUTHORIZED,  // Use UNAUTHORIZED instead of BAD_REQUEST for security
-                json!({
-                    "status": "error",
-                    "message": "Invalid reset token"
-                }),
-            );
-        }
-    };
-
-    // Update the user's password
-    if let Err(e) = user.set_password_and_update(&mut db_conn, new_password) {
-        log_error!("PasswordReset", &format!("Password update failed: {}", e), "db_error");
-        AUTH_PASSWORD_RESETS.with_label_values(&["confirm", "db_error"]).inc();
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json!({
-                "status": "error",
-                "message": "Failed to update password"
-            }),
-        );
-    }
-
-    // Delete token from Redis to prevent reuse
-    // Note: This is done after the password update to ensure the token is invalidated
-    match redis_conn.del::<_, i64>(&redis_key).await {
-        Ok(_) => {
-            log_info!("PasswordReset", "Reset token invalidated after use", "token_invalidated");
-        }
-        Err(e) => {
-            // Non-fatal error, but should be logged
-            log_warn!("PasswordReset", &format!("Failed to invalidate used token: {}", e), "token_cleanup_failed");
-        }
+    // POPRAWKA: Invalidate token using config/redis.rs function
+    if let Err(e) = invalidate_reset_token(redis_client, token).await {
+        // Non-fatal error, but should be logged
+        log_warn!("PasswordReset", &format!("Failed to invalidate used token: {}", e), "token_cleanup_failed");
+    } else {
+        log_info!("PasswordReset", "Reset token invalidated after use", "token_invalidated");
     }
 
     // Log success and return positive response
     log_info!("PasswordReset", &format!("Password reset successful for user with email: {}", mask_email(&email)), "success");
     AUTH_PASSWORD_RESETS.with_label_values(&["confirm", "success"]).inc();
     
-    (
+    Ok((
         StatusCode::OK,
-        json!({
+        Json(json!({
             "status": "success",
             "message": "Password has been reset successfully."
-        }),
-    )
+        })),
+    ))
 }
 
 /// Generates a cryptographically secure random token for password reset.
@@ -355,9 +240,7 @@ fn mask_email(email: &str) -> String {
 mod tests {
     use super::*;
     use crate::utils::test_utils::{init_jwt_secret, state_no_redis, state_with_redis};
-    use axum::http::StatusCode;
     use redis::cmd;
-    use serde_json::json;
 
     #[test]
     fn test_mask_email() {
@@ -390,80 +273,85 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_redis_request_returns_500() {
+    async fn missing_redis_request_returns_configuration_error() {
         // Arrange
         init_jwt_secret();
         let state = state_no_redis();
         
         // Act
-        let (status, body) = process_password_reset_request(&state, "user@example.com").await;
+        let result = process_password_reset_request(&state, "user@example.com").await;
         
         // Assert
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(body, json!({
-            "status": "error",
-            "message": "Redis unavailable"
-        }));
+        assert!(result.is_err());
+        
+        // Check that it's a configuration error
+        match result.err().unwrap() {
+            AuthServiceError::Configuration(msg) => {
+                assert!(msg.contains("Redis client"));
+            }
+            other => panic!("Expected configuration error, got: {:?}", other),
+        }
     }
 
     #[tokio::test]
-    async fn request_nonexistent_email_returns_200() {
+    async fn request_nonexistent_email_returns_success() {
         // Arrange
         init_jwt_secret();
         let state = state_with_redis();
         
         // Act
-        let (status, body) =
-            process_password_reset_request(&state, "no-user@domain").await;
-            
-        // Assert
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, json!({
-            "status": "success",
-            "message": "If the email exists, a password reset link has been sent."
-        }));
+        let result = process_password_reset_request(&state, "no-user@domain").await;
+        
+        // Assert - Should succeed regardless of email existence (anti-enumeration)
+        assert!(result.is_ok());
     }
 
     #[tokio::test]
-    async fn missing_redis_confirm_returns_500() {
+    async fn missing_redis_confirm_returns_configuration_error() {
         // Arrange
         init_jwt_secret();
         let state = state_no_redis();
         
         // Act
-        let (status, body) =
-            process_password_reset_confirm(&state, "some-token", "NewPass1!").await;
-            
+        let result = process_password_reset_confirm(&state, "some-token", "NewPass1!").await;
+        
         // Assert
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(body, json!({
-            "status": "error",
-            "message": "Redis unavailable"
-        }));
+        assert!(result.is_err());
+        
+        // Check that it's a configuration error
+        match result.err().unwrap() {
+            AuthServiceError::Configuration(msg) => {
+                assert!(msg.contains("Redis client"));
+            }
+            other => panic!("Expected configuration error, got: {:?}", other),
+        }
     }
 
     #[tokio::test]
     #[ignore] // requires Redis + JWT_SECRET
-    async fn invalid_token_confirm_returns_401() {
+    async fn invalid_token_confirm_returns_validation_error() {
         // Arrange
         init_jwt_secret();
         let state = state_with_redis();
         
         // Act - no such token in Redis
-        let (status, body) =
-            process_password_reset_confirm(&state, "bad-token", "NewPass1!").await;
-            
+        let result = process_password_reset_confirm(&state, "bad-token", "NewPass1!").await;
+        
         // Assert
-        assert_eq!(status, StatusCode::UNAUTHORIZED);  // Changed from BAD_REQUEST to UNAUTHORIZED
-        assert_eq!(body, json!({
-            "status": "error",
-            "message": "Invalid or expired reset token"
-        }));
+        assert!(result.is_err());
+        
+        // Check that it's a validation error
+        match result.err().unwrap() {
+            AuthServiceError::Validation(_) => {
+                // Expected
+            }
+            other => panic!("Expected validation error, got: {:?}", other),
+        }
     }
 
     #[tokio::test]
     #[ignore] // requires Redis + JWT_SECRET
-    async fn validation_error_confirm_returns_400() {
+    async fn validation_error_confirm_returns_validation_error() {
         // Arrange
         init_jwt_secret();
         let state = state_with_redis();
@@ -482,12 +370,18 @@ mod tests {
         redis_conn.set_ex::<_, _, ()>(&key, email, RESET_TOKEN_TTL_SECS).await.unwrap();
 
         // Act - invalid new password
-        let (status, body) =
-            process_password_reset_confirm(&state, token, "short").await;
-            
+        let result = process_password_reset_confirm(&state, token, "short").await;
+        
         // Assert
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(body.get("message").unwrap().as_str().unwrap().contains("password"));
+        assert!(result.is_err());
+        
+        // Check that it's a validation error
+        match result.err().unwrap() {
+            AuthServiceError::Validation(_) => {
+                // Expected
+            }
+            other => panic!("Expected validation error, got: {:?}", other),
+        }
     }
 
     #[tokio::test]
@@ -520,15 +414,10 @@ mod tests {
 
         // Act - confirm with new valid password
         let new_pw = "NewStrong1!";
-        let (status, body) =
-            process_password_reset_confirm(&state, token, new_pw).await;
-            
+        let result = process_password_reset_confirm(&state, token, new_pw).await;
+        
         // Assert response
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, json!({
-            "status": "success",
-            "message": "Password has been reset successfully."
-        }));
+        assert!(result.is_ok());
 
         // Verify DB was updated with new password
         let mut conn2 = state.pool.get().unwrap();
@@ -567,17 +456,22 @@ mod tests {
         
         // Act - first reset attempt
         let new_pw = "NewStrong2@";
-        let (status1, _) = process_password_reset_confirm(&state, token, new_pw).await;
+        let result1 = process_password_reset_confirm(&state, token, new_pw).await;
         
         // Assert first attempt succeeded
-        assert_eq!(status1, StatusCode::OK);
+        assert!(result1.is_ok());
         
         // Act - second reset attempt with same token
         let new_pw2 = "DifferentPass3#";
-        let (status2, body2) = process_password_reset_confirm(&state, token, new_pw2).await;
+        let result2 = process_password_reset_confirm(&state, token, new_pw2).await;
         
-        // Assert second attempt fails
-        assert_eq!(status2, StatusCode::UNAUTHORIZED);
-        assert_eq!(body2["message"], "Invalid or expired reset token");
+        // Assert second attempt fails with validation error
+        assert!(result2.is_err());
+        match result2.err().unwrap() {
+            AuthServiceError::Validation(_) => {
+                // Expected - token should be invalid after first use
+            }
+            other => panic!("Expected validation error, got: {:?}", other),
+        }
     }
 }

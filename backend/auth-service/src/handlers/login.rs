@@ -6,20 +6,21 @@
 //!
 //! The handler includes comprehensive request tracing, structured logging,
 //! and proper error handling to facilitate debugging and security auditing.
+//! - Unified error handling with automatic HTTP response conversion
 
 use std::sync::Arc;
 use axum::{
     extract::{Json, State},
     response::IntoResponse,
-    Json as AxumJson,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tracing::instrument;
 
 use crate::{
     app::AppState,
     handlers::login_logic::process_login,
-    log_info, log_error,
+    utils::error_new::AuthServiceError, // ← Add unified error system
+    log_info,
 };
 
 /// Request payload for user authentication.
@@ -34,44 +35,12 @@ pub struct LoginRequest {
     pub password: String,
 }
 
-/// Response structure for successful authentication.
-#[derive(Debug, Serialize)]
-pub struct LoginResponse {
-    /// Operation status ("success")
-    pub status: String,
-    
-    /// Success message
-    pub message: String,
-    
-    /// Authentication data including tokens
-    pub data: AuthData,
-}
-
-/// Authentication tokens and user information.
-#[derive(Debug, Serialize)]
-pub struct AuthData {
-    /// JWT access token for API authorization
-    pub access_token: String,
-    
-    /// JWT refresh token for obtaining new access tokens
-    pub refresh_token: String,
-    
-    /// Token type (always "Bearer" for JWT)
-    pub token_type: String,
-    
-    /// The authenticated user's username
-    pub username: String,
-    
-    /// The authenticated user's email address
-    pub email: String,
-}
-
-/// Handles user authentication requests.
+/// Handles user login requests.
 ///
 /// # Endpoint: POST /auth/login
 ///
-/// Authenticates a user with username/email and password,
-/// returning JWT tokens on success.
+/// Authenticates a user using either username or email address along with
+/// their password. Returns JWT tokens (access and refresh) on successful authentication.
 ///
 /// ## Request Body
 /// ```json
@@ -83,71 +52,73 @@ pub struct AuthData {
 ///
 /// ## Responses
 ///
-/// * `200 OK` - Authentication successful, returns tokens
-/// * `401 Unauthorized` - Invalid credentials
+/// * `200 OK` - Authentication successful, returns tokens and user info
+/// * `400 Bad Request` - Invalid credentials or validation error
 /// * `500 Internal Server Error` - Server-side error
+/// * `503 Service Unavailable` - Database unavailable
+///
+/// ## Example success response
+/// ```json
+/// {
+///   "status": "success",
+///   "message": "Authentication successful",
+///   "data": {
+///     "access_token": "<jwt-access-token>",
+///     "refresh_token": "<jwt-refresh-token>",
+///     "token_type": "Bearer",
+///     "username": "user123",
+///     "email": "user@example.com"
+///   }
+/// }
+/// ```
+///
+/// ## Example error responses
+/// ```json
+/// {
+///   "status": "validation_error",
+///   "message": "credentials: Invalid credentials"
+/// }
+/// ```
+/// ```json
+/// {
+///   "status": "service_unavailable",
+///   "message": "Could not get a database connection"
+/// }
+/// ```
 ///
 /// ## Security Features
 ///
-/// - Consistent response timing to mitigate timing attacks
-/// - Password verification using secure comparison
-/// - Comprehensive audit logging
-/// - Rate limiting protection (applied at middleware level)
+/// - Constant-time password comparison to prevent timing attacks
+/// - Generic error messages that don't reveal user existence
+/// - Consistent response timing regardless of error type
+/// - Comprehensive logging for security auditing
 #[instrument(
-    name = "user_login",
+    name = "login_user",
     level = "info",
     skip(app_state, login_request),
     fields(
         path = "/auth/login", 
         method = "POST",
-        username_or_email = tracing::field::Empty,
-        login_type = tracing::field::Empty
+        login_type = tracing::field::Empty,
+        login_length = tracing::field::Empty
     )
 )]
 pub async fn login_handler(
     State(app_state): State<Arc<AppState>>,
     Json(login_request): Json<LoginRequest>,
-) -> impl IntoResponse {
-    // Determine login type (email vs username) for better tracing
+) -> Result<impl IntoResponse, AuthServiceError> { // ← Changed return type
+    // Determine login type and add useful trace information without exposing credentials
     let login_type = if login_request.login.contains('@') { "email" } else { "username" };
-    
-    // Add structured information to the current span
     tracing::Span::current()
-        .record("username_or_email", &tracing::field::display(&login_request.login))
-        .record("login_type", &tracing::field::display(login_type));
-    
-    // Log authentication attempt
-    log_info!(
-        "Auth", 
-        &format!("Login attempt with {}: {}", login_type, login_request.login), 
-        "attempt"
-    );
+        .record("login_type", &tracing::field::display(login_type))
+        .record("login_length", &tracing::field::display(login_request.login.len()));
 
-    // Process login request through business logic layer
-    match process_login(&app_state.pool, &login_request).await {
-        Ok((status, body)) => {
-            // Log successful authentication
-            log_info!(
-                "Auth", 
-                &format!("Login successful for {}", login_request.login), 
-                "success"
-            );
-            
-            // Return success response
-            (status, AxumJson(body)).into_response()
-        }
-        Err(err) => {
-            // Log failed authentication attempt with error reason
-            log_error!(
-                "Auth", 
-                &format!("Login failed for {}: {}", login_request.login, err), 
-                "failure"
-            );
-            
-            // Return error response
-            err.into_response()
-        }
-    }
+    // Log the login attempt without revealing sensitive information
+    log_info!("Auth", &format!("Login attempt via {} (length: {})", login_type, login_request.login.len()), "attempt");
+
+    // Process the login request using unified error system
+    // The ? operator will automatically convert AuthServiceError to HTTP response
+    process_login(&app_state, &login_request).await
 }
 
 #[cfg(test)]
@@ -161,28 +132,25 @@ mod tests {
     };
     use serde_json::json;
     use tower::ServiceExt;
-    
+
+    use crate::utils::test_utils::{init_jwt_secret, state_with_redis};
     use crate::db::users::User;
-    use crate::utils::test_utils::state_with_redis;
 
     /// Creates a test router with the login handler
-    fn app() -> (Router, Arc<AppState>) {
-        let state = Arc::new(state_with_redis());
+    fn app() -> Router {
+        let state = state_with_redis();
         
-        let app = Router::new()
+        Router::new()
             .route("/auth/login", post(login_handler))
-            .with_state(state.clone());
-            
-        (app, state)
+            .with_state(Arc::new(state))
     }
 
     #[tokio::test]
-    async fn invalid_credentials_return_401() {
+    async fn missing_login_field_returns_bad_request() {
         // Arrange
-        let (app, _) = app();
+        let app = app();
         let request_body = json!({
-            "login": "nonexistent",
-            "password": "wrong"
+            "password": "some_password" // Missing required "login" field
         });
 
         // Act
@@ -198,63 +166,178 @@ mod tests {
             .await
             .unwrap();
 
-        // Assert
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        
-        assert_eq!(body["status"], "unauthorized");
-        assert!(body["message"].as_str().unwrap().contains("Invalid"));
-    }
-
-    #[tokio::test]
-    async fn missing_fields_return_400() {
-        // Arrange
-        let (app, _) = app();
-        let request_body = json!({
-            // Missing required fields
-        });
-
-        // Act
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/auth/login")
-                    .header("Content-Type", "application/json")
-                    .body(Body::from(request_body.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        // Assert - accept either 400 or 422 as both are used for validation errors
+        // Assert - This will be handled by Axum's JSON extractor
         assert!(
-            response.status() == StatusCode::BAD_REQUEST || response.status() == StatusCode::UNPROCESSABLE_ENTITY,
+            response.status() == StatusCode::BAD_REQUEST || 
+            response.status() == StatusCode::UNPROCESSABLE_ENTITY,
             "Response status should be 400 Bad Request or 422 Unprocessable Entity"
         );
     }
 
     #[tokio::test]
-    #[ignore] // requires DB setup with test user
-    async fn valid_credentials_return_200_with_tokens() {
+    async fn missing_password_field_returns_bad_request() {
         // Arrange
-        let (app, state) = app();
+        let app = app();
+        let request_body = json!({
+            "login": "username" // Missing required "password" field
+        });
+
+        // Act
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/login")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Assert - This will be handled by Axum's JSON extractor
+        assert!(
+            response.status() == StatusCode::BAD_REQUEST || 
+            response.status() == StatusCode::UNPROCESSABLE_ENTITY,
+            "Response status should be 400 Bad Request or 422 Unprocessable Entity"
+        );
+    }
+
+    #[tokio::test]
+    async fn nonexistent_user_returns_validation_error() {
+        // Arrange
+        init_jwt_secret();
+        let app = app();
+        let request_body = json!({
+            "login": "nonexistent_user",
+            "password": "any_password"
+        });
+
+        // Act
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/login")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         
-        // Set up test user
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        
+        // With unified error system, invalid credentials should be validation error
+        assert_eq!(body["status"], "validation_error");
+        assert!(body["message"].as_str().unwrap().contains("credentials"));
+    }
+
+    #[tokio::test]
+    async fn wrong_password_returns_validation_error() {
+        // Arrange
+        init_jwt_secret();
+        let app = app();
+        let state = state_with_redis();
         let mut conn = state.pool.get().unwrap();
-        let test_user = "test_login_user";
-        let test_password = "TestPass123!";
-        let test_email = "test_login@example.com";
         
-        let mut user = User::new(test_user, test_email, test_password);
+        // Create active user
+        let mut user = User::new("testuser", "test@example.com", "CorrectPass123!");
         user.is_active = Some(true);
         user.save(&mut conn).unwrap();
         
         let request_body = json!({
-            "login": test_user,
-            "password": test_password
+            "login": "testuser",
+            "password": "wrong_password"
+        });
+
+        // Act
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/login")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        
+        // With unified error system, wrong password should be validation error
+        assert_eq!(body["status"], "validation_error");
+        assert!(body["message"].as_str().unwrap().contains("credentials"));
+    }
+
+    #[tokio::test]
+    async fn inactive_user_returns_validation_error() {
+        // Arrange
+        init_jwt_secret();
+        let app = app();
+        let state = state_with_redis();
+        let mut conn = state.pool.get().unwrap();
+        
+        // Create inactive user
+        let mut user = User::new("inactive", "inactive@example.com", "ValidPass123!");
+        user.is_active = Some(false); // Inactive account
+        user.save(&mut conn).unwrap();
+        
+        let request_body = json!({
+            "login": "inactive",
+            "password": "ValidPass123!"
+        });
+
+        // Act
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/login")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        
+        // With unified error system, inactive account should be validation error
+        assert_eq!(body["status"], "validation_error");
+        assert!(body["message"].as_str().unwrap().contains("credentials"));
+    }
+
+    #[tokio::test]
+    #[ignore] // requires JWT_SECRET environment variable
+    async fn successful_login_returns_tokens() {
+        // Arrange
+        init_jwt_secret();
+        let app = app();
+        let state = state_with_redis();
+        let mut conn = state.pool.get().unwrap();
+        
+        // Create active user
+        let mut user = User::new("activeuser", "active@example.com", "ValidPass123!");
+        user.is_active = Some(true);
+        user.save(&mut conn).unwrap();
+        
+        let request_body = json!({
+            "login": "activeuser",
+            "password": "ValidPass123!"
         });
 
         // Act
@@ -276,33 +359,35 @@ mod tests {
         let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         
+        // Verify success response structure
         assert_eq!(body["status"], "success");
+        assert_eq!(body["message"], "Authentication successful");
+        assert!(body["data"].is_object());
         assert!(body["data"]["access_token"].is_string());
         assert!(body["data"]["refresh_token"].is_string());
         assert_eq!(body["data"]["token_type"], "Bearer");
-        assert_eq!(body["data"]["username"], test_user);
-        assert_eq!(body["data"]["email"], test_email);
+        assert_eq!(body["data"]["username"], "activeuser");
+        assert_eq!(body["data"]["email"], "active@example.com");
     }
-    
+
     #[tokio::test]
-    #[ignore] // requires DB setup with test user
-    async fn login_with_email_returns_200_with_tokens() {
+    #[ignore] // requires JWT_SECRET environment variable
+    async fn email_login_works() {
         // Arrange
-        let (app, state) = app();
-        
-        // Set up test user
+        init_jwt_secret();
+        let app = app();
+        let state = state_with_redis();
         let mut conn = state.pool.get().unwrap();
-        let test_user = "test_email_login";
-        let test_password = "TestPass123!";
-        let test_email = "test_email_login@example.com";
         
-        let mut user = User::new(test_user, test_email, test_password);
+        // Create active user
+        let mut user = User::new("emailuser", "email@example.com", "ValidPass123!");
         user.is_active = Some(true);
         user.save(&mut conn).unwrap();
         
+        // Login with email instead of username
         let request_body = json!({
-            "login": test_email,  // Login with email instead of username
-            "password": test_password
+            "login": "email@example.com", // Using email
+            "password": "ValidPass123!"
         });
 
         // Act
@@ -324,7 +409,63 @@ mod tests {
         let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         
+        // Verify success response
         assert_eq!(body["status"], "success");
-        assert_eq!(body["data"]["username"], test_user);
+        assert_eq!(body["data"]["username"], "emailuser");
+        assert_eq!(body["data"]["email"], "email@example.com");
+    }
+
+    #[tokio::test]
+    async fn malformed_json_returns_bad_request() {
+        // Arrange
+        let app = app();
+        let malformed_json = "{ invalid json }";
+
+        // Act
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/login")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(malformed_json))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Assert - Malformed JSON should be rejected by Axum
+        assert!(
+            response.status() == StatusCode::BAD_REQUEST || 
+            response.status() == StatusCode::UNPROCESSABLE_ENTITY,
+            "Malformed JSON should return 400 or 422"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_json_returns_bad_request() {
+        // Arrange
+        let app = app();
+        let empty_json = "{}";
+
+        // Act
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/login")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(empty_json))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Assert - Empty JSON missing required fields should be rejected
+        assert!(
+            response.status() == StatusCode::BAD_REQUEST || 
+            response.status() == StatusCode::UNPROCESSABLE_ENTITY,
+            "Empty JSON should return 400 or 422"
+        );
     }
 }

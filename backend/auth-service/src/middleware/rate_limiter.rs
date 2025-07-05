@@ -39,13 +39,14 @@
 //!     .layer(rate_limiter);
 //! ```
 
+use crate::utils::error_new::ApiError; // ← Dodane
 use crate::utils::metrics::RATE_LIMIT_BLOCKS;
 use crate::utils::rate_limit::check_and_increment;
 use crate::{log_error, log_warn};
 use axum::{
     body::{Body, BoxBody},
-    http::{Request, StatusCode},
-    response::Response,
+    http::Request,
+    response::{IntoResponse, Response}, // ← Dodane IntoResponse
 };
 use redis::Client;
 use std::future::Future;
@@ -59,10 +60,8 @@ pub type KeyFn = dyn Fn(&Request<Body>) -> String + Send + Sync + 'static;
 /// Configuration for rate limit responses.
 #[derive(Debug, Clone)]
 pub struct RateLimitConfig {
-    /// HTTP status code to return when rate limited (default: 429)
-    pub status_code: StatusCode,
-    /// Response body to return when rate limited
-    pub message: String,
+    /// Custom message to return when rate limited (optional)
+    pub message: Option<String>,
     /// Value for Retry-After header in seconds (optional)
     pub retry_after: Option<u64>,
 }
@@ -70,8 +69,7 @@ pub struct RateLimitConfig {
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
-            status_code: StatusCode::TOO_MANY_REQUESTS,
-            message: "Too many requests. Please try again later.".to_string(),
+            message: None, // Use default ApiError message
             retry_after: Some(10),
         }
     }
@@ -179,26 +177,18 @@ where
                 );
                 RATE_LIMIT_BLOCKS.with_label_values(&["rate_limit"]).inc();
 
-                // Build response using the config values
-                let mut response = Response::builder().status(config.status_code);
+                // ✅ NOWE: Używamy ApiError z unified error system
+                let message = config.message
+                    .unwrap_or_else(|| "Too many requests. Please try again later.".to_string());
+                
+                let mut api_error = ApiError::too_many_requests(&message);
                 
                 // Add Retry-After header if configured
                 if let Some(retry_secs) = config.retry_after {
-                    response = response.header("Retry-After", retry_secs.to_string());
+                    api_error = api_error.with_header("Retry-After", retry_secs.to_string());
                 }
                 
-                // Return configured response with message
-                let response = response
-                    .body(axum::body::boxed(Body::from(config.message)))
-                    .unwrap_or_else(|_| {
-                        // Fallback if builder fails
-                        Response::builder()
-                            .status(StatusCode::TOO_MANY_REQUESTS)
-                            .body(axum::body::boxed(Body::from("Rate limit exceeded")))
-                            .unwrap()
-                    });
-                
-                return Ok(response);
+                return Ok(api_error.into_response());
             }
 
             // Request is allowed - forward to inner service
@@ -269,7 +259,7 @@ mod tests {
 
     #[tokio::test]
     async fn allows_and_blocks_based_on_limit() {
-        let svc = setup_svc(1, 60).await; // svc: RateLimiterMiddleware<DummyService>
+        let svc = setup_svc(1, 60).await;
 
         // First call → allowed
         let req1 = Request::builder().body(Body::empty()).unwrap();
@@ -279,11 +269,17 @@ mod tests {
         let req2 = Request::builder().body(Body::empty()).unwrap();
         let resp2 = svc.clone().oneshot(req2).await.unwrap();
         assert_eq!(resp2.status(), StatusCode::TOO_MANY_REQUESTS);
+        
+        // ✅ NOWY TEST: Verify JSON structure
+        let body = hyper::body::to_bytes(resp2.into_body()).await.unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("\"status\":\"too_many_requests\""), 
+                "Should return structured JSON error");
     }
 
     #[tokio::test]
     async fn resets_after_ttl() {
-        let svc = setup_svc(1, 1).await; // svc: RateLimiterMiddleware<DummyService>
+        let svc = setup_svc(1, 1).await;
 
         // 1) first call: allowed
         let req1 = Request::builder().body(Body::empty()).unwrap();
@@ -308,7 +304,6 @@ mod tests {
     async fn fail_open_on_redis_error() {
         // Bad port → connection error → middleware must let requests through
         let client = Client::open("redis://127.0.0.1:6380/").unwrap();
-        // reuse helper: window=60, max=0
         let layer = RateLimiterLayer {
             redis: Arc::new(client),
             max_attempts: 0,
@@ -345,8 +340,7 @@ mod tests {
     async fn uses_custom_config() {
         let client = make_redis_client().await;
         let custom_config = RateLimitConfig {
-            status_code: StatusCode::SERVICE_UNAVAILABLE,
-            message: "Custom rate limit message".to_string(),
+            message: Some("Custom rate limit message".to_string()),
             retry_after: Some(30),
         };
         
@@ -363,17 +357,87 @@ mod tests {
         let resp = svc.oneshot(req).await.unwrap();
         
         // Check that config values were properly used
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS); // ← Changed from SERVICE_UNAVAILABLE
         assert_eq!(
             resp.headers().get("retry-after").unwrap().to_str().unwrap(),
             "30"
         );
         
-        // Read body to check the custom message 
+        // Read body to check the custom message and JSON structure
         let body = hyper::body::to_bytes(resp.into_body())
             .await
             .unwrap();
         let body_text = String::from_utf8(body.to_vec()).unwrap();
-        assert_eq!(body_text, "Custom rate limit message");
+        
+        // ✅ NOWY TEST: Should be JSON, not plain text
+        assert!(body_text.contains("\"status\":\"too_many_requests\""), 
+                "Should return structured JSON");
+        assert!(body_text.contains("Custom rate limit message"), 
+                "Should contain custom message");
+    }
+
+    #[tokio::test]
+    async fn retry_after_header_is_set() {
+        let client = make_redis_client().await;
+        let config = RateLimitConfig {
+            message: None,
+            retry_after: Some(120), // 2 minutes
+        };
+        
+        let layer = RateLimiterLayer {
+            redis: Arc::new(client),
+            max_attempts: 0, // Always rate limit
+            window_secs: 60,
+            key_fn: Arc::new(|_| "test_key_retry".to_string()),
+            config,
+        };
+        
+        let svc = layer.layer(DummyService);
+        let req = Request::builder().body(Body::empty()).unwrap();
+        let resp = svc.oneshot(req).await.unwrap();
+        
+        // Check that Retry-After header is properly set
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers().get("retry-after").unwrap().to_str().unwrap(),
+            "120"
+        );
+        
+        // Verify it's proper JSON response
+        let body = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("\"status\":\"too_many_requests\""), 
+                "Should return structured JSON error");
+    }
+
+    #[tokio::test]
+    async fn default_message_when_none_provided() {
+        let client = make_redis_client().await;
+        let config = RateLimitConfig {
+            message: None, // Use default message
+            retry_after: None,
+        };
+        
+        let layer = RateLimiterLayer {
+            redis: Arc::new(client),
+            max_attempts: 0, // Always rate limit
+            window_secs: 60,
+            key_fn: Arc::new(|_| "test_key_default".to_string()),
+            config,
+        };
+        
+        let svc = layer.layer(DummyService);
+        let req = Request::builder().body(Body::empty()).unwrap();
+        let resp = svc.oneshot(req).await.unwrap();
+        
+        // Check that default message is used
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        
+        let body = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("Too many requests. Please try again later."), 
+                "Should contain default message");
+        assert!(body_str.contains("\"status\":\"too_many_requests\""), 
+                "Should return structured JSON error");
     }
 }

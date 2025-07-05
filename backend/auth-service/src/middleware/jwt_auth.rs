@@ -5,7 +5,7 @@
 //! On failure, it returns a 401 Unauthorized response and logs the event.
 
 use crate::app::AppState;
-use crate::utils::errors::ApiError;
+use crate::utils::error_new::ApiError; // ← Zmienione z utils::errors
 use crate::utils::jwt;
 use crate::{log_error, log_info, log_warn};
 use axum::{extract::State, http::Request, middleware::Next, response::IntoResponse};
@@ -27,7 +27,7 @@ use std::sync::Arc;
 /// - Graceful error handling with descriptive responses
 ///
 /// # Example Usage
-/// ```
+/// ```rust
 /// let app = Router::new()
 ///     .route("/protected", get(protected_handler))
 ///     .layer(from_fn_with_state(app_state, jwt_auth_middleware));
@@ -52,7 +52,8 @@ pub async fn jwt_auth_middleware<B>(
         Some(redis) => redis,
         None => {
             log_error!("JWTAuth", "Redis unavailable for token validation", "system_error");
-            return ApiError::internal("Redis unavailable for token validation").into_response();
+            return ApiError::service_unavailable("Redis unavailable for token validation")
+                .into_response();
         }
     };
 
@@ -68,7 +69,10 @@ pub async fn jwt_auth_middleware<B>(
                 &format!("Invalid or expired token: {}", err),
                 "unauthorized"
             );
-            ApiError::unauthorized(&format!("Invalid or expired token: {}", err)).into_response()
+            
+            // Convert AuthServiceError to ApiError automatically
+            let api_error = ApiError::from(err);
+            api_error.into_response()
         }
     }
 }
@@ -122,7 +126,7 @@ mod tests {
     /// Build AppState with optional Redis URL, using in-memory SQLite
     fn make_state(redis_url: Option<&str>) -> Arc<AppState> {
         // Configure test environment
-        env::set_var("JWT_SECRET", "test-secret");
+        env::set_var("JWT_SECRET", "test-secret-key-minimum-32-characters-for-security-compliance");
         env::set_var("DATABASE_URL", ":memory:");
         
         // Initialize database
@@ -154,6 +158,12 @@ mod tests {
 
         // Assert
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        
+        // Verify response body contains JSON error
+        let body = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("unauthorized"), "Response should contain error status");
+        assert!(body_str.contains("Missing or invalid Authorization header"), "Response should contain specific error message");
     }
 
     #[tokio::test]
@@ -204,6 +214,71 @@ mod tests {
 
         // Assert
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        
+        // Verify response is JSON with proper error structure
+        let body = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("\"status\":\"unauthorized\""), "Response should be structured JSON error");
+    }
+
+    #[tokio::test]
+    async fn expired_token_returns_401_with_proper_error() {
+        // Arrange
+        let state = make_state(Some("redis://127.0.0.1/"));
+        
+        // Generate expired token
+        let expired_token = jwt::generate_token("test-user", TOKEN_TYPE_ACCESS, Some(Duration::seconds(-1)))
+            .unwrap();
+
+        let app = Router::new()
+            .route("/", get(ok_handler))
+            .layer(from_fn_with_state(state.clone(), jwt_auth_middleware));
+
+        // Act
+        let req = Request::builder()
+            .uri("/")
+            .header("authorization", format!("Bearer {}", expired_token))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+
+        // Assert
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        
+        // Verify response contains expiration error information
+        let body = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("expired"), "Response should mention token expiration");
+    }
+
+    #[tokio::test]
+    async fn redis_unavailable_returns_503() {
+        // Arrange - state without Redis
+        let state = make_state(None);
+        let token = jwt::generate_token("test-user", TOKEN_TYPE_ACCESS, Some(Duration::hours(1)))
+            .unwrap();
+
+        let app = Router::new()
+            .route("/", get(ok_handler))
+            .layer(from_fn_with_state(state.clone(), jwt_auth_middleware));
+
+        // Act
+        let req = Request::builder()
+            .uri("/")
+            .header("authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+
+        // Assert
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        
+        // Verify response mentions Redis unavailability
+        let body = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("Redis unavailable"), "Response should mention Redis unavailability");
     }
 
     #[tokio::test]
@@ -238,5 +313,32 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert_eq!(extract_bearer_token(&req), Some("abc123"));
+    }
+
+    #[tokio::test]
+    async fn invalid_token_format_returns_401() {
+        // Arrange
+        let state = make_state(Some("redis://127.0.0.1/"));
+        let app = Router::new()
+            .route("/", get(ok_handler))
+            .layer(from_fn_with_state(state.clone(), jwt_auth_middleware));
+
+        // Act - Send request with completely invalid token
+        let req = Request::builder()
+            .uri("/")
+            .header("authorization", "Bearer not-a-jwt-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+
+        // Assert
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        
+        // Verify proper error structure
+        let body = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("\"status\":\"unauthorized\""), "Should return structured JSON error");
+        assert!(body_str.contains("Invalid token"), "Should mention token invalidity");
     }
 }

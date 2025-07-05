@@ -13,13 +13,13 @@ use std::sync::Arc;
 use axum::{
     extract::{Json, State},
     response::IntoResponse,
-    Json as AxumJson,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tracing::instrument;
 
 use crate::app::AppState;
 use crate::handlers::refresh_logic::process_token_refresh;
+use crate::utils::error_new::AuthServiceError; // ← Add unified error system
 
 /// Request payload for token refresh operations.
 ///
@@ -28,35 +28,6 @@ use crate::handlers::refresh_logic::process_token_refresh;
 pub struct TokenRequest {
     /// The refresh token to validate and exchange for new tokens.
     pub token: String,
-}
-
-/// Response structure for token refresh operations.
-///
-/// Provides a consistent response format for both success and error cases.
-#[derive(Debug, Serialize)]
-pub struct TokenResponse {
-    /// Operation status ("success" or "error").
-    pub status: String,
-    
-    /// Human-readable message about the operation result.
-    pub message: String,
-    
-    /// Optional data field containing new tokens (present only on success).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub data: Option<TokenData>,
-}
-
-/// Data structure for successful token refresh operations.
-#[derive(Debug, Serialize)]
-pub struct TokenData {
-    /// The new JWT access token.
-    pub access_token: String,
-    
-    /// The new JWT refresh token.
-    pub refresh_token: String,
-    
-    /// Token type (always "Bearer" for JWT).
-    pub token_type: String,
 }
 
 /// Handles token refresh requests.
@@ -92,6 +63,14 @@ pub struct TokenData {
 ///   }
 /// }
 /// ```
+///
+/// ## Example error response
+/// ```json
+/// {
+///   "status": "unauthorized",
+///   "message": "Token has expired"
+/// }
+/// ```
 #[instrument(
     name = "refresh_token",
     level = "info",
@@ -105,18 +84,16 @@ pub struct TokenData {
 pub async fn refresh_token_handler(
     State(app_state): State<Arc<AppState>>,
     Json(refresh_request): Json<TokenRequest>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, AuthServiceError> { // ← Changed return type
     // Add useful trace information without revealing the token
     tracing::Span::current().record(
         "token_length",
         &tracing::field::display(refresh_request.token.len()),
     );
 
-    // Process the token refresh request
-    let (status, body) = process_token_refresh(&app_state, &refresh_request.token).await;
-    
-    // Return the response with appropriate status code
-    (status, AxumJson(body))
+    // Process the token refresh request using unified error system
+    // The ? operator will automatically convert AuthServiceError to HTTP response
+    process_token_refresh(&app_state, &refresh_request.token).await
 }
 
 #[cfg(test)]
@@ -170,8 +147,10 @@ mod tests {
         let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         
-        assert_eq!(body["status"], "error");
-        assert!(body.get("data").is_none(), "Error response should not contain data field");
+        // With unified error system, status field will be "unauthorized"
+        assert_eq!(body["status"], "unauthorized");
+        assert!(body["message"].as_str().unwrap().contains("Invalid") || 
+                body["message"].as_str().unwrap().contains("token"));
     }
 
     #[tokio::test]
@@ -197,6 +176,12 @@ mod tests {
 
         // Assert
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        
+        // With unified error system, status field will be "unauthorized"
+        assert_eq!(body["status"], "unauthorized");
     }
 
     #[tokio::test]
@@ -232,7 +217,7 @@ mod tests {
         let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         
-        // Verify success response structure
+        // Verify success response structure - from process_token_refresh JSON format
         assert_eq!(body["status"], "success");
         assert!(body["data"].is_object(), "Success response should contain data object");
         assert!(body["data"]["access_token"].is_string(), "Response should contain access_token string");
@@ -261,10 +246,86 @@ mod tests {
             .await
             .unwrap();
 
-        // Assert - accept either 400 or 422 as both are used for validation errors
+        // Assert - This will be handled by Axum's JSON extractor
+        // which should return 400 or 422 for malformed JSON
         assert!(
-            response.status() == StatusCode::BAD_REQUEST || response.status() == StatusCode::UNPROCESSABLE_ENTITY,
+            response.status() == StatusCode::BAD_REQUEST || 
+            response.status() == StatusCode::UNPROCESSABLE_ENTITY,
             "Response status should be 400 Bad Request or 422 Unprocessable Entity"
         );
+    }
+
+    #[tokio::test]
+    async fn wrong_token_type_returns_validation_error() {
+        // Arrange - Set JWT secret first
+        std::env::set_var("JWT_SECRET", "test-secret-for-wrong-token-type");
+        let app = app();
+        
+        // Generate an access token instead of a refresh token
+        let access_token = generate_token("test_user", "access", None).unwrap();
+        
+        let request_body = json!({
+            "token": access_token
+        });
+
+        // Act
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/refresh")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        
+        // With unified error system, wrong token type should be validation error
+        assert_eq!(body["status"], "validation_error");
+        assert!(body["message"].as_str().unwrap().contains("refresh"));
+    }
+
+    #[tokio::test]
+    async fn missing_redis_returns_configuration_error() {
+        // Arrange - Create state without Redis
+        let mut state = state_with_redis();
+        state.redis_client = None; // Remove Redis client
+        
+        let app = Router::new()
+            .route("/auth/refresh", post(refresh_token_handler))
+            .with_state(Arc::new(state));
+
+        let request_body = json!({
+            "token": "any-token"
+        });
+
+        // Act
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/refresh")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        
+        assert_eq!(body["status"], "configuration_error");
+        assert!(body["message"].as_str().unwrap().contains("Redis"));
     }
 }

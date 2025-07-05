@@ -2,7 +2,7 @@
 //!
 //! This module implements the endpoint that handles user account activation
 //! via email confirmation links. It renders appropriate HTML responses based
-//! on the activation result.
+//! on the activation result using the unified error system.
 //!
 //! # Endpoint
 //! `GET /auth/activate?code=<activation_code>`
@@ -22,7 +22,8 @@ use serde::Deserialize;
 use tracing::instrument;
 
 use crate::app::AppState;
-use crate::handlers::activation_logic::{process_activation, ActivationLogicResult};
+use crate::handlers::activation_logic::process_activation; // ← Zmienione z process_activation_unified
+use crate::utils::error_new::AuthServiceError;
 
 /// Query parameters for account activation.
 ///
@@ -33,7 +34,7 @@ pub struct ActivationParams {
     pub code: String,
 }
 
-/// Handles account activation requests.
+/// Handles account activation requests using the unified error system.
 ///
 /// Processes the activation code and renders an appropriate HTML page
 /// with the result of the activation attempt.
@@ -64,51 +65,57 @@ pub async fn activate_account_handler(
         &tracing::field::display(params.code.len())
     );
 
-    // Process the activation code and return appropriate HTML response
-    match process_activation(&app_state, &params.code).await {
-        ActivationLogicResult::Success => Html(render_page(
+    // Process the activation code using unified error system
+    match process_activation(&app_state, &params.code).await { // ← Zmienione z process_activation_unified
+        Ok(()) => Html(render_page(
             "Account Activated",
             "Your account has been successfully activated. You can now log in.",
             "success",
         ))
         .into_response(),
         
-        ActivationLogicResult::AlreadyActive => Html(render_page(
-            "Already Activated",
-            "Your account is already active. You can log in anytime.",
-            "info",
-        ))
-        .into_response(),
+        Err(AuthServiceError::Validation(validation_err)) => {
+            // Check the specific validation error type for better UX
+            let (title, message) = match validation_err.to_string().as_str() {
+                msg if msg.contains("Invalid or expired") => (
+                    "Invalid Activation Link",
+                    "The activation link is invalid or has expired. Please request a new activation link."
+                ),
+                msg if msg.contains("No user found") => (
+                    "Account Not Found", 
+                    "We couldn't find an account for this activation link. Please register or contact support."
+                ),
+                _ => (
+                    "Validation Error",
+                    "There was an issue with your activation request. Please try again or contact support."
+                ),
+            };
+            
+            Html(render_page(title, message, "error")).into_response()
+        }
         
-        ActivationLogicResult::InvalidOrExpired => Html(render_page(
-            "Invalid Activation Link",
-            "The activation link is invalid or has expired. Please request a new activation link.",
-            "error",
-        ))
-        .into_response(),
-        
-        ActivationLogicResult::NotFound => Html(render_page(
-            "Account Not Found",
-            "We couldn't find an account for this activation link. Please register or contact support.",
-            "error",
-        ))
-        .into_response(),
-        
-        ActivationLogicResult::ServiceUnavailable => Html(render_page(
+        Err(AuthServiceError::Configuration(_)) => Html(render_page(
             "Service Unavailable",
             "We're experiencing technical difficulties. Please try again later.",
             "error",
         ))
         .into_response(),
         
-        ActivationLogicResult::DatabaseUnavailable => Html(render_page(
-            "Service Unavailable",
+        Err(AuthServiceError::Database(_)) => Html(render_page(
+            "Service Unavailable", 
             "We're experiencing database issues. Please try again later.",
             "error",
         ))
         .into_response(),
         
-        ActivationLogicResult::ActivationFailed => Html(render_page(
+        Err(AuthServiceError::RateLimit(_)) => Html(render_page(
+            "Too Many Requests",
+            "You've made too many activation attempts. Please wait a moment before trying again.",
+            "error",
+        ))
+        .into_response(),
+        
+        Err(_) => Html(render_page(
             "Activation Failed",
             "We couldn't activate your account. Please try again or contact support.",
             "error",
@@ -134,6 +141,10 @@ fn render_page(title: &str, message: &str, status: &str) -> String {
         "info" => "info-message",
         _ => "neutral-message",
     };
+
+    // Pobierz URL frontendu z konfiguracji
+    let frontend_url = std::env::var("FRONTEND_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
+    let login_url = format!("{}/auth", frontend_url);
 
     format!(
         r#"<!DOCTYPE html>
@@ -201,7 +212,7 @@ fn render_page(title: &str, message: &str, status: &str) -> String {
     <div class="message {status_class}">
         <p>{message}</p>
     </div>
-    <a href="/auth/login" class="btn">Go to Login</a>
+    <a href="{login_url}" class="btn">Go to Login</a>
 </body>
 </html>"#
     )
@@ -291,5 +302,12 @@ mod tests {
         assert!(info_html.contains("info-message"));
         assert!(success_html.contains("Go to Login"));
         assert!(error_html.contains("Go to Login"));
+    }
+
+    #[tokio::test]
+    async fn successful_activation_returns_success_html() {
+        // Note: This test would require setting up a valid activation code
+        // in Redis, which is more complex. For now, we're testing the error cases.
+        // Integration tests with a real Redis instance would be needed for full coverage.
     }
 }

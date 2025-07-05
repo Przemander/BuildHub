@@ -16,7 +16,7 @@
 
 use crate::app::AppState;
 use crate::config::database::{init_pool, run_migrations, DbPool};
-use crate::utils::errors::ValidationError;
+use crate::utils::error_new::{AuthServiceError, ValidationError}; // ← Updated import
 use once_cell::sync::Lazy;
 use redis::Client as RedisClient;
 use std::{
@@ -220,7 +220,7 @@ pub fn state_no_redis() -> AppState {
 /// ```
 pub fn assert_valid<F>(value: &str, validator: F)
 where
-    F: Fn(&str) -> Result<(), ValidationError>,
+    F: Fn(&str) -> Result<(), AuthServiceError>, // ← Updated to use AuthServiceError
 {
     match validator(value) {
         Ok(_) => {}, // Test passes
@@ -263,21 +263,52 @@ where
 /// ```
 pub fn assert_invalid<F>(expected_field: &str, value: &str, error_contains: &str, validator: F)
 where
-    F: Fn(&str) -> Result<(), ValidationError>,
+    F: Fn(&str) -> Result<(), AuthServiceError>, // ← Updated to use AuthServiceError
 {
     match validator(value) {
         Ok(_) => panic!("Expected '{}' to be invalid, but validation passed", value),
-        Err(ValidationError::InvalidValue(field, msg)) => {
-            assert_eq!(
-                field, expected_field,
-                "Expected field '{}' but got '{}'",
-                expected_field, field
-            );
-            assert!(
-                msg.contains(error_contains),
-                "Error message '{}' doesn't contain '{}'",
-                msg, error_contains
-            );
+        Err(AuthServiceError::Validation(validation_err)) => {
+            // Handle the new ValidationError structure
+            match validation_err {
+                ValidationError::InvalidValue { field, message, .. } => {
+                    assert_eq!(
+                        field, expected_field,
+                        "Expected field '{}' but got '{}'",
+                        expected_field, field
+                    );
+                    assert!(
+                        message.contains(error_contains),
+                        "Error message '{}' doesn't contain '{}'",
+                        message, error_contains
+                    );
+                }
+                ValidationError::MissingField { field, .. } => {
+                    assert_eq!(
+                        field, expected_field,
+                        "Expected field '{}' but got '{}'",
+                        expected_field, field
+                    );
+                    // For missing field errors, just check the field name
+                }
+                ValidationError::TooLong { field, .. } => {
+                    assert_eq!(
+                        field, expected_field,
+                        "Expected field '{}' but got '{}'",
+                        expected_field, field
+                    );
+                    // You can add more specific checks for TooLong if needed
+                }
+                ValidationError::PasswordHash { message, .. } => {
+                    assert!(
+                        message.contains(error_contains),
+                        "Error message '{}' doesn't contain '{}'",
+                        message, error_contains
+                    );
+                }
+            }
+        }
+        Err(other_err) => {
+            panic!("Expected ValidationError, but got: {:?}", other_err);
         }
     }
 }
@@ -311,7 +342,9 @@ pub fn reset_test_env() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::error_new::{AuthServiceError, ValidationError};
     use std::env::var;
+    use tracing_error::SpanTrace;
 
     #[test]
     fn make_pool_creates_working_database() {
@@ -373,7 +406,7 @@ mod tests {
     #[test]
     fn assert_valid_passes_for_valid_input() {
         // Define a simple validation function
-        fn always_valid(_: &str) -> Result<(), ValidationError> {
+        fn always_valid(_: &str) -> Result<(), AuthServiceError> {
             Ok(())
         }
         
@@ -385,8 +418,12 @@ mod tests {
     #[should_panic(expected = "Expected 'test' to be valid")]
     fn assert_valid_panics_for_invalid_input() {
         // Define a validation function that always fails
-        fn always_invalid(_: &str) -> Result<(), ValidationError> {
-            Err(ValidationError::InvalidValue("field".into(), "error".into()))
+        fn always_invalid(_: &str) -> Result<(), AuthServiceError> {
+            Err(AuthServiceError::Validation(ValidationError::InvalidValue {
+                field: "field".to_string(),
+                message: "error".to_string(),
+                span: SpanTrace::capture(),
+            }))
         }
         
         // This should panic
@@ -396,11 +433,12 @@ mod tests {
     #[test]
     fn assert_invalid_passes_for_invalid_input() {
         // Define a validation function that fails with the expected error
-        fn fails_with_expected_error(_: &str) -> Result<(), ValidationError> {
-            Err(ValidationError::InvalidValue(
-                "test_field".into(),
-                "contains expected text".into(),
-            ))
+        fn fails_with_expected_error(_: &str) -> Result<(), AuthServiceError> {
+            Err(AuthServiceError::Validation(ValidationError::InvalidValue {
+                field: "test_field".to_string(),
+                message: "contains expected text".to_string(),
+                span: SpanTrace::capture(),
+            }))
         }
         
         // This should not panic
@@ -411,7 +449,7 @@ mod tests {
     #[should_panic(expected = "Expected 'test' to be invalid")]
     fn assert_invalid_panics_for_valid_input() {
         // Define a validation function that always succeeds
-        fn always_valid(_: &str) -> Result<(), ValidationError> {
+        fn always_valid(_: &str) -> Result<(), AuthServiceError> {
             Ok(())
         }
         
@@ -423,11 +461,12 @@ mod tests {
     #[should_panic(expected = "Expected field 'expected' but got 'actual'")]
     fn assert_invalid_checks_field_name() {
         // Define a validation function with wrong field name
-        fn wrong_field(_: &str) -> Result<(), ValidationError> {
-            Err(ValidationError::InvalidValue(
-                "actual".into(),
-                "error message".into(),
-            ))
+        fn wrong_field(_: &str) -> Result<(), AuthServiceError> {
+            Err(AuthServiceError::Validation(ValidationError::InvalidValue {
+                field: "actual".to_string(),
+                message: "error message".to_string(),
+                span: SpanTrace::capture(),
+            }))
         }
         
         // This should panic due to field name mismatch
@@ -438,11 +477,12 @@ mod tests {
     #[should_panic(expected = "Error message 'actual message' doesn't contain 'expected text'")]
     fn assert_invalid_checks_error_message() {
         // Define a validation function with message not containing expected text
-        fn wrong_message(_: &str) -> Result<(), ValidationError> {
-            Err(ValidationError::InvalidValue(
-                "field".into(),
-                "actual message".into(),
-            ))
+        fn wrong_message(_: &str) -> Result<(), AuthServiceError> {
+            Err(AuthServiceError::Validation(ValidationError::InvalidValue {
+                field: "field".to_string(),
+                message: "actual message".to_string(),
+                span: SpanTrace::capture(),
+            }))
         }
         
         // This should panic due to message content mismatch
