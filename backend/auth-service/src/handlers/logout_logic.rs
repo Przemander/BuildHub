@@ -15,9 +15,16 @@ use crate::{
     utils::{
         error_new::AuthServiceError, // ← Add unified error system
         jwt::{revoke_token, validate_token},
-        metrics::AUTH_LOGOUTS,
     },
     log_info, log_warn,
+    // Import logout metrics
+    metricss::logout_metrics::{
+        time_complete_logout_flow, record_logout_success, record_logout_failure,
+        record_redis_check_success, record_redis_check_failure,
+        record_token_validation_success, record_token_validation_failure,
+        record_token_revocation_success, record_token_revocation_failure,
+        error_types,
+    },
 };
 use axum::{http::StatusCode, response::IntoResponse, Json}; // ← Add IntoResponse
 use serde_json::json;
@@ -43,31 +50,56 @@ pub async fn process_logout(
     app_state: &AppState,
     token: &str,
 ) -> Result<impl IntoResponse, AuthServiceError> { // ← Changed return type
-    // Ensure Redis is available - automatic conversion via ? operator
-    let redis_client = app_state
-        .redis_client
-        .as_ref()
-        .ok_or_else(|| AuthServiceError::configuration("Redis client not available for logout operation"))?;
+    // Start complete logout flow timer
+    let _logout_timer = time_complete_logout_flow();
 
-    // Try to validate token (for logging), but proceed regardless of result
-    // This helps with audit trails and identifying potential abuse
+    log_info!(
+        "Auth", 
+        "Starting logout process", 
+        "logout_start"
+    );
+
+    // Step 1: Check Redis availability with metrics
+    let redis_client = match &app_state.redis_client {
+        Some(client) => {
+            record_redis_check_success();
+            client
+        }
+        None => {
+            record_redis_check_failure(error_types::REDIS_UNAVAILABLE);
+            record_logout_failure();
+            return Err(AuthServiceError::configuration("Redis client not available for logout operation"));
+        }
+    };
+
+    // Step 2: Try to validate token (for logging) with metrics
     match validate_token(token, redis_client).await {
         Ok(claims) => {
+            record_token_validation_success();
             log_info!("Auth", &format!("Logout: token valid for user {}", claims.sub), "success");
         }
         Err(e) => {
             // Token validation failure doesn't prevent logout attempt
-            // We still try to revoke in case it's just expired but otherwise valid
+            record_token_validation_failure(error_types::INVALID_TOKEN);
             log_warn!("Auth", &format!("Logout: invalid token ({})", e), "invalid_token");
         }
     }
 
-    // Revoke the token by adding to blocklist - automatic conversion via ? operator
-    revoke_token(token, redis_client).await?;
+    // Step 3: Revoke the token by adding to blocklist with metrics
+    match revoke_token(token, redis_client).await {
+        Ok(_) => {
+            record_token_revocation_success();
+            log_info!("Auth", "Token revoked successfully", "token_revoked");
+        }
+        Err(e) => {
+            record_token_revocation_failure(error_types::REVOCATION_FAILED);
+            record_logout_failure();
+            return Err(e);
+        }
+    }
 
-    // Log success and record metrics
-    log_info!("Auth", "Token revoked successfully", "success");
-    AUTH_LOGOUTS.with_label_values(&["success"]).inc();
+    // Record overall success
+    record_logout_success();
 
     // Return success response using Axum's Json wrapper
     Ok((
@@ -84,12 +116,29 @@ mod tests {
     use super::*;
     use crate::utils::jwt::{generate_token, TOKEN_TYPE_ACCESS};
     use crate::utils::test_utils::{init_jwt_secret, state_no_redis, state_with_redis};
+    use crate::metricss::logout_metrics::{
+        init_logout_metrics, LOGOUT_OPERATIONS, LOGOUT_FAILURES, LOGOUT_DURATION,
+        steps, results, error_types
+    };
+
+    /// Initialize logout metrics for testing
+    fn setup_metrics() {
+        init_logout_metrics();
+    }
 
     #[tokio::test]
     async fn missing_redis_returns_configuration_error() {
+        setup_metrics();
         // Arrange
         let state = state_no_redis();
         
+        let initial_redis_failure = LOGOUT_FAILURES
+            .with_label_values(&[steps::REDIS_CHECK, error_types::REDIS_UNAVAILABLE])
+            .get();
+        let initial_logout_failure = LOGOUT_OPERATIONS
+            .with_label_values(&[steps::COMPLETE_FLOW, results::FAILURE])
+            .get();
+
         // Act
         let result = process_logout(&state, "any-token").await;
         
@@ -103,40 +152,69 @@ mod tests {
             }
             other => panic!("Expected configuration error, got: {:?}", other),
         }
+
+        let final_redis_failure = LOGOUT_FAILURES
+            .with_label_values(&[steps::REDIS_CHECK, error_types::REDIS_UNAVAILABLE])
+            .get();
+        let final_logout_failure = LOGOUT_OPERATIONS
+            .with_label_values(&[steps::COMPLETE_FLOW, results::FAILURE])
+            .get();
+
+        assert_eq!(final_redis_failure, initial_redis_failure + 1.0);
+        assert_eq!(final_logout_failure, initial_logout_failure + 1.0);
     }
 
     #[tokio::test]
     #[ignore] // requires Redis + JWT_SECRET
     async fn successful_logout_returns_success() {
+        setup_metrics();
         // Arrange
         init_jwt_secret();
         let state = state_with_redis();
         let token = generate_token("user1", TOKEN_TYPE_ACCESS, None).unwrap();
         
+        let initial_logout_success = LOGOUT_OPERATIONS
+            .with_label_values(&[steps::COMPLETE_FLOW, results::SUCCESS])
+            .get();
+        let initial_duration = LOGOUT_DURATION
+            .with_label_values(&[steps::COMPLETE_FLOW])
+            .get_sample_count();
+
         // Act
         let result = process_logout(&state, &token).await;
         
         // Assert
         assert!(result.is_ok());
-        // Since we can't easily extract the JSON from impl IntoResponse in tests,
-        // we just verify the result is Ok. In integration tests, we'd verify
-        // the actual HTTP response structure.
+
+        let final_logout_success = LOGOUT_OPERATIONS
+            .with_label_values(&[steps::COMPLETE_FLOW, results::SUCCESS])
+            .get();
+        let final_duration = LOGOUT_DURATION
+            .with_label_values(&[steps::COMPLETE_FLOW])
+            .get_sample_count();
+
+        assert_eq!(final_logout_success, initial_logout_success + 1.0);
+        assert_eq!(final_duration, initial_duration + 1);
     }
 
     #[tokio::test]
     #[ignore] // requires Redis + JWT_SECRET
     async fn invalid_token_proceeds_with_revocation() {
+        setup_metrics();
         // Arrange
         init_jwt_secret();
         let state = state_with_redis();
         let bad_token = "bad.token.signature";
         
+        let initial_validation_failure = LOGOUT_FAILURES
+            .with_label_values(&[steps::TOKEN_VALIDATION, error_types::INVALID_TOKEN])
+            .get();
+
         // Act
         let result = process_logout(&state, bad_token).await;
         
         // Assert - Invalid tokens should still attempt revocation
         // The result depends on whether the revocation succeeds or fails
-        // This test verifies that we don't fail early on token validation
         match result {
             Ok(_) => {
                 // Token revocation succeeded (token was added to blocklist)
@@ -151,16 +229,27 @@ mod tests {
                 panic!("Unexpected error type: {:?}", other);
             }
         }
+
+        let final_validation_failure = LOGOUT_FAILURES
+            .with_label_values(&[steps::TOKEN_VALIDATION, error_types::INVALID_TOKEN])
+            .get();
+        
+        assert_eq!(final_validation_failure, initial_validation_failure + 1.0);
     }
     
     #[tokio::test]
     #[ignore] // requires Redis + JWT_SECRET
     async fn double_logout_handles_gracefully() {
+        setup_metrics();
         // Arrange
         init_jwt_secret();
         let state = state_with_redis();
         let token = generate_token("user1", TOKEN_TYPE_ACCESS, None).unwrap();
         
+        let initial_logout_success = LOGOUT_OPERATIONS
+            .with_label_values(&[steps::COMPLETE_FLOW, results::SUCCESS])
+            .get();
+
         // First logout
         let result1 = process_logout(&state, &token).await;
         assert!(result1.is_ok(), "First logout should succeed");
@@ -184,15 +273,27 @@ mod tests {
                 panic!("Unexpected error type for double logout: {:?}", other);
             }
         }
+
+        let final_logout_success = LOGOUT_OPERATIONS
+            .with_label_values(&[steps::COMPLETE_FLOW, results::SUCCESS])
+            .get();
+
+        // At least the first logout succeeded
+        assert!(final_logout_success >= initial_logout_success + 1.0);
     }
 
     #[tokio::test]
     #[ignore] // requires Redis + JWT_SECRET
     async fn empty_token_returns_jwt_error() {
+        setup_metrics();
         // Arrange
         init_jwt_secret();
         let state = state_with_redis();
         
+        let initial_validation_failure = LOGOUT_FAILURES
+            .with_label_values(&[steps::TOKEN_VALIDATION, error_types::INVALID_TOKEN])
+            .get();
+
         // Act
         let result = process_logout(&state, "").await;
         
@@ -206,16 +307,27 @@ mod tests {
             }
             other => panic!("Expected JWT error for empty token, got: {:?}", other),
         }
+
+        let final_validation_failure = LOGOUT_FAILURES
+            .with_label_values(&[steps::TOKEN_VALIDATION, error_types::INVALID_TOKEN])
+            .get();
+
+        assert_eq!(final_validation_failure, initial_validation_failure + 1.0);
     }
 
     #[tokio::test]
     #[ignore] // requires Redis + JWT_SECRET
     async fn malformed_token_returns_jwt_error() {
+        setup_metrics();
         // Arrange
         init_jwt_secret();
         let state = state_with_redis();
         let malformed_token = "not.a.valid.jwt.format.at.all";
         
+        let initial_validation_failure = LOGOUT_FAILURES
+            .with_label_values(&[steps::TOKEN_VALIDATION, error_types::INVALID_TOKEN])
+            .get();
+
         // Act
         let result = process_logout(&state, malformed_token).await;
         
@@ -229,5 +341,11 @@ mod tests {
             }
             other => panic!("Expected JWT error for malformed token, got: {:?}", other),
         }
+
+        let final_validation_failure = LOGOUT_FAILURES
+            .with_label_values(&[steps::TOKEN_VALIDATION, error_types::INVALID_TOKEN])
+            .get();
+
+        assert_eq!(final_validation_failure, initial_validation_failure + 1.0);
     }
 }

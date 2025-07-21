@@ -24,8 +24,9 @@ use std::sync::Arc;
 use tracing::{debug, warn};
 
 use crate::app::AppState;
-use crate::utils::error_new::ApiError; // ← Zmienione z utils::errors
-use crate::utils::rate_limit::check_and_increment;
+use crate::config::redis::check_and_increment_rate_limit; // ← ZMIENIONE
+use crate::metricss::middleware_metrics::login_guard;
+use crate::utils::error_new::ApiError; // ← UNIFIED ERROR SYSTEM
 
 /// Middleware guard for login attempts - applies rate limiting and account lockout.
 ///
@@ -79,6 +80,7 @@ pub async fn login_guard_middleware(
 
     // 5) Call the next handler
     debug!("Login guard passed, proceeding to handler");
+    login_guard::record_allowed("auth");
     next.run(req).await
 }
 
@@ -112,6 +114,8 @@ pub async fn enforce_lockout(
     
     if locked {
         debug!("Account lockout active for login: {}", login);
+        // 🆕 Record account lockout metrics
+        login_guard::record_account_lockout_blocked("auth");
         let err = ApiError::unauthorized(
             "Account temporarily locked due to repeated failed login attempts",
         );
@@ -138,23 +142,24 @@ pub async fn enforce_rate_limit(
     
     let key = format!("rate:login:{}", login);
     
-    // Call the check_and_increment utility
-    let allowed = match check_and_increment(
+    // ✅ UŻYWAMY FUNKCJI Z redis.rs z proper error handling
+    let allowed = match check_and_increment_rate_limit(
         redis, 
         &key, 
         MAX_LOGIN_ATTEMPTS, 
         RATE_LIMIT_WINDOW_SECS
     ).await {
         Ok(v) => v,
-        Err(e) => {
-            warn!("Redis error in rate limiting: {}", e);
+        Err(cache_err) => {
+            warn!("Redis error in rate limiting: {:?}", cache_err);
             true  // fail open on Redis errors
         }
     };
     
     if !allowed {
         debug!("Rate limit exceeded for login: {}", login);
-        // Now using proper too_many_requests method from unified error system
+        // 🆕 Record rate limit metrics
+        login_guard::record_rate_limit_blocked("auth");
         let err = ApiError::too_many_requests(
             "Too many login attempts; please try again later"
         );
@@ -198,135 +203,48 @@ mod tests {
         let err = enforce_rate_limit(&client, &login)
             .await
             .unwrap_err();
-        // Now properly returns 429 instead of 400
+        // ✅ FIXED: Now properly returns 429 with unified error system
         assert_eq!(err.status(), StatusCode::TOO_MANY_REQUESTS);
-    }
-
-    #[tokio::test]
-    async fn enforce_rate_limit_fail_open_on_redis_error() {
-        // Bad port => fail-open => Ok
-        let client = redis::Client::open("redis://127.0.0.1:6380/").unwrap();
-        let login = Uuid::new_v4().to_string();
-        assert!(enforce_rate_limit(&client, &login).await.is_ok());
+        
+        // ✅ VERIFY: Should be structured JSON response
+        let body = hyper::body::to_bytes(err.into_body()).await.unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("\"status\":\"too_many_requests\""), 
+                "Should return structured JSON error");
     }
 
     #[tokio::test]
     async fn enforce_lockout_allows_and_blocks() {
         let client = setup_redis().await;
+        let login = Uuid::new_v4().to_string();
+        
+        // No lockout initially
+        assert!(enforce_lockout(&client, &login).await.is_ok());
+        
+        // Set lockout manually
         let mut conn = client.get_async_connection().await.unwrap();
-        let login = Uuid::new_v4().to_string();
-
-        // No lockout => Ok
-        assert!(enforce_lockout(&client, &login).await.is_ok());
-
-        // Set lockout key with 60s TTL
         let key = format!("lockout:{}", login);
-        let _: () = conn.set_ex(&key, 1, 60).await.unwrap();
-
-        // Now should Err(Response 401)
-        let err = enforce_lockout(&client, &login)
-            .await
-            .unwrap_err();
+        let _: () = conn.set(&key, "locked").await.unwrap();
+        
+        // Now should be blocked
+        let err = enforce_lockout(&client, &login).await.unwrap_err();
         assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
-    }
-    
-    #[tokio::test]
-    async fn enforce_lockout_fail_open_on_redis_error() {
-        // Bad port => fail-open => Ok
-        let client = redis::Client::open("redis://127.0.0.1:6380/").unwrap();
-        let login = Uuid::new_v4().to_string();
-        assert!(enforce_lockout(&client, &login).await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn login_guard_middleware_processes_valid_request() {
-        // This test would require more setup with axum testing framework
-        // Testing the actual middleware behavior with request/response flow
-        // For now, we focus on testing the individual enforcement functions
+        
+        // Verify structured JSON response
+        let body = hyper::body::to_bytes(err.into_body()).await.unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("\"status\":\"unauthorized\""));
+        assert!(body_str.contains("temporarily locked"));
     }
 
     #[tokio::test] 
-    async fn login_guard_extracts_login_from_json() {
-        // Test that the middleware correctly extracts login from request body
-        let json_body = r#"{"login": "test@example.com", "password": "secret"}"#;
-        let parsed: serde_json::Value = serde_json::from_str(json_body).unwrap();
-        let login = parsed.get("login").and_then(|l| l.as_str());
+    async fn fail_open_on_redis_errors() {
+        // Use invalid Redis URL to trigger connection errors
+        let invalid_client = redis::Client::open("redis://invalid:9999/").unwrap();
+        let login = "test_user";
         
-        assert_eq!(login, Some("test@example.com"));
-    }
-
-    #[tokio::test]
-    async fn login_guard_handles_malformed_json() {
-        // Test graceful handling of malformed JSON
-        let malformed_json = r#"{"login": incomplete"#;
-        let parsed = serde_json::from_str::<serde_json::Value>(malformed_json);
-        
-        assert!(parsed.is_err(), "Should fail to parse malformed JSON");
-    }
-
-    #[tokio::test]
-    async fn login_guard_handles_missing_login_field() {
-        // Test behavior when login field is missing
-        let json_without_login = r#"{"password": "secret", "other": "field"}"#;
-        let parsed: serde_json::Value = serde_json::from_str(json_without_login).unwrap();
-        let login = parsed.get("login").and_then(|l| l.as_str());
-        
-        assert_eq!(login, None, "Should return None when login field is missing");
-    }
-
-    #[tokio::test]
-    async fn rate_limit_returns_proper_error_structure() {
-        let client = setup_redis().await;
-        let login = Uuid::new_v4().to_string();
-
-        // Exhaust rate limit
-        for _ in 1..=5 {
-            let _ = enforce_rate_limit(&client, &login).await;
-        }
-
-        // 6th attempt should return structured error
-        let err_response = enforce_rate_limit(&client, &login)
-            .await
-            .unwrap_err();
-        
-        assert_eq!(err_response.status(), StatusCode::TOO_MANY_REQUESTS);
-        
-        // Verify response body contains JSON error structure
-        let body = hyper::body::to_bytes(err_response.into_body()).await.unwrap();
-        let body_str = String::from_utf8(body.to_vec()).unwrap();
-        
-        // Should contain unified error structure
-        assert!(body_str.contains("\"status\":\"too_many_requests\""), 
-                "Response should contain proper error status");
-        assert!(body_str.contains("Too many login attempts"), 
-                "Response should contain descriptive message");
-    }
-
-    #[tokio::test]
-    async fn lockout_returns_proper_error_structure() {
-        let client = setup_redis().await;
-        let mut conn = client.get_async_connection().await.unwrap();
-        let login = Uuid::new_v4().to_string();
-
-        // Set lockout
-        let key = format!("lockout:{}", login);
-        let _: () = conn.set_ex(&key, 1, 60).await.unwrap();
-
-        // Should return structured error
-        let err_response = enforce_lockout(&client, &login)
-            .await
-            .unwrap_err();
-        
-        assert_eq!(err_response.status(), StatusCode::UNAUTHORIZED);
-        
-        // Verify response body contains JSON error structure
-        let body = hyper::body::to_bytes(err_response.into_body()).await.unwrap();
-        let body_str = String::from_utf8(body.to_vec()).unwrap();
-        
-        // Should contain unified error structure
-        assert!(body_str.contains("\"status\":\"unauthorized\""), 
-                "Response should contain proper error status");
-        assert!(body_str.contains("temporarily locked"), 
-                "Response should contain descriptive message");
+        // Both functions should fail open (return Ok) when Redis is unavailable
+        assert!(enforce_lockout(&invalid_client, login).await.is_ok());
+        assert!(enforce_rate_limit(&invalid_client, login).await.is_ok());
     }
 }

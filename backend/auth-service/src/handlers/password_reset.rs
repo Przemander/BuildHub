@@ -121,53 +121,7 @@ pub async fn password_reset_request_handler(
     process_password_reset_request(&app_state, &req.email).await
 }
 
-/// Handles password reset confirmations.
-///
-/// # Endpoint: POST /auth/password-reset/confirm
-///
-/// Validates the reset token and updates the user's password if valid.
-///
-/// ## Request Body
-/// ```json
-/// {
-///   "token": "reset-token-from-email",
-///   "new_password": "NewSecureP@ssw0rd"
-/// }
-/// ```
-///
-/// ## Responses
-///
-/// * `200 OK` - Password successfully reset
-/// * `400 Bad Request` - Invalid password format or requirements not met
-/// * `401 Unauthorized` - Invalid or expired token
-/// * `500 Internal Server Error` - Server-side error
-///
-/// ## Security Note
-///
-/// The token is single-use and will be invalidated after a successful reset.
-/// The new password must meet the system's password strength requirements.
-///
-/// ## Example success response
-/// ```json
-/// {
-///   "status": "success",
-///   "message": "Password has been reset successfully."
-/// }
-/// ```
-///
-/// ## Example error responses
-/// ```json
-/// {
-///   "status": "validation_error",
-///   "message": "token: Invalid or expired reset token"
-/// }
-/// ```
-/// ```json
-/// {
-///   "status": "validation_error", 
-///   "message": "password: Password must be at least 8 characters long"
-/// }
-/// ```
+
 #[instrument(
     name = "password_reset_confirm",
     level = "info",

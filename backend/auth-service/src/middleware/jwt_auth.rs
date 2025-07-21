@@ -10,38 +10,23 @@ use crate::utils::jwt;
 use crate::{log_error, log_info, log_warn};
 use axum::{extract::State, http::Request, middleware::Next, response::IntoResponse};
 use std::sync::Arc;
+use crate::metricss::middleware_metrics::jwt_auth;
+use std::time::Instant;
 
-/// JWT authentication middleware for protected routes.
-///
-/// # Authentication Flow
-/// 1. Extracts the `Authorization: Bearer <token>` header from the request
-/// 2. Validates the JWT token's integrity and expiration
-/// 3. Checks if the token has been revoked (using Redis blocklist)
-/// 4. On success, passes the request to the next handler
-/// 5. On failure, returns 401 Unauthorized with details and logs the event
-///
-/// # Security Features
-/// - Proper JWT validation including signature verification
-/// - Revocation checking for immediate token invalidation
-/// - Comprehensive logging for security audit trails
-/// - Graceful error handling with descriptive responses
-///
-/// # Example Usage
-/// ```rust
-/// let app = Router::new()
-///     .route("/protected", get(protected_handler))
-///     .layer(from_fn_with_state(app_state, jwt_auth_middleware));
-/// ```
 pub async fn jwt_auth_middleware<B>(
     State(app_state): State<Arc<AppState>>,
     req: Request<B>,
     next: Next<B>,
 ) -> impl IntoResponse {
+    let start_time = Instant::now();
+    
     // Extract the Authorization header and validate Bearer token format
     let token = match extract_bearer_token(&req) {
         Some(token) => token,
         None => {
             log_warn!("JWTAuth", "Missing or invalid Authorization header", "unauthorized");
+            // 🆕 Record middleware metrics
+            jwt_auth::record_unauthorized("protected", "missing_header");
             return ApiError::unauthorized("Missing or invalid Authorization header")
                 .into_response();
         }
@@ -52,6 +37,8 @@ pub async fn jwt_auth_middleware<B>(
         Some(redis) => redis,
         None => {
             log_error!("JWTAuth", "Redis unavailable for token validation", "system_error");
+            // 🆕 Record service unavailable
+            jwt_auth::record_service_unavailable("protected");
             return ApiError::service_unavailable("Redis unavailable for token validation")
                 .into_response();
         }
@@ -61,7 +48,18 @@ pub async fn jwt_auth_middleware<B>(
     match jwt::validate_token(token, redis_client).await {
         Ok(claims) => {
             log_info!("JWTAuth", &format!("Token valid for user {}", claims.sub), "success");
-            next.run(req).await
+            // 🆕 Record successful authentication
+            jwt_auth::record_success("protected");
+            
+            let response = next.run(req).await;
+            
+            // 🆕 Record processing duration
+            let duration = start_time.elapsed().as_secs_f64();
+            crate::metricss::middleware_metrics::record_middleware_duration(
+                duration, "jwt_auth", "protected"
+            );
+            
+            response
         }
         Err(err) => {
             log_warn!(
@@ -70,7 +68,9 @@ pub async fn jwt_auth_middleware<B>(
                 "unauthorized"
             );
             
-            // Convert AuthServiceError to ApiError automatically
+            // 🆕 Record authentication failure with context
+            jwt_auth::record_unauthorized("protected", "token_validation_failed");
+            
             let api_error = ApiError::from(err);
             api_error.into_response()
         }

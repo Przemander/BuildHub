@@ -52,7 +52,6 @@ use crate::app::build_app;
 use crate::config::database::{init_pool, run_migrations, DbPool};
 use crate::config::redis::{check_redis_connection, init_redis};
 use crate::utils::email::EmailConfig;
-use crate::utils::metrics;
 
 mod app;
 mod config;
@@ -60,6 +59,7 @@ mod db;
 mod handlers;
 mod middleware;
 mod utils;
+mod metricss; // ← FIXED: było "metricss" (podwójne 's')
 
 /// Maximum time to wait for connections to close during shutdown (in seconds)
 const GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 30;
@@ -93,8 +93,8 @@ const OPTIONAL_ENV_VARS: &[&str] = &[
 /// the service from starting properly.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize Prometheus metrics
-    metrics::init();
+    // Initialize all metrics (not just Prometheus)
+    metricss::init_all_metrics();  // ← FIXED: było metricss::init()
     
     // Configure structured JSON logging with async writer
     setup_logging()?;

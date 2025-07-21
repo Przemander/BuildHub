@@ -23,6 +23,13 @@ use serde::Serialize;
 use thiserror::Error;
 use tracing_error::SpanTrace;
 
+// 🆕 Import enhanced error metrics with helper modules (only what we use)
+use crate::metricss::error_metrics::{
+    record_http_response, endpoint_groups,
+    // Import helper modules for cleaner usage
+    database, cache, jwt, rate_limit, validation, configuration,
+};
+
 // =============================================================================
 // LAYER 1: PUBLIC API CONTRACT (what the client sees)
 // =============================================================================
@@ -40,7 +47,7 @@ pub enum ApiStatus {
     ConfigurationError,
     BadRequest,
     ServiceUnavailable,
-    TooManyRequests,  // ← Add this for rate limiting
+    TooManyRequests,
 }
 
 /// API error response structure, ensuring consistent JSON responses.
@@ -82,7 +89,7 @@ impl ApiError {
         ApiError { 
             status, 
             message: msg_str,
-            headers: Vec::new(), // ← Initialize empty headers
+            headers: Vec::new(),
         }
     }
 
@@ -94,7 +101,7 @@ impl ApiError {
         self
     }
 
-    // --- Helper constructors for common errors ---
+    // Helper constructors
     #[inline]
     pub fn unique_constraint(field: &str, msg: &str) -> Self {
         Self::new(ApiStatus::UniqueConstraintError, format!("{}: {}", field, msg))
@@ -288,66 +295,24 @@ pub enum AuthServiceError {
     RateLimit(#[from] RateLimitError),
     
     #[error(transparent)]
-    Validation(#[from] ValidationError), // ← Add this
-}
-
-// --- Add this direct conversion for diesel::result::Error to AuthServiceError ---
-impl From<diesel::result::Error> for AuthServiceError {
-    fn from(err: diesel::result::Error) -> Self {
-        // Convert through DatabaseError to maintain consistency
-        let database_error = DatabaseError::from(err);
-        AuthServiceError::Database(database_error)
-    }
-}
-
-// --- Helper constructors for AuthServiceError ---
-impl AuthServiceError {
-    /// Creates a configuration error with the given message.
-    pub fn configuration(msg: &str) -> Self {
-        AuthServiceError::Configuration(msg.to_string())
-    }
-    
-    /// Creates a validation error with the given field and message.
-    pub fn validation(field: &str, message: &str) -> Self {
-        AuthServiceError::Validation(ValidationError::InvalidValue {
-            field: field.to_string(),
-            message: message.to_string(),
-            span: SpanTrace::capture(),
-        })
-    }
-    
-    /// Creates a database error with the given message.
-    pub fn database(msg: &str) -> Self {
-        AuthServiceError::Database(DatabaseError::Query {
-            source: diesel::result::Error::QueryBuilderError(msg.into()),
-            span: SpanTrace::capture(),
-        })
-    }
+    Validation(#[from] ValidationError),
 }
 
 // =============================================================================
-// LAYER 3: CONVERSION LOGIC (the glue between layers)
+// CONVERSIONS FROM LIBRARY ERRORS
 // =============================================================================
-
-// --- Conversions from library errors to `DatabaseError` ---
 
 impl From<r2d2::Error> for DatabaseError {
     fn from(err: r2d2::Error) -> Self {
         DatabaseError::ConnectionPool { source: err, span: SpanTrace::capture() }
     }
 }
+
 impl From<diesel::result::Error> for DatabaseError {
     fn from(err: diesel::result::Error) -> Self {
         DatabaseError::Query { source: err, span: SpanTrace::capture() }
     }
 }
-impl From<Box<dyn std::error::Error + Send + Sync>> for DatabaseError {
-    fn from(err: Box<dyn std::error::Error + Send + Sync>) -> Self {
-        DatabaseError::Migration { source: err, span: SpanTrace::capture() }
-    }
-}
-
-// --- Conversions from library errors to `CacheError` ---
 
 impl From<redis::RedisError> for CacheError {
     fn from(err: redis::RedisError) -> Self {
@@ -357,17 +322,6 @@ impl From<redis::RedisError> for CacheError {
         }
     }
 }
-
-impl From<std::env::VarError> for CacheError {
-    fn from(err: std::env::VarError) -> Self {
-        CacheError::Connection { 
-            source: Box::new(err), 
-            span: SpanTrace::capture() 
-        }
-    }
-}
-
-// --- Conversions from library errors to `JwtError` ---
 
 impl From<jsonwebtoken::errors::Error> for JwtError {
     fn from(err: jsonwebtoken::errors::Error) -> Self {
@@ -385,22 +339,6 @@ impl From<jsonwebtoken::errors::Error> for JwtError {
     }
 }
 
-// --- Conversions from library errors to `RateLimitError` ---
-
-impl From<redis::RedisError> for RateLimitError {
-    fn from(err: redis::RedisError) -> Self {
-        RateLimitError::CacheOperation {
-            operation: "redis_operation".to_string(),
-            source: CacheError::Operation {
-                source: Box::new(err),
-                span: SpanTrace::capture(),
-            },
-            span: SpanTrace::capture(),
-        }
-    }
-}
-
-// --- Conversion from argon2 password hashing errors to ValidationError
 impl From<argon2::password_hash::Error> for ValidationError {
     fn from(err: argon2::password_hash::Error) -> Self {
         ValidationError::PasswordHash {
@@ -410,100 +348,181 @@ impl From<argon2::password_hash::Error> for ValidationError {
     }
 }
 
-// --- Add this direct conversion for the ? operator to work
-impl From<argon2::password_hash::Error> for AuthServiceError {
-    fn from(err: argon2::password_hash::Error) -> Self {
-        // Convert through ValidationError to maintain consistency
-        let validation_error = ValidationError::from(err);
-        AuthServiceError::Validation(validation_error)
+// Direct conversions to AuthServiceError
+impl From<diesel::result::Error> for AuthServiceError {
+    fn from(err: diesel::result::Error) -> Self {
+        AuthServiceError::Database(DatabaseError::from(err))
     }
 }
 
-// --- Add this direct conversion for r2d2::Error to AuthServiceError ---
 impl From<r2d2::Error> for AuthServiceError {
     fn from(err: r2d2::Error) -> Self {
-        // Convert through DatabaseError to maintain consistency
-        let database_error = DatabaseError::from(err);
-        AuthServiceError::Database(database_error)
+        AuthServiceError::Database(DatabaseError::from(err))
     }
 }
 
-// --- Add this direct conversion for redis::RedisError to AuthServiceError ---
 impl From<redis::RedisError> for AuthServiceError {
     fn from(err: redis::RedisError) -> Self {
-        // Convert through CacheError to maintain consistency
-        let cache_error = CacheError::from(err);
-        AuthServiceError::Cache(cache_error)
+        AuthServiceError::Cache(CacheError::from(err))
     }
 }
 
-// --- The central point of conversion from an internal error to a public API error ---
+impl From<argon2::password_hash::Error> for AuthServiceError {
+    fn from(err: argon2::password_hash::Error) -> Self {
+        AuthServiceError::Validation(ValidationError::from(err))
+    }
+}
+
+// Helper constructors
+impl AuthServiceError {
+    pub fn configuration(msg: &str) -> Self {
+        AuthServiceError::Configuration(msg.to_string())
+    }
+    
+    pub fn validation(field: &str, message: &str) -> Self {
+        AuthServiceError::Validation(ValidationError::InvalidValue {
+            field: field.to_string(),
+            message: message.to_string(),
+            span: SpanTrace::capture(),
+        })
+    }
+    
+    pub fn database(msg: &str) -> Self {
+        AuthServiceError::Database(DatabaseError::Query {
+            source: diesel::result::Error::QueryBuilderError(msg.into()),
+            span: SpanTrace::capture(),
+        })
+    }
+}
+
+// =============================================================================
+// ERROR TO API CONVERSION WITH ENHANCED METRICS
+// =============================================================================
+
+/// 🆕 Enhanced helper function to determine endpoint group from request context
+/// TODO: In real implementation, this should extract from axum::Request or middleware context
+fn determine_endpoint_group() -> &'static str {
+    // For now, return unknown - this should be enhanced with actual request context
+    // In a real implementation, you might:
+    // 1. Use thread-local storage to store request context
+    // 2. Pass endpoint group through error constructors
+    // 3. Extract from axum request extensions
+    endpoint_groups::UNKNOWN
+}
+
+/// 🆕 Helper function for recording HTTP responses with appropriate status-specific helpers
+fn record_response_by_status(status_code: u16, endpoint_group: &str) {
+    // Since we don't have the http helper module imported, use the base function
+    record_http_response(status_code, endpoint_group);
+}
 
 impl From<AuthServiceError> for ApiError {
     fn from(err: AuthServiceError) -> Self {
-        // Use consistent logging with our custom macro
         log_error!("ErrorHandler", &format!("Service error occurred: {:?}", err), "conversion");
         
         match err {
-            AuthServiceError::Configuration(msg) => ApiError::configuration(&msg),
+            AuthServiceError::Configuration(msg) => {
+                // 🆕 Use helper module for cleaner code
+                configuration::record_general_error();
+                ApiError::configuration(&msg)
+            }
             
             AuthServiceError::Database(db_err) => match db_err {
                 DatabaseError::ConnectionPool { .. } => {
+                    // 🆕 Use helper module
+                    database::record_connection_pool_error();
                     ApiError::service_unavailable("Could not get a database connection")
                 }
                 DatabaseError::Migration { .. } => {
+                    // 🆕 Use helper module
+                    database::record_migration_error();
                     ApiError::internal("Failed to run database migrations")
                 }
                 DatabaseError::Query { source, .. } => match source {
                     diesel::result::Error::NotFound => {
+                        // Don't record NotFound as error - it's normal business logic
                         ApiError::not_found("Resource not found in the database")
                     }
                     diesel::result::Error::DatabaseError(
                         diesel::result::DatabaseErrorKind::UniqueViolation,
                         _,
-                    ) => ApiError::unique_constraint("resource", "already exists"),
-                    _ => ApiError::internal("An unexpected database error occurred"),
+                    ) => {
+                        // Don't record unique violations as errors - they're business logic
+                        ApiError::unique_constraint("resource", "already exists")
+                    }
+                    _ => {
+                        // 🆕 Use helper module
+                        database::record_query_error();
+                        ApiError::internal("An unexpected database error occurred")
+                    }
                 },
             },
 
             AuthServiceError::Cache(cache_err) => match cache_err {
                 CacheError::Connection { .. } => {
+                    // 🆕 Use helper module
+                    cache::record_connection_error();
                     ApiError::service_unavailable("Could not connect to cache service")
                 }
                 CacheError::Operation { .. } => {
+                    // 🆕 Use helper module
+                    cache::record_operation_error();
                     ApiError::internal("Cache operation failed")
                 }
                 CacheError::KeyNotFound { .. } => {
+                    // 🆕 Use helper module
+                    cache::record_key_not_found();
                     ApiError::not_found("Requested data not found in cache")
                 }
                 CacheError::Serialization { .. } => {
+                    // 🆕 Use helper module
+                    cache::record_serialization_error();
                     ApiError::internal("Failed to serialize/deserialize cache data")
                 }
             },
 
             AuthServiceError::Jwt(jwt_err) => match jwt_err {
                 JwtError::Expired { .. } => {
+                    // 🆕 Use helper module
+                    jwt::record_expired();
                     ApiError::unauthorized("Token has expired")
                 }
-                JwtError::InvalidSignature { .. } | JwtError::Invalid { .. } => {
+                JwtError::InvalidSignature { .. } => {
+                    // 🆕 Use helper module
+                    jwt::record_invalid_signature();
+                    ApiError::unauthorized("Invalid token")
+                }
+                JwtError::Invalid { .. } => {
+                    // 🆕 Use helper module
+                    jwt::record_invalid();
                     ApiError::unauthorized("Invalid token")
                 }
                 JwtError::Revoked { .. } => {
+                    // 🆕 Use helper module
+                    jwt::record_revoked();
                     ApiError::unauthorized("Token has been revoked")
                 }
                 JwtError::InvalidIat { .. } => {
+                    // 🆕 Use helper module
+                    jwt::record_invalid_iat();
                     ApiError::unauthorized("Token timing is invalid")
                 }
                 JwtError::Configuration { message, .. } => {
+                    // 🆕 Use helper module
+                    jwt::record_configuration_error();
                     ApiError::configuration(&message)
                 }
                 JwtError::Internal { message, .. } => {
+                    // 🆕 Use helper module
+                    jwt::record_internal_error();
                     ApiError::internal(&message)
                 }
             },
 
             AuthServiceError::RateLimit(rate_err) => match rate_err {
                 RateLimitError::LimitExceeded { current, limit, reset_time, .. } => {
+                    // 🆕 Use helper module
+                    rate_limit::record_limit_exceeded();
                     let message = match reset_time {
                         Some(reset_secs) => format!(
                             "Rate limit exceeded ({}/{}). Try again in {} seconds.", 
@@ -514,30 +533,49 @@ impl From<AuthServiceError> for ApiError {
                             current, limit
                         ),
                     };
-                    ApiError::too_many_requests(&message)
+                    
+                    let mut api_error = ApiError::too_many_requests(&message);
+                    if let Some(reset_secs) = reset_time {
+                        api_error = api_error.with_header("Retry-After", reset_secs.to_string());
+                    }
+                    api_error
                 }
                 RateLimitError::Configuration { message, .. } => {
+                    // 🆕 Use helper module
+                    rate_limit::record_configuration_error();
                     ApiError::configuration(&message)
                 }
                 RateLimitError::CacheOperation { .. } => {
+                    // 🆕 Use helper module
+                    rate_limit::record_cache_operation_error();
                     ApiError::service_unavailable("Rate limiting service temporarily unavailable")
                 }
                 RateLimitError::InvalidKey { key, .. } => {
+                    // 🆕 Use helper module
+                    rate_limit::record_invalid_key_error();
                     ApiError::bad_request(&format!("Invalid rate limit key format: {}", key))
                 }
             },
 
             AuthServiceError::Validation(val_err) => match val_err {
                 ValidationError::InvalidValue { field, message, .. } => {
+                    // 🆕 Use helper module
+                    validation::record_invalid_value();
                     ApiError::new(ApiStatus::ValidationError, format!("{}: {}", field, message))
                 }
                 ValidationError::MissingField { field, .. } => {
+                    // 🆕 Use helper module
+                    validation::record_missing_field();
                     ApiError::new(ApiStatus::ValidationError, format!("{} is required", field))
                 }
                 ValidationError::TooLong { field, max_length, .. } => {
+                    // 🆕 Use helper module
+                    validation::record_too_long();
                     ApiError::new(ApiStatus::ValidationError, format!("{} must be no more than {} characters", field, max_length))
                 }
                 ValidationError::PasswordHash { message, .. } => {
+                    // 🆕 Use helper module
+                    validation::record_password_hash_error();
                     ApiError::new(ApiStatus::InternalError, format!("Password processing failed: {}", message))
                 }
             },
@@ -546,7 +584,7 @@ impl From<AuthServiceError> for ApiError {
 }
 
 // =============================================================================
-// LAYER 4: AXUM FRAMEWORK INTEGRATION
+// AXUM FRAMEWORK INTEGRATION WITH ENHANCED METRICS
 // =============================================================================
 
 /// Allows Axum handlers to return `Result<_, AuthServiceError>`.
@@ -568,6 +606,9 @@ impl IntoResponse for AuthServiceError {
             ApiStatus::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
         };
 
+        // 🆕 Record HTTP response using enhanced helper
+        record_response_by_status(status_code.as_u16(), determine_endpoint_group());
+
         // Return JSON response
         (status_code, Json(api_error)).into_response()
     }
@@ -586,17 +627,32 @@ impl IntoResponse for ApiError {
             ApiStatus::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
         };
 
+        // 🆕 Record HTTP response using enhanced helper
+        record_response_by_status(status.as_u16(), determine_endpoint_group());
+
         let body = serde_json::to_string(&self).unwrap_or_else(|e| {
             log_error!("ApiError", &format!("Error serializing error response: {}", e), "serialization_failure");
             "{\"status\":\"internal_error\",\"message\":\"Error serializing the error message.\"}".to_string()
         });
 
-        axum::response::Response::builder()
+        // 🆕 Build response with custom headers support
+        let mut response_builder = axum::response::Response::builder()
             .status(status)
-            .header("Content-Type", "application/json")
+            .header("Content-Type", "application/json");
+
+        // 🆕 Add custom headers (e.g., Retry-After for rate limiting)
+        for (name, value) in &self.headers {
+            response_builder = response_builder.header(name, value);
+        }
+
+        response_builder
             .body(axum::body::boxed(axum::body::Body::from(body)))
             .unwrap_or_else(|_| {
                 log_error!("ApiError", "Failed to build HTTP response", "response_construction_failure");
+                
+                // 🆕 Use helper function for fallback response
+                record_response_by_status(500, endpoint_groups::UNKNOWN);
+                
                 axum::response::Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
                     .body(axum::body::boxed(axum::body::Body::from(
