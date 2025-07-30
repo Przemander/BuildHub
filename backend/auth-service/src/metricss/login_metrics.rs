@@ -280,8 +280,8 @@ pub mod http {
     // Status codes
     pub const OK: u16 = 200;
     pub const BAD_REQUEST: u16 = 400;
-    pub const UNAUTHORIZED: u16 = 401;
     pub const INTERNAL_SERVER_ERROR: u16 = 500;
+    pub const TOO_MANY_REQUESTS: u16 = 429;
 }
 
 // =============================================================================

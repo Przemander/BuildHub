@@ -29,6 +29,7 @@ pub mod refresh_metrics;
 pub mod password_metrics;
 pub mod logout_metrics;      // ✅ ADDED: Just adding refresh_metrics module
 pub mod login_metrics;
+pub mod activation_metrics;
 // --- INITIALIZATION STATE ---
 static METRICS_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
@@ -91,7 +92,8 @@ pub fn init_all_metrics() {
     refresh_metrics::init_refresh_metrics(); // ✅ ADDED: Initialize refresh metrics
     password_metrics::init_password_reset_metrics();
     logout_metrics::init_logout_metrics();
-    login_metrics::init_login_metrics(); // ✅ ADDED: Initialize logout metrics
+    login_metrics::init_login_metrics();
+    activation_metrics::init_activation_metrics(); // ✅ ADDED: Initialize activation metrics
     // TODO: Check if this function exists in rate_limiter_metrics
     // rate_limiter_metrics::init_rate_limit_metrics(); // Verify function name
 

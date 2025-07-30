@@ -24,6 +24,9 @@ use tracing::instrument;
 use crate::app::AppState;
 use crate::handlers::activation_logic::process_activation; // ← Zmienione z process_activation_unified
 use crate::utils::error_new::AuthServiceError;
+use crate::metricss::activation_metrics::{
+    record_http_request, http::{GET, OK, BAD_REQUEST, INTERNAL_SERVER_ERROR},
+};
 
 /// Query parameters for account activation.
 ///
@@ -65,8 +68,32 @@ pub async fn activate_account_handler(
         &tracing::field::display(params.code.len())
     );
 
+    // Start HTTP duration timer
+    let start = std::time::Instant::now();
+
     // Process the activation code using unified error system
-    match process_activation(&app_state, &params.code).await { // ← Zmienione z process_activation_unified
+    let result = process_activation(&app_state, &params.code).await;
+
+    // Record HTTP metrics
+    let duration = start.elapsed().as_secs_f64();
+    let status_code = match &result {
+        Ok(_) => OK,
+        Err(err) => match err {
+            AuthServiceError::Validation(_) => BAD_REQUEST,
+            AuthServiceError::Configuration(_) => INTERNAL_SERVER_ERROR,
+            AuthServiceError::Database(_) => INTERNAL_SERVER_ERROR,
+            _ => BAD_REQUEST,
+        },
+    };
+
+    crate::metricss::activation_metrics::ACTIVATION_HTTP_DURATION
+        .with_label_values(&[GET, &status_code.to_string()])
+        .observe(duration);
+    
+    record_http_request(GET, status_code);
+
+    // Render page based on result
+    match result {
         Ok(()) => Html(render_page(
             "Account Activated",
             "Your account has been successfully activated. You can now log in.",

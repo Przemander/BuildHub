@@ -16,6 +16,7 @@ use diesel::prelude::*;
 use diesel::{AsChangeset, Insertable, Queryable};
 use serde::{Deserialize, Serialize};
 use tracing_error::SpanTrace;
+use crate::metricss::database_metrics::user;
 
 /// Represents a user in the database.
 #[derive(Debug, Serialize, Deserialize, Queryable, Insertable, AsChangeset)]
@@ -147,6 +148,8 @@ impl User {
     /// * `Ok(usize)` - Number of rows affected (should be 1)
     /// * `Err(AuthServiceError)` - Database operation failed
     pub fn save(&self, conn: &mut SqliteConnection) -> Result<usize, AuthServiceError> {
+        user::record_create_attempt();
+        
         log_debug!(
             "User Management",
             &format!("Saving user to database: {}", self.username),
@@ -158,6 +161,7 @@ impl User {
                 .values(self)
                 .execute(conn)
         }).map_err(|e| {
+            user::record_create_failure("query_error");
             log_error!(
                 "User Management",
                 &format!("Failed to save user {}: {}", self.username, e),
@@ -169,6 +173,7 @@ impl User {
             }
         })?;
 
+        user::record_create_success();
         log_info!(
             "User Management", 
             &format!("User {} saved successfully", self.username), 
@@ -191,6 +196,8 @@ impl User {
         conn: &mut SqliteConnection, 
         username_str: &str
     ) -> Result<Self, AuthServiceError> {
+        user::record_lookup_username_attempt();
+        
         log_debug!(
             "User Management", 
             &format!("Searching for user by username: {}", username_str), 
@@ -205,6 +212,7 @@ impl User {
             .map_err(|e| {
                 match e {
                     diesel::result::Error::NotFound => {
+                        user::record_lookup_username_failure("not_found");
                         log_debug!(
                             "User Management",
                             &format!("User not found by username: {}", username_str),
@@ -212,6 +220,7 @@ impl User {
                         );
                     }
                     _ => {
+                        user::record_lookup_username_failure("query_error");
                         log_error!(
                             "User Management",
                             &format!("Database error finding user by username {}: {}", username_str, e),
@@ -225,6 +234,7 @@ impl User {
                 }
             })?;
 
+        user::record_lookup_username_success();
         log_info!(
             "User Management", 
             &format!("User found by username: {}", username_str), 
@@ -247,6 +257,8 @@ impl User {
         conn: &mut SqliteConnection, 
         email_str: &str
     ) -> Result<Self, AuthServiceError> {
+        user::record_lookup_email_attempt();
+        
         log_debug!(
             "User Management", 
             &format!("Searching for user by email: {}", email_str), 
@@ -261,6 +273,7 @@ impl User {
             .map_err(|e| {
                 match e {
                     diesel::result::Error::NotFound => {
+                        user::record_lookup_email_failure("not_found");
                         log_debug!(
                             "User Management",
                             &format!("User not found by email: {}", email_str),
@@ -268,6 +281,7 @@ impl User {
                         );
                     }
                     _ => {
+                        user::record_lookup_email_failure("query_error");
                         log_error!(
                             "User Management",
                             &format!("Database error finding user by email {}: {}", email_str, e),
@@ -281,6 +295,7 @@ impl User {
                 }
             })?;
 
+        user::record_lookup_email_success();
         log_info!(
             "User Management", 
             &format!("User found by email: {}", email_str), 
@@ -299,6 +314,8 @@ impl User {
     /// * `Ok(())` - Account activated successfully
     /// * `Err(AuthServiceError)` - Database operation failed
     pub fn activate(&self, conn: &mut SqliteConnection) -> Result<(), AuthServiceError> {
+        user::record_activate_attempt();
+        
         log_debug!(
             "User Management", 
             &format!("Activating account for user: {}", self.email), 
@@ -311,6 +328,7 @@ impl User {
             .set(is_active.eq(true))
             .execute(conn)
             .map_err(|e| {
+                user::record_activate_failure("query_error");
                 log_error!(
                     "User Management",
                     &format!("Failed to activate account for {}: {}", self.email, e),
@@ -322,6 +340,7 @@ impl User {
                 }
             })?;
 
+        user::record_activate_success();
         log_info!(
             "User Management", 
             &format!("Account activated successfully for: {}", self.email), 
@@ -340,6 +359,8 @@ impl User {
     /// * `Ok(())` - User updated successfully
     /// * `Err(AuthServiceError)` - User has no ID or database error
     pub fn update(&self, conn: &mut SqliteConnection) -> Result<(), AuthServiceError> {
+        user::record_update_attempt();
+        
         log_debug!(
             "User Management", 
             &format!("Updating user record: {}", self.username), 
@@ -349,6 +370,7 @@ impl User {
         use crate::db::schema::users::dsl::*;
         
         let user_id = self.id.ok_or_else(|| {
+            user::record_update_failure("no_id");
             log_warn!(
                 "User Management", 
                 &format!("Attempted to update user {} without ID", self.username), 
@@ -364,6 +386,7 @@ impl User {
             .set(self)
             .execute(conn)
             .map_err(|e| {
+                user::record_update_failure("query_error");
                 log_error!(
                     "User Management",
                     &format!("Failed to update user {}: {}", self.username, e),
@@ -375,6 +398,7 @@ impl User {
                 }
             })?;
 
+        user::record_update_success();
         log_info!(
             "User Management", 
             &format!("User {} updated successfully", self.username), 
@@ -401,6 +425,8 @@ impl User {
         conn: &mut SqliteConnection,
         new_password: &str,
     ) -> Result<(), AuthServiceError> {
+        user::record_password_update_attempt();
+        
         log_debug!(
             "User Management", 
             &format!("Updating password for user: {}", self.username), 
@@ -419,6 +445,7 @@ impl User {
         // Now safe to call update
         self.update(conn)?;
 
+        user::record_password_update_success();
         log_info!(
             "User Management", 
             &format!("Password updated successfully for user: {}", self.username), 

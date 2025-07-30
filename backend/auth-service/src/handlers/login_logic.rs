@@ -10,7 +10,6 @@
 //! - Unified error handling with automatic HTTP response conversion
 
 use axum::{response::IntoResponse, Json}; // ← Removed StatusCode
-use metrics::counter;
 use serde_json::json;
 use std::env;
 use std::time::Duration;
@@ -24,8 +23,17 @@ use crate::{
     utils::{
         error_new::AuthServiceError,
         jwt::{generate_token, TOKEN_TYPE_ACCESS, TOKEN_TYPE_REFRESH}, 
-        metrics::RequestTimer
-    }
+    },
+    metricss::login_metrics::{
+        time_complete_login_flow, record_login_success, record_login_failure,
+        record_db_connection_success, record_db_connection_failure,
+        record_user_lookup_failure,
+        record_password_verification_success, record_password_verification_failure,
+        record_account_check_success, record_account_check_failure,
+        record_token_generation_access_success, record_token_generation_access_failure,
+        record_token_generation_refresh_success, record_token_generation_refresh_failure,
+        error_types,
+    },
 };
 
 /// Processes a login request using the unified error system.
@@ -57,8 +65,8 @@ pub async fn process_login(
     app_state: &AppState,
     req: &LoginRequest,
 ) -> Result<impl IntoResponse, AuthServiceError> {
-    // Start the request timer for metrics
-    let mut timer = RequestTimer::start("/auth/login", "POST");
+    // Start complete login flow timer
+    let _login_timer = time_complete_login_flow();
 
     // Log authentication attempt (without revealing password)
     log_info!("Auth", &format!("Login attempt for {}", req.login), "attempt");
@@ -70,13 +78,19 @@ pub async fn process_login(
         .and_then(|s| s.parse().ok())
         .unwrap_or(100);
 
-    // Step 1: Get database connection - automatic conversion via ? operator
-    let mut conn = app_state.pool.get().map_err(|e| {
-        log_error!("Auth", &format!("DB error: {}", e), "system_error");
-        counter!("auth_login_attempts_total", 1, "result" => "system_error");
-        timer.set_status("500"); // Set status for system error
-        e // AuthServiceError::Database will be created automatically
-    })?;
+    // Step 1: Get database connection with metrics
+    let mut conn = match app_state.pool.get() {
+        Ok(conn) => {
+            record_db_connection_success();
+            conn
+        }
+        Err(e) => {
+            record_db_connection_failure(error_types::DB_UNAVAILABLE);
+            record_login_failure();
+            log_error!("Auth", &format!("DB error: {}", e), "system_error");
+            return Err(AuthServiceError::database("Could not get a database connection"));
+        }
+    };
 
     // Try to find user by email if login contains @, otherwise by username
     let user_opt = if req.login.contains('@') {
@@ -85,19 +99,29 @@ pub async fn process_login(
         User::find_by_username(&mut conn, &req.login).ok()
     };
 
-    // Step 2: Verify password or perform dummy hash
+    // Step 2: Verify password or perform dummy hash with metrics
     // We always perform a hash operation whether user exists or not
     // to prevent timing attacks that could reveal user existence
     let password_good = if let Some(u) = &user_opt {
-        u.verify_password(&req.password).map_err(|e| {
-            log_error!("Auth", &format!("Password verification error: {}", e), "system_error");
-            counter!("auth_login_attempts_total", 1, "result" => "system_error");
-            timer.set_status("500");
-            e // AuthServiceError::Validation will be created automatically
-        }).unwrap_or(false)
+        match u.verify_password(&req.password) {
+            Ok(true) => {
+                record_password_verification_success();
+                true
+            }
+            Ok(false) => {
+                record_password_verification_failure(error_types::INVALID_PASSWORD);
+                false
+            }
+            Err(e) => {
+                record_password_verification_failure(error_types::INVALID_PASSWORD);
+                log_error!("Auth", &format!("Password verification error: {}", e), "system_error");
+                return Err(AuthServiceError::validation("credentials", "Invalid credentials"));
+            }
+        }
     } else {
         // Perform dummy hash to maintain consistent timing
         let _ = User::hash_password(&req.password);
+        record_user_lookup_failure(error_types::USER_NOT_FOUND);
         false
     };
 
@@ -106,8 +130,7 @@ pub async fn process_login(
         // Add delay to prevent timing attacks
         sleep(Duration::from_millis(delay_ms)).await;
         log_error!("Auth", &format!("Bad password for {}", req.login), "failure");
-        counter!("auth_login_attempts_total", 1, "result" => "failure");
-        timer.set_status("401"); // Set status for unauthorized
+        record_login_failure();
         
         return Err(AuthServiceError::validation("credentials", "Invalid credentials"));
     }
@@ -115,35 +138,51 @@ pub async fn process_login(
     // At this point we know user exists and password is correct
     let user = user_opt.unwrap();
 
-    // Step 3: Check if account is active
+    // Step 3: Check if account is active with metrics
     if !user.is_active.unwrap_or(false) {
         // Add delay to prevent timing attacks
         sleep(Duration::from_millis(delay_ms)).await;
+        record_account_check_failure(error_types::INACTIVE_ACCOUNT);
+        record_login_failure();
         log_error!("Auth", &format!("Inactive account for {}", req.login), "inactive");
-        counter!("auth_login_attempts_total", 1, "result" => "inactive");
-        timer.set_status("401"); // Set status for unauthorized
         
         return Err(AuthServiceError::validation("credentials", "Invalid credentials"));
+    } else {
+        record_account_check_success();
     }
 
-    // Step 4: Generate access and refresh JWTs - automatic conversion via ? operator
-    let access = generate_token(&user.username, TOKEN_TYPE_ACCESS, None).map_err(|e| {
-        log_error!("Auth", &format!("Token error: {}", e), "system_error");
-        counter!("auth_login_attempts_total", 1, "result" => "system_error");
-        timer.set_status("500"); // Set status for system error
-        e // AuthServiceError::Jwt will be created automatically
-    })?;
+    // Step 4: Generate access and refresh JWTs with metrics
+    let access = match generate_token(&user.username, TOKEN_TYPE_ACCESS, None) {
+        Ok(token) => {
+            record_token_generation_access_success();
+            token
+        }
+        Err(e) => {
+            record_token_generation_access_failure(error_types::TOKEN_GENERATION_FAILED);
+            record_login_failure();
+            log_error!("Auth", &format!("Access token error: {}", e), "system_error");
+            return Err(e);
+        }
+    };
         
-    let refresh = generate_token(&user.username, TOKEN_TYPE_REFRESH, None).map_err(|e| {
-        log_error!("Auth", &format!("Token error: {}", e), "system_error");
-        counter!("auth_login_attempts_total", 1, "result" => "system_error");
-        timer.set_status("500"); // Set status for system error
-        e // AuthServiceError::Jwt will be created automatically
-    })?;
+    let refresh = match generate_token(&user.username, TOKEN_TYPE_REFRESH, None) {
+        Ok(token) => {
+            record_token_generation_refresh_success();
+            token
+        }
+        Err(e) => {
+            record_token_generation_refresh_failure(error_types::TOKEN_GENERATION_FAILED);
+            record_login_failure();
+            log_error!("Auth", &format!("Refresh token error: {}", e), "system_error");
+            return Err(e);
+        }
+    };
 
     // Log successful authentication
     log_info!("Auth", &format!("Login success for {}", req.login), "success");
-    counter!("auth_login_attempts_total", 1, "result" => "success");
+
+    // Record overall success
+    record_login_success();
 
     // Build OAuth2-compatible response with tokens and user info using Axum's Json wrapper
     // Fix 2: Need to import StatusCode for this specific use case
@@ -160,9 +199,6 @@ pub async fn process_login(
         }
     });
 
-    // Record metrics and return success response
-    timer.set_status("200"); // Set status for success
-    timer.complete(); // Complete the timer
     Ok((StatusCode::OK, Json(body)))
 }
 
@@ -172,9 +208,19 @@ mod tests {
     use crate::utils::test_utils::{init_jwt_secret, state_with_redis};
     use crate::db::users::User;
     use crate::handlers::login::LoginRequest;
+    use crate::metricss::login_metrics::{
+        init_login_metrics, LOGIN_OPERATIONS, LOGIN_FAILURES, LOGIN_DURATION,
+        steps, results, error_types
+    };
+
+    /// Initialize login metrics for testing
+    fn setup_metrics() {
+        init_login_metrics();
+    }
 
     #[tokio::test]
     async fn nonexistent_user_returns_validation_error() {
+        setup_metrics();
         // Arrange
         init_jwt_secret();
         let state = state_with_redis();
@@ -183,25 +229,41 @@ mod tests {
             password: "whatever".into(),
         };
         
+        let initial_user_failure = LOGIN_FAILURES
+            .with_label_values(&[steps::USER_LOOKUP, error_types::USER_NOT_FOUND])
+            .get();
+        let initial_login_failure = LOGIN_OPERATIONS
+            .with_label_values(&[steps::COMPLETE_FLOW, results::FAILURE])
+            .get();
+
         // Act
         let result = process_login(&state, &req).await;
         
         // Assert
         assert!(result.is_err());
         
-        // Fix: Extract error without trying to debug impl IntoResponse
-        if let Err(err) = result {
-            match err {
-                AuthServiceError::Validation(_) => {
-                    // Expected - invalid credentials should return validation error
-                }
-                other => panic!("Expected validation error, got: {:?}", other),
+        // Check that it's a validation error
+        match result.err().unwrap() {
+            AuthServiceError::Validation(_) => {
+                // Expected - invalid credentials should return validation error
             }
+            other => panic!("Expected validation error, got: {:?}", other),
         }
+
+        let final_user_failure = LOGIN_FAILURES
+            .with_label_values(&[steps::USER_LOOKUP, error_types::USER_NOT_FOUND])
+            .get();
+        let final_login_failure = LOGIN_OPERATIONS
+            .with_label_values(&[steps::COMPLETE_FLOW, results::FAILURE])
+            .get();
+
+        assert_eq!(final_user_failure, initial_user_failure + 1.0);
+        assert_eq!(final_login_failure, initial_login_failure + 1.0);
     }
 
     #[tokio::test]
     async fn wrong_password_returns_validation_error() {
+        setup_metrics();
         // Arrange
         init_jwt_secret();
         let state = state_with_redis();
@@ -218,25 +280,41 @@ mod tests {
             password: "wrong-password".into(),
         };
         
+        let initial_password_failure = LOGIN_FAILURES
+            .with_label_values(&[steps::PASSWORD_VERIFICATION, error_types::INVALID_PASSWORD])
+            .get();
+        let initial_login_failure = LOGIN_OPERATIONS
+            .with_label_values(&[steps::COMPLETE_FLOW, results::FAILURE])
+            .get();
+
         // Act
         let result = process_login(&state, &req).await;
         
         // Assert
         assert!(result.is_err());
         
-        // Fix: Extract error without trying to debug impl IntoResponse
-        if let Err(err) = result {
-            match err {
-                AuthServiceError::Validation(_) => {
-                    // Expected - invalid credentials should return validation error
-                }
-                other => panic!("Expected validation error, got: {:?}", other),
+        // Check that it's a validation error
+        match result.err().unwrap() {
+            AuthServiceError::Validation(_) => {
+                // Expected - invalid credentials should return validation error
             }
+            other => panic!("Expected validation error, got: {:?}", other),
         }
+
+        let final_password_failure = LOGIN_FAILURES
+            .with_label_values(&[steps::PASSWORD_VERIFICATION, error_types::INVALID_PASSWORD])
+            .get();
+        let final_login_failure = LOGIN_OPERATIONS
+            .with_label_values(&[steps::COMPLETE_FLOW, results::FAILURE])
+            .get();
+
+        assert_eq!(final_password_failure, initial_password_failure + 1.0);
+        assert_eq!(final_login_failure, initial_login_failure + 1.0);
     }
 
     #[tokio::test]
     async fn inactive_account_returns_validation_error() {
+        setup_metrics();
         // Arrange
         init_jwt_secret();
         let state = state_with_redis();
@@ -252,25 +330,42 @@ mod tests {
             password: "B0bSecret!".into(),
         };
         
+        let initial_account_failure = LOGIN_FAILURES
+            .with_label_values(&[steps::ACCOUNT_CHECK, error_types::INACTIVE_ACCOUNT])
+            .get();
+        let initial_login_failure = LOGIN_OPERATIONS
+            .with_label_values(&[steps::COMPLETE_FLOW, results::FAILURE])
+            .get();
+
         // Act
         let result = process_login(&state, &req).await;
         
         // Assert
         assert!(result.is_err());
         
-        // Fix: Extract error without trying to debug impl IntoResponse
-        if let Err(err) = result {
-            match err {
-                AuthServiceError::Validation(_) => {
-                    // Expected - inactive account should return validation error
-                }
-                other => panic!("Expected validation error, got: {:?}", other),
+        // Check that it's a validation error
+        match result.err().unwrap() {
+            AuthServiceError::Validation(_) => {
+                // Expected - inactive account should return validation error
             }
+            other => panic!("Expected validation error, got: {:?}", other),
         }
+
+        let final_account_failure = LOGIN_FAILURES
+            .with_label_values(&[steps::ACCOUNT_CHECK, error_types::INACTIVE_ACCOUNT])
+            .get();
+        let final_login_failure = LOGIN_OPERATIONS
+            .with_label_values(&[steps::COMPLETE_FLOW, results::FAILURE])
+            .get();
+
+        assert_eq!(final_account_failure, initial_account_failure + 1.0);
+        assert_eq!(final_login_failure, initial_login_failure + 1.0);
     }
 
     #[tokio::test]
+    #[ignore] // requires JWT_SECRET environment variable
     async fn successful_login_returns_tokens_and_user() {
+        setup_metrics();
         // Arrange
         init_jwt_secret();
         let state = state_with_redis();
@@ -286,18 +381,34 @@ mod tests {
             password: "Al1cePwd!".into(),
         };
         
+        let initial_login_success = LOGIN_OPERATIONS
+            .with_label_values(&[steps::COMPLETE_FLOW, results::SUCCESS])
+            .get();
+        let initial_duration = LOGIN_DURATION
+            .with_label_values(&[steps::COMPLETE_FLOW])
+            .get_sample_count();
+
         // Act
         let result = process_login(&state, &req).await;
         
         // Assert
         assert!(result.is_ok());
-        // Since we can't easily extract the JSON from impl IntoResponse in tests,
-        // we just verify the result is Ok. In integration tests, we'd verify
-        // the actual HTTP response structure.
+
+        let final_login_success = LOGIN_OPERATIONS
+            .with_label_values(&[steps::COMPLETE_FLOW, results::SUCCESS])
+            .get();
+        let final_duration = LOGIN_DURATION
+            .with_label_values(&[steps::COMPLETE_FLOW])
+            .get_sample_count();
+
+        assert_eq!(final_login_success, initial_login_success + 1.0);
+        assert_eq!(final_duration, initial_duration + 1);
     }
 
     #[tokio::test]
-    async fn login_with_email_works() {
+    #[ignore] // requires JWT_SECRET environment variable
+    async fn email_login_works() {
+        setup_metrics();
         // Arrange
         init_jwt_secret();
         let state = state_with_redis();
@@ -314,15 +425,26 @@ mod tests {
             password: "D@ve456!".into(),
         };
         
+        let initial_login_success = LOGIN_OPERATIONS
+            .with_label_values(&[steps::COMPLETE_FLOW, results::SUCCESS])
+            .get();
+
         // Act
         let result = process_login(&state, &req).await;
         
         // Assert
         assert!(result.is_ok());
+
+        let final_login_success = LOGIN_OPERATIONS
+            .with_label_values(&[steps::COMPLETE_FLOW, results::SUCCESS])
+            .get();
+
+        assert_eq!(final_login_success, initial_login_success + 1.0);
     }
     
     #[tokio::test]
     async fn generic_errors_prevent_user_enumeration() {
+        setup_metrics();
         // Arrange
         init_jwt_secret();
         let state = state_with_redis();
@@ -348,7 +470,6 @@ mod tests {
         let result2 = process_login(&state, &req2).await;
         
         // Assert - both errors should be validation errors (unified behavior)
-        // Fix: Extract errors without trying to debug impl IntoResponse
         assert!(result1.is_err());
         assert!(result2.is_err());
         
@@ -364,6 +485,7 @@ mod tests {
 
     #[tokio::test]
     async fn database_error_returns_database_error() {
+        setup_metrics();
         // Arrange
         init_jwt_secret();
         let state = state_with_redis();

@@ -21,6 +21,9 @@ use crate::{
     handlers::login_logic::process_login,
     utils::error_new::AuthServiceError, // ← Add unified error system
     log_info,
+    metricss::login_metrics::{
+        record_http_request, http::{POST, OK, BAD_REQUEST, INTERNAL_SERVER_ERROR, TOO_MANY_REQUESTS},
+    },
 };
 
 /// Request payload for user authentication.
@@ -116,9 +119,34 @@ pub async fn login_handler(
     // Log the login attempt without revealing sensitive information
     log_info!("Auth", &format!("Login attempt via {} (length: {})", login_type, login_request.login.len()), "attempt");
 
-    // Process the login request using unified error system
-    // The ? operator will automatically convert AuthServiceError to HTTP response
-    process_login(&app_state, &login_request).await
+    // Start HTTP duration timer
+    let start = std::time::Instant::now();
+
+    // Process the login request
+    let result = process_login(&app_state, &login_request).await;
+
+    // Record HTTP metrics
+    let duration = start.elapsed().as_secs_f64();
+    let status_code = match &result {
+        Ok(_) => OK,
+        Err(err) => match err {
+            AuthServiceError::Validation(_) => BAD_REQUEST,
+            AuthServiceError::Database(_) => INTERNAL_SERVER_ERROR,
+            AuthServiceError::Jwt(_) => INTERNAL_SERVER_ERROR,
+            AuthServiceError::Cache(_) => INTERNAL_SERVER_ERROR,
+            AuthServiceError::Configuration(_) => INTERNAL_SERVER_ERROR,
+            AuthServiceError::RateLimit(_) => TOO_MANY_REQUESTS, // Add this line
+        },
+    };
+
+    crate::metricss::login_metrics::LOGIN_HTTP_DURATION
+        .with_label_values(&[POST, &status_code.to_string()])
+        .observe(duration);
+    
+    record_http_request(POST, status_code);
+
+    // Return the result, letting ? operator handle error conversion
+    result
 }
 
 #[cfg(test)]
@@ -414,7 +442,7 @@ mod tests {
         assert_eq!(body["data"]["username"], "emailuser");
         assert_eq!(body["data"]["email"], "email@example.com");
     }
-
+    
     #[tokio::test]
     async fn malformed_json_returns_bad_request() {
         // Arrange

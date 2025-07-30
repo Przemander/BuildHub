@@ -38,3 +38,12 @@ metrics-exporter-prometheus = "0.8"
 tracing-appender = "0.2"
 deadpool-redis = "0.10"
 hyper = { version = "0.14", features = ["full"] }
+tracing-opentelemetry             = "0.31.0"
+opentelemetry                     = "0.30.0"
+opentelemetry_sdk                 = { version = "0.30.0", features = ["rt-tokio", "logs"] }
+opentelemetry-otlp                = { version = "0.30.0", features = ["grpc-tonic"] }
+opentelemetry-appender-log        = "0.30.0"
+opentelemetry-semantic-conventions = "0.30.0"
+
+[dev-dependencies]
+tracing-test = "0.2.5"

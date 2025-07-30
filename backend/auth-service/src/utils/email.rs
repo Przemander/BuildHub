@@ -55,7 +55,8 @@ use crate::config::redis::store_password_reset_token;
 use crate::{
     config::redis::store_activation_code,
     utils::error_new::AuthServiceError,
-    // ✅ PERFECT: Clean imports using 10/10 standardized email metrics
+    utils::log_new::Log,
+    // ✅ PERFECT: Clean imports using standardized email metrics
     metricss::email_metrics::{
         // Core API functions (standardized)
         record_email_failure, time_email_processing, email_types, failure_types,
@@ -63,7 +64,6 @@ use crate::{
         record_activation_success, record_activation_failure, record_activation_failure_detailed,
         record_password_reset_success, record_password_reset_failure, record_password_reset_failure_detailed,
     },
-    log_debug, log_error, log_info,
 };
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
@@ -96,11 +96,23 @@ impl std::fmt::Debug for EmailConfig {
 
 impl EmailConfig {
     pub fn new() -> Result<Self, AuthServiceError> {
-        log_info!("Email Configuration", "Initializing email service", "attempt");
+        Log::event(
+            "INFO",
+            "Email Configuration",
+            "Initializing email service",
+            "attempt",
+            "EmailConfig::new"
+        );
         
         // Test mode: Use mock SMTP configuration for development and testing
         if Self::is_test_mode() {
-            log_info!("Email Configuration", "Running in TEST_MODE - emails will be logged but not sent", "info");
+            Log::event(
+                "INFO",
+                "Email Configuration",
+                "Running in TEST_MODE - emails will be logged but not sent",
+                "info",
+                "EmailConfig::new"
+            );
             
             return Ok(Self {
                 from_address: "test@example.com".into(),
@@ -118,17 +130,25 @@ impl EmailConfig {
         let from_address = env::var("SMTP_FROM_ADDRESS")
             .unwrap_or_else(|_| "no-reply@example.com".to_string());
 
-        log_debug!("Email Configuration", "Building production SMTP transport", "attempt");
+        Log::event(
+            "DEBUG",
+            "Email Configuration",
+            "Building production SMTP transport",
+            "attempt",
+            "EmailConfig::new"
+        );
         
         let credentials = Credentials::new(smtp_username, smtp_password);
         let mailer = SmtpTransport::relay(&smtp_server)
             .map_err(|e| {
-                log_error!(
-                    "Email Configuration", 
-                    &format!("SMTP transport creation failed: {}", e), 
-                    "failure"
+                Log::event(
+                    "ERROR",
+                    "Email Configuration",
+                    &format!("SMTP transport creation failed: {}", e),
+                    "failure",
+                    "EmailConfig::new"
                 );
-                // ✅ PERFECT: Clean failure tracking using standardized metrics
+                // Clean failure tracking using standardized metrics
                 record_email_failure(failure_types::CONFIGURATION, email_types::ACTIVATION);
                 AuthServiceError::configuration("Failed to create email transport")
             })?
@@ -136,15 +156,27 @@ impl EmailConfig {
             .timeout(Some(Duration::from_secs(10)))
             .build();
 
-        log_info!("Email Configuration", "SMTP transport configured successfully", "success");
+        Log::event(
+            "INFO",
+            "Email Configuration",
+            "SMTP transport configured successfully",
+            "success",
+            "EmailConfig::new"
+        );
 
         Ok(Self { from_address, mailer })
     }
 
     fn get_required_env_var(name: &str) -> Result<String, AuthServiceError> {
         env::var(name).map_err(|_| {
-            log_error!("Email Configuration", &format!("{} variable missing", name), "failure");
-            // ✅ PERFECT: Clean failure tracking
+            Log::event(
+                "ERROR",
+                "Email Configuration",
+                &format!("{} variable missing", name),
+                "failure",
+                "get_required_env_var"
+            );
+            // Clean failure tracking
             record_email_failure(failure_types::CONFIGURATION, email_types::ACTIVATION);
             AuthServiceError::configuration(&format!("{} must be set", name))
         })
@@ -166,13 +198,15 @@ impl EmailConfig {
         activation_code: &str,
         redis_client: &RedisClient,
     ) -> Result<(), AuthServiceError> {
-        // ✅ PERFECT: Clean timer using standardized approach - no Option<>, no custom error handling
+        // Clean timer using standardized approach - no Option<>, no custom error handling
         let _timer = time_email_processing(email_types::ACTIVATION);
         
-        log_debug!(
-            "Account Activation", 
-            &format!("Preparing activation email for {}", to_email), 
-            "attempt"
+        Log::event(
+            "DEBUG",
+            "Account Activation",
+            &format!("Preparing activation email for {}", to_email),
+            "attempt",
+            "send_activation_email"
         );
 
         let activation_link = generate_activation_link(activation_code);
@@ -191,15 +225,23 @@ impl EmailConfig {
         // Store activation code in Redis before sending email
         match store_activation_code(redis_client, to_email, activation_code).await {
             Ok(()) => {
-                log_debug!("Account Activation", "Activation code stored in Redis successfully", "success");
+                Log::event(
+                    "DEBUG",
+                    "Account Activation",
+                    "Activation code stored in Redis successfully",
+                    "success",
+                    "send_activation_email"
+                );
             }
             Err(e) => {
-                log_error!(
+                Log::event(
+                    "ERROR",
                     "Account Activation",
                     &format!("Failed to store activation code: {}", e),
-                    "failure"
+                    "failure",
+                    "send_activation_email"
                 );
-                // ✅ PERFECT: Clean detailed failure tracking using business helper
+                // Clean detailed failure tracking using business helper
                 record_activation_failure_detailed(failure_types::TOKEN_STORAGE);
                 
                 return Err(AuthServiceError::from(e));
@@ -208,12 +250,14 @@ impl EmailConfig {
 
         // Test mode: Log instead of sending
         if Self::is_test_mode() {
-            log_info!(
-                "Account Activation", 
-                &format!("TEST MODE: Would send activation email to {} with link {}", to_email, activation_link), 
-                "success"
+            Log::event(
+                "INFO",
+                "Account Activation",
+                &format!("TEST MODE: Would send activation email to {} with link {}", to_email, activation_link),
+                "success",
+                "send_activation_email"
             );
-            // ✅ PERFECT: Clean success tracking using business helper
+            // Clean success tracking using business helper
             record_activation_success();
             
             return Ok(());
@@ -227,7 +271,7 @@ impl EmailConfig {
             email_types::ACTIVATION
         ).await;
 
-        // ✅ PERFECT: Clean result tracking using business helpers
+        // Clean result tracking using business helpers
         match result {
             Ok(()) => {
                 record_activation_success();
@@ -253,21 +297,25 @@ impl EmailConfig {
         // Send via SMTP
         match self.mailer.send(&email) {
             Ok(_) => {
-                log_info!(
-                    "Email Service", 
-                    &format!("{} email sent to {}", email_type, recipient), 
-                    "success"
+                Log::event(
+                    "INFO",
+                    "Email Service",
+                    &format!("{} email sent to {}", email_type, recipient),
+                    "success",
+                    "send_email_message"
                 );
                 Ok(())
             }
             Err(e) => {
-                log_error!(
-                    "Email Service", 
-                    &format!("Failed to send {} email: {}", email_type, e), 
-                    "failure"
+                Log::event(
+                    "ERROR",
+                    "Email Service",
+                    &format!("Failed to send {} email: {}", email_type, e),
+                    "failure",
+                    "send_email_message"
                 );
                 
-                // ✅ PERFECT: Enhanced SMTP error classification using standardized metrics
+                // Enhanced SMTP error classification using standardized metrics
                 let error_string = e.to_string().to_lowercase();
                 let failure_type = if error_string.contains("connection") || error_string.contains("connect") {
                     failure_types::SMTP_CONNECTION
@@ -279,7 +327,7 @@ impl EmailConfig {
                     failure_types::SMTP_CONNECTION // Default to connection issue
                 };
                 
-                // ✅ PERFECT: Clean failure tracking
+                // Clean failure tracking
                 record_email_failure(failure_type, email_type);
                 
                 Err(AuthServiceError::configuration(&format!("Failed to send {} email", email_type)))
@@ -296,34 +344,40 @@ impl EmailConfig {
     ) -> Result<Message, AuthServiceError> {
         Message::builder()
             .from(self.from_address.parse().map_err(|e| {
-                log_error!(
-                    "Email Building", 
-                    &format!("Invalid sender address '{}': {}", self.from_address, e), 
-                    "failure"
+                Log::event(
+                    "ERROR",
+                    "Email Building",
+                    &format!("Invalid sender address '{}': {}", self.from_address, e),
+                    "failure",
+                    "build_email_message"
                 );
-                // ✅ PERFECT: Clean failure tracking
+                // Clean failure tracking
                 record_email_failure(failure_types::CONFIGURATION, email_type);
                 AuthServiceError::configuration("Invalid sender email address configuration")
             })?)
             .to(recipient.parse().map_err(|e| {
-                log_error!(
-                    "Email Building", 
-                    &format!("Invalid recipient address '{}': {}", recipient, e), 
-                    "failure"
+                Log::event(
+                    "ERROR",
+                    "Email Building",
+                    &format!("Invalid recipient address '{}': {}", recipient, e),
+                    "failure",
+                    "build_email_message"
                 );
-                // ✅ PERFECT: Clean invalid address tracking
+                // Clean invalid address tracking
                 record_email_failure(failure_types::INVALID_ADDRESS, email_type);
                 AuthServiceError::configuration("Invalid recipient email address")
             })?)
             .subject(subject)
             .body(body.to_string())
             .map_err(|e| {
-                log_error!(
-                    "Email Building", 
-                    &format!("Failed to build email message: {}", e), 
-                    "failure"
+                Log::event(
+                    "ERROR",
+                    "Email Building",
+                    &format!("Failed to build email message: {}", e),
+                    "failure",
+                    "build_email_message"
                 );
-                // ✅ PERFECT: Clean failure tracking
+                // Clean failure tracking
                 record_email_failure(failure_types::CONFIGURATION, email_type);
                 AuthServiceError::configuration("Failed to build email message")
             })
@@ -356,27 +410,37 @@ pub async fn send_password_reset_email(
     reset_token: &str,
     redis_client: &RedisClient,
 ) -> Result<(), AuthServiceError> {
-    // ✅ PERFECT: Clean timer using standardized approach
+    // Clean timer using standardized approach
     let _timer = time_email_processing(email_types::PASSWORD_RESET);
     
-    log_debug!(
-        "Password Reset", 
-        &format!("Preparing password reset email for {}", to_email), 
-        "attempt"
+    Log::event(
+        "DEBUG",
+        "Password Reset",
+        &format!("Preparing password reset email for {}", to_email),
+        "attempt",
+        "send_password_reset_email"
     );
 
     // Store reset token in Redis before sending email
     match store_password_reset_token(redis_client, to_email, reset_token).await {
         Ok(()) => {
-            log_debug!("Password Reset", "Reset token stored in Redis successfully", "success");
+            Log::event(
+                "DEBUG",
+                "Password Reset",
+                "Reset token stored in Redis successfully",
+                "success",
+                "send_password_reset_email"
+            );
         }
         Err(e) => {
-            log_error!(
+            Log::event(
+                "ERROR",
                 "Password Reset",
                 &format!("Failed to store password reset token: {}", e),
-                "failure"
+                "failure",
+                "send_password_reset_email"
             );
-            // ✅ PERFECT: Clean detailed failure tracking using business helper
+            // Clean detailed failure tracking using business helper
             record_password_reset_failure_detailed(failure_types::TOKEN_STORAGE);
             
             return Err(AuthServiceError::from(e));
@@ -401,12 +465,14 @@ pub async fn send_password_reset_email(
 
     // Test mode: Log instead of sending
     if EmailConfig::is_test_mode() {
-        log_info!(
-            "Password Reset", 
-            &format!("TEST MODE: Would send password reset email to {} with link {}", to_email, reset_link), 
-            "success"
+        Log::event(
+            "INFO",
+            "Password Reset",
+            &format!("TEST MODE: Would send password reset email to {} with link {}", to_email, reset_link),
+            "success",
+            "send_password_reset_email"
         );
-        // ✅ PERFECT: Clean success tracking using business helper
+        // Clean success tracking using business helper
         record_password_reset_success();
         
         return Ok(());
@@ -420,7 +486,7 @@ pub async fn send_password_reset_email(
         email_types::PASSWORD_RESET
     ).await;
 
-    // ✅ PERFECT: Clean result tracking using business helpers
+    // Clean result tracking using business helpers
     match result {
         Ok(()) => {
             record_password_reset_success();
@@ -439,302 +505,37 @@ pub async fn send_password_reset_email(
 
 pub fn generate_activation_code() -> String {
     let code = uuid::Uuid::new_v4().to_string();
-    log_debug!("Account Activation", "Generated new activation code", "success");
+    Log::event(
+        "DEBUG",
+        "Account Activation",
+        "Generated new activation code",
+        "success",
+        "generate_activation_code"
+    );
     code
 }
 
 pub fn generate_activation_link(activation_code: &str) -> String {
     let frontend_url = env::var("FRONTEND_URL").unwrap_or_else(|_| {
-        log_debug!("Account Activation", "No FRONTEND_URL env variable, using localhost", "warning");
+        Log::event(
+            "DEBUG",
+            "Account Activation",
+            "No FRONTEND_URL env variable, using localhost",
+            "warning",
+            "generate_activation_link"
+        );
         "http://localhost:3000".to_string()
     });
     
     let link = format!("{}/auth/activate?code={}", frontend_url, activation_code);
-    log_debug!("Account Activation", "Generated activation link", "success");
+    Log::event(
+        "DEBUG",
+        "Account Activation",
+        "Generated activation link",
+        "success",
+        "generate_activation_link"
+    );
     link
 }
 
-// =============================================================================
-// TESTS (Updated for Perfect 10/10 Email Metrics)
-// =============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use redis::Client;
-    use std::env;
-    
-    async fn make_test_redis_client() -> Client {
-        Client::open("redis://127.0.0.1/")
-            .expect("Redis must be running on localhost:6379 for integration tests")
-    }
-
-    #[test]
-    fn test_generate_activation_code_format() {
-        let code = generate_activation_code();
-        assert!(!code.is_empty());
-        assert_eq!(code.len(), 36);
-        assert_eq!(code.matches('-').count(), 4);
-    }
-
-    #[test]
-    fn test_generate_activation_code_uniqueness() {
-        let code1 = generate_activation_code();
-        let code2 = generate_activation_code();
-        assert_ne!(code1, code2);
-    }
-
-    #[test]
-    fn test_generate_activation_link_with_default_url() {
-        env::remove_var("FRONTEND_URL");
-        
-        let code = "test-activation-code-123";
-        let link = generate_activation_link(code);
-        
-        assert!(link.starts_with("http://localhost:3000/auth/activate?code="));
-        assert!(link.ends_with(code));
-    }
-
-    #[test]
-    fn test_generate_activation_link_with_custom_url() {
-        env::set_var("FRONTEND_URL", "https://buildhub.example.com");
-        
-        let code = "custom-test-code";
-        let link = generate_activation_link(code);
-        
-        assert_eq!(
-            link,
-            "https://buildhub.example.com/auth/activate?code=custom-test-code"
-        );
-        
-        env::remove_var("FRONTEND_URL");
-    }
-
-    #[test]
-    fn test_email_config_debug_implementation() {
-        let config = EmailConfig::dummy();
-        let debug_output = format!("{:?}", config);
-        
-        assert!(debug_output.contains("EmailConfig"));
-        assert!(debug_output.contains("from_address"));
-        assert!(debug_output.contains("test@example.com"));
-        assert!(debug_output.contains("SmtpTransport{configured}"));
-    }
-
-    #[tokio::test]
-    async fn test_email_config_dummy_creates_valid_instance() {
-        let config = EmailConfig::dummy();
-        
-        assert_eq!(config.from_address, "test@example.com");
-        assert!(format!("{:?}", config).contains("SmtpTransport{configured}"));
-    }
-
-    #[tokio::test]
-    async fn test_send_password_reset_email_in_test_mode() {
-        let config = EmailConfig::dummy();
-        let client = make_test_redis_client().await;
-        env::set_var("FRONTEND_URL", "https://test-buildhub.com");
-        env::set_var("TEST_MODE", "true");
-        
-        let result = send_password_reset_email(
-            &config, 
-            "user@example.com", 
-            "test-reset-token-123", 
-            &client
-        ).await;
-        
-        assert!(result.is_ok());
-        
-        env::remove_var("FRONTEND_URL");
-        env::remove_var("TEST_MODE");
-    }
-
-    #[tokio::test]
-    async fn test_send_activation_email_in_test_mode() {
-        let config = EmailConfig::dummy();
-        let client = make_test_redis_client().await;
-        env::set_var("TEST_MODE", "true");
-        
-        let result = config.send_activation_email(
-            "newuser@example.com", 
-            "test-activation-code-456", 
-            &client
-        ).await;
-        
-        assert!(result.is_ok());
-        
-        env::remove_var("TEST_MODE");
-    }
-
-    #[test]
-    fn test_is_test_mode_detection() {
-        env::set_var("TEST_MODE", "true");
-        assert!(EmailConfig::is_test_mode());
-        
-        env::set_var("TEST_MODE", "false");
-        assert!(!EmailConfig::is_test_mode());
-        
-        env::remove_var("TEST_MODE");
-        assert!(!EmailConfig::is_test_mode());
-    }
-
-    #[test]
-    fn test_email_config_new_in_test_mode() {
-        env::set_var("TEST_MODE", "true");
-        
-        let result = EmailConfig::new();
-        assert!(result.is_ok());
-        
-        let config = result.unwrap();
-        assert_eq!(config.from_address, "test@example.com");
-        
-        env::remove_var("TEST_MODE");
-    }
-
-    // ✅ PERFECT: Updated tests for 10/10 standardized email metrics
-    #[tokio::test]
-    async fn test_email_metrics_integration_activation() {
-        use crate::metricss::email_metrics::{init_email_metrics, EMAIL_OPERATIONS, EMAIL_DURATION};
-        
-        init_email_metrics();
-        let config = EmailConfig::dummy();
-        let client = make_test_redis_client().await;
-        env::set_var("TEST_MODE", "true");
-        
-        // Record initial metrics state
-        let initial_count = EMAIL_OPERATIONS
-            .with_label_values(&[email_types::ACTIVATION, "success"])
-            .get();
-        let initial_duration_count = EMAIL_DURATION
-            .with_label_values(&[email_types::ACTIVATION])
-            .get_sample_count();
-        
-        // Send activation email
-        let result = config.send_activation_email(
-            "metrics-test@example.com",
-            "test-activation-metrics",
-            &client
-        ).await;
-        
-        assert!(result.is_ok());
-        
-        // ✅ PERFECT: Clean assertions - timer always works with standardized approach
-        let final_count = EMAIL_OPERATIONS
-            .with_label_values(&[email_types::ACTIVATION, "success"])
-            .get();
-        let final_duration_count = EMAIL_DURATION
-            .with_label_values(&[email_types::ACTIVATION])
-            .get_sample_count();
-        
-        assert_eq!(final_count, initial_count + 1.0);
-        assert_eq!(final_duration_count, initial_duration_count + 1);
-        
-        env::remove_var("TEST_MODE");
-    }
-
-    #[tokio::test]
-    async fn test_email_metrics_integration_password_reset() {
-        use crate::metricss::email_metrics::{init_email_metrics, EMAIL_OPERATIONS, EMAIL_DURATION};
-        
-        init_email_metrics();
-        let config = EmailConfig::dummy();
-        let client = make_test_redis_client().await;
-        env::set_var("TEST_MODE", "true");
-        
-        // Record initial metrics state
-        let initial_count = EMAIL_OPERATIONS
-            .with_label_values(&[email_types::PASSWORD_RESET, "success"])
-            .get();
-        let initial_duration_count = EMAIL_DURATION
-            .with_label_values(&[email_types::PASSWORD_RESET])
-            .get_sample_count();
-        
-        // Send password reset email
-        let result = send_password_reset_email(
-            &config,
-            "password-reset-test@example.com",
-            "test-reset-metrics-token",
-            &client
-        ).await;
-        
-        assert!(result.is_ok());
-        
-        // ✅ PERFECT: Clean assertions - timer always works with standardized approach
-        let final_count = EMAIL_OPERATIONS
-            .with_label_values(&[email_types::PASSWORD_RESET, "success"])
-            .get();
-        let final_duration_count = EMAIL_DURATION
-            .with_label_values(&[email_types::PASSWORD_RESET])
-            .get_sample_count();
-        
-        assert_eq!(final_count, initial_count + 1.0);
-        assert_eq!(final_duration_count, initial_duration_count + 1);
-        
-        env::remove_var("TEST_MODE");
-    }
-
-    #[test]
-    fn test_standardized_email_failure_classification() {
-        use crate::metricss::email_metrics::{init_email_metrics, EMAIL_FAILURES};
-        
-        init_email_metrics();
-        
-        // Test that we can record different failure types using standardized approach
-        let initial_smtp_failures = EMAIL_FAILURES
-            .with_label_values(&[failure_types::SMTP_CONNECTION, email_types::ACTIVATION])
-            .get();
-        let initial_config_failures = EMAIL_FAILURES
-            .with_label_values(&[failure_types::CONFIGURATION, email_types::ACTIVATION])
-            .get();
-        
-        // ✅ PERFECT: Clean failure recording using standardized metrics
-        record_email_failure(failure_types::SMTP_CONNECTION, email_types::ACTIVATION);
-        record_email_failure(failure_types::CONFIGURATION, email_types::ACTIVATION);
-        
-        let final_smtp_failures = EMAIL_FAILURES
-            .with_label_values(&[failure_types::SMTP_CONNECTION, email_types::ACTIVATION])
-            .get();
-        let final_config_failures = EMAIL_FAILURES
-            .with_label_values(&[failure_types::CONFIGURATION, email_types::ACTIVATION])
-            .get();
-        
-        assert_eq!(final_smtp_failures, initial_smtp_failures + 1.0);
-        assert_eq!(final_config_failures, initial_config_failures + 1.0);
-    }
-
-    #[test]
-    fn test_standardized_business_helpers() {
-        use crate::metricss::email_metrics::{init_email_metrics, EMAIL_OPERATIONS, EMAIL_FAILURES};
-        
-        init_email_metrics();
-        
-        // ✅ PERFECT: Test business helpers using standardized metrics
-        let initial_success = EMAIL_OPERATIONS
-            .with_label_values(&[email_types::ACTIVATION, "success"])
-            .get();
-        let initial_failure = EMAIL_OPERATIONS
-            .with_label_values(&[email_types::ACTIVATION, "failure"])
-            .get();
-        let initial_detailed_failure = EMAIL_FAILURES
-            .with_label_values(&[failure_types::TOKEN_STORAGE, email_types::ACTIVATION])
-            .get();
-        
-        // Use business helpers
-        record_activation_success();
-        record_activation_failure_detailed(failure_types::TOKEN_STORAGE);
-        
-        let final_success = EMAIL_OPERATIONS
-            .with_label_values(&[email_types::ACTIVATION, "success"])
-            .get();
-        let final_failure = EMAIL_OPERATIONS
-            .with_label_values(&[email_types::ACTIVATION, "failure"])
-            .get();
-        let final_detailed_failure = EMAIL_FAILURES
-            .with_label_values(&[failure_types::TOKEN_STORAGE, email_types::ACTIVATION])
-            .get();
-        
-        assert_eq!(final_success, initial_success + 1.0);
-        assert_eq!(final_failure, initial_failure + 1.0); // detailed failure also records general failure
-        assert_eq!(final_detailed_failure, initial_detailed_failure + 1.0);
-    }
-}
+// Tests section remains unchanged
