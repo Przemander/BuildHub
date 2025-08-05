@@ -7,19 +7,19 @@
 //! - Activation code generation and storage in Redis
 //! - Email delivery for account activation
 //! - Unified error handling with structured observability
-//! - **Full observability through 10/10 standardized registration metrics**
+//! - Full OpenTelemetry integrated tracing with hierarchical spans
 
 use crate::{
     app::AppState,
     config::redis::store_activation_code,
     db::users::{RegisterData, User},
-    log_info, log_warn,
     utils::{
-        email::{generate_activation_code, EmailConfig},
+        email::generate_activation_code,
         error_new::AuthServiceError,
         validators::{validate_email, validate_password, validate_username},
+        log_new::Log,
+        telemetry::{db_operation_span, business_operation_span, SpanExt},
     },
-    // ✅ PERFECT: Import our brand new 10/10 registration metrics
     metricss::register_metrics::{
         // High-level complete flow tracking
         time_complete_registration_flow, record_registration_success, record_registration_failure,
@@ -30,168 +30,406 @@ use crate::{
         record_activation_setup_success, record_activation_setup_failure,
         record_email_delivery_success, record_email_delivery_failure,
         // Type-safe constants
-        error_types, // ✅ FIXED: Removed unused `steps` import
+        error_types,
     },
 };
 use axum::{http::StatusCode, response::IntoResponse, Json};
 use redis::Client as RedisClient;
 use serde_json::json;
+use tracing::Instrument;
 
-/// Processes registration using the unified error system with complete 10/10 metrics integration.
-///
-/// # Metrics Generated
-/// - `registration_operations_total{step="complete_flow|validation|uniqueness_check|user_creation|activation_setup|email_delivery", result="success|failure"}`
-/// - `registration_failures_total{step="...", error_type="invalid_email|weak_password|email_taken|database_error|smtp_error|..."}`
-/// - `registration_duration_seconds{step="complete_flow|validation|uniqueness_check|user_creation|activation_setup|email_delivery"}` (using LATENCY_BUCKETS_MEDIUM)
-///
-/// # Parameters
-/// * `app_state` - Application state containing DB pool, Redis client, and email config
-/// * `data` - Registration data from the client request
-///
-/// # Returns
-/// Result that can be converted to HTTP response via unified error system
-///
-/// # Flow with Complete Metrics Tracking
-/// 1. **Start complete flow timer** - Overall registration performance
-/// 2. **Validate dependencies** (Email config, Redis) - Configuration validation
-/// 3. **Validate input fields** (username, email, password) - Input validation metrics
-/// 4. **Check uniqueness** (email, username) - Uniqueness check metrics with database timing
-/// 5. **Create inactive user** in database - User creation metrics with database timing
-/// 6. **Generate and store activation code** - Activation setup metrics with Redis timing
-/// 7. **Send activation email** - Email delivery metrics with SMTP timing
-/// 8. **Record complete success** - Overall flow completion tracking
+/// Processes registration using the unified error system with complete tracing integration.
 pub async fn process_registration(
     app_state: &AppState,
     data: RegisterData,
 ) -> Result<impl IntoResponse, AuthServiceError> {
-    // ✅ PERFECT: Start complete registration flow timer for end-to-end performance monitoring
+    // Start complete registration flow timer for end-to-end performance monitoring
     let _complete_flow_timer = time_complete_registration_flow();
+
+    // Create span for the entire registration processing flow
+    let process_span = business_operation_span("process_registration");
+    process_span.record("username", &data.username);
+    process_span.record("email_domain", &data.email.split('@').nth(1).unwrap_or("invalid"));
     
-    log_info!(
+    // Clone span before moving it into the async block
+    let process_span_clone = process_span.clone();
+    
+    Log::event(
+        "INFO",
         "Registration", 
         &format!("Starting registration for username: {}, email: {}", data.username, data.email), 
-        "registration_start"
+        "registration_start",
+        "process_registration"
     );
 
-    // ✅ Step 1: Check required dependencies (configuration validation)
-    let email_cfg = app_state
-        .email_config
-        .as_ref()
-        .ok_or_else(|| {
-            record_registration_failure(); // Record overall failure
-            AuthServiceError::configuration("Email configuration not available")
-        })?
-        .clone();
+    // Wrap registration logic in the process_span
+    async move {
+        // Step 1: Check required dependencies (configuration validation)
+        let email_cfg = app_state
+            .email_config
+            .as_ref()
+            .ok_or_else(|| {
+                record_registration_failure();
+                process_span.record("business.result", &"failure");
+                process_span.record("failure_reason", &"missing_email_config");
+                
+                Log::event(
+                    "ERROR",
+                    "Registration",
+                    "Email configuration not available",
+                    "configuration_error",
+                    "process_registration"
+                );
+                
+                AuthServiceError::configuration("Email configuration not available")
+            })?
+            .clone();
 
-    let redis_client = app_state
-        .redis_client
-        .as_ref()
-        .ok_or_else(|| {
-            record_registration_failure(); // Record overall failure
-            AuthServiceError::configuration("Redis client not available")
-        })?;
+        let redis_client = app_state
+            .redis_client
+            .as_ref()
+            .ok_or_else(|| {
+                record_registration_failure();
+                process_span.record("business.result", &"failure");
+                process_span.record("failure_reason", &"missing_redis_client");
+                
+                Log::event(
+                    "ERROR",
+                    "Registration",
+                    "Redis client not available",
+                    "configuration_error",
+                    "process_registration"
+                );
+                
+                AuthServiceError::configuration("Redis client not available")
+            })?;
 
-    // ✅ Step 2: Validate input fields with detailed step metrics
-    log_info!("Registration", "Starting input validation", "validation_start");
-    
-    match validate_all_inputs(&data.username, &data.email, &data.password) {
-        Ok(()) => {
-            record_validation_success();
-            log_info!("Registration", "All input validation successful", "validation_success");
-        }
-        Err(e) => {
-            // Categorize validation failure for detailed monitoring
-            let error_type = categorize_validation_error(&e);
-            record_validation_failure(error_type);
-            record_registration_failure(); // Also record overall failure
-            
-            log_warn!("Registration", &format!("Input validation failed: {}", e), "validation_failure");
-            return Err(e);
-        }
-    }
-
-    // ✅ Step 3: Get database connection and check uniqueness with metrics
-    let mut conn = app_state.pool.get().map_err(|e| {
-        record_uniqueness_check_failure(error_types::DATABASE_ERROR);
-        record_registration_failure();
-        log_warn!("Registration", &format!("Failed to get database connection: {}", e), "db_connection_failure");
-        e
-    })?;
-
-    log_info!("Registration", "Starting uniqueness checks", "uniqueness_check_start");
-
-    match check_uniqueness(&mut conn, &data.email, &data.username) {
-        Ok(()) => {
-            record_uniqueness_check_success();
-            log_info!("Registration", "Uniqueness checks passed", "uniqueness_check_success");
-        }
-        Err(e) => {
-            // Categorize uniqueness failure for detailed monitoring
-            let error_type = if e.to_string().contains("email") {
-                error_types::EMAIL_TAKEN
-            } else {
-                error_types::USERNAME_TAKEN
-            };
-            record_uniqueness_check_failure(error_type);
-            record_registration_failure(); // Also record overall failure
-            
-            log_warn!("Registration", &format!("Uniqueness check failed: {}", e), "uniqueness_check_failure");
-            return Err(e);
-        }
-    }
-
-    // ✅ Step 4: Create inactive user with database metrics
-    log_info!("Registration", "Creating user record", "user_creation_start");
-    
-    match create_inactive_user(&mut conn, &data.username, &data.email, &data.password) {
-        Ok(user) => {
-            record_user_creation_success();
-            log_info!(
-                "Registration", 
-                &format!("User created successfully: {}", data.username), 
-                "user_created"
-            );
-            
-            // ✅ Step 5: Generate and store activation code + send email
-            match create_and_send_activation(&user, redis_client, &email_cfg).await {
+        // Step 2: Validate input fields with spans and metrics
+        let validation_span = business_operation_span("input_validation");
+        let validation_span_clone = validation_span.clone();
+        
+        Log::event(
+            "INFO",
+            "Registration", 
+            "Starting input validation", 
+            "validation_start",
+            "process_registration"
+        );
+        
+        let validation_result = async {
+            match validate_all_inputs(&data.username, &data.email, &data.password) {
                 Ok(()) => {
-                    // ✅ PERFECT: Complete success - record overall success
-                    record_registration_success();
-                    log_info!(
+                    record_validation_success();
+                    validation_span.record("business.result", &"success");
+                    
+                    Log::event(
+                        "INFO",
                         "Registration", 
-                        &format!("Registration completed successfully for: {}", data.username), 
-                        "registration_success"
+                        "All input validation successful", 
+                        "validation_success",
+                        "process_registration"
                     );
-
-                    // Return success response
-                    Ok((
-                        StatusCode::CREATED,
-                        Json(json!({
-                            "status": "success",
-                            "message": "Registration successful! Please check your email to activate your account."
-                        })),
-                    ))
+                    
+                    Ok(())
                 }
                 Err(e) => {
-                    record_registration_failure(); // Record overall failure
-                    log_warn!("Registration", &format!("Activation setup failed: {}", e), "activation_setup_failure");
+                    // Categorize validation failure for detailed monitoring
+                    let error_type = categorize_validation_error(&e);
+                    record_validation_failure(error_type);
+                    record_registration_failure();
+                    validation_span.record("business.result", &"failure");
+                    validation_span.record("failure_reason", &error_type);
+                    validation_span.record_error(&e);
+                    
+                    Log::event(
+                        "WARN",
+                        "Registration", 
+                        &format!("Input validation failed: {}", e), 
+                        "validation_failure",
+                        "process_registration"
+                    );
+                    
                     Err(e)
                 }
             }
-        }
-        Err(e) => {
-            record_user_creation_failure(error_types::DATABASE_ERROR);
-            record_registration_failure(); // Also record overall failure
-            log_warn!("Registration", &format!("Failed to create user: {}", e), "user_creation_failure");
-            Err(e)
-        }
+        }.instrument(validation_span_clone).await;
+        
+        // Early return on validation failure
+        validation_result?;
+
+        // Step 3: Get database connection for further operations
+        let db_conn_span = db_operation_span("get_connection", "pool");
+        let db_conn_span_clone = db_conn_span.clone();
+        
+        let conn_result = async {
+            match app_state.pool.get() {
+                Ok(conn) => {
+                    db_conn_span.record("db.success", &true);
+                    Ok(conn)
+                }
+                Err(e) => {
+                    record_uniqueness_check_failure(error_types::DATABASE_ERROR);
+                    record_registration_failure();
+                    db_conn_span.record("db.success", &false);
+                    db_conn_span.record_error(&e);
+                    
+                    Log::event(
+                        "ERROR",
+                        "Registration", 
+                        &format!("Failed to get database connection: {}", e), 
+                        "db_connection_failure",
+                        "process_registration"
+                    );
+                    
+                    Err(AuthServiceError::database("Database connection failed"))
+                }
+            }
+        }.instrument(db_conn_span_clone).await?;
+        
+        let mut conn = conn_result;
+
+        // Step 4: Check uniqueness with proper span context
+        let uniqueness_span = db_operation_span("check_uniqueness", "users");
+        let uniqueness_span_clone = uniqueness_span.clone();
+        
+        Log::event(
+            "INFO",
+            "Registration", 
+            "Starting uniqueness checks", 
+            "uniqueness_check_start",
+            "process_registration"
+        );
+        
+        let uniqueness_result = async {
+            match check_uniqueness(&mut conn, &data.email, &data.username) {
+                Ok(()) => {
+                    record_uniqueness_check_success();
+                    uniqueness_span.record("db.success", &true);
+                    uniqueness_span.record("business.result", &"success");
+                    
+                    Log::event(
+                        "INFO",
+                        "Registration", 
+                        "Uniqueness checks passed", 
+                        "uniqueness_check_success",
+                        "process_registration"
+                    );
+                    
+                    Ok(())
+                }
+                Err(e) => {
+                    // Categorize uniqueness failure for detailed monitoring
+                    let error_type = if e.to_string().contains("email") {
+                        error_types::EMAIL_TAKEN
+                    } else {
+                        error_types::USERNAME_TAKEN
+                    };
+                    
+                    record_uniqueness_check_failure(error_type);
+                    record_registration_failure();
+                    uniqueness_span.record("db.success", &false);
+                    uniqueness_span.record("business.result", &"failure");
+                    uniqueness_span.record("failure_reason", &error_type);
+                    uniqueness_span.record_error(&e);
+                    
+                    Log::event(
+                        "WARN",
+                        "Registration", 
+                        &format!("Uniqueness check failed: {}", e), 
+                        "uniqueness_check_failure",
+                        "process_registration"
+                    );
+                    
+                    Err(e)
+                }
+            }
+        }.instrument(uniqueness_span_clone).await;
+        
+        // Early return on uniqueness check failure
+        uniqueness_result?;
+
+        // Step 5: Create inactive user with database span
+        let user_creation_span = db_operation_span("create_user", "users");
+        let user_creation_span_clone = user_creation_span.clone();
+        
+        Log::event(
+            "INFO",
+            "Registration", 
+            "Creating user record", 
+            "user_creation_start",
+            "process_registration"
+        );
+        
+        let user_result = async {
+            match create_inactive_user(&mut conn, &data.username, &data.email, &data.password) {
+                Ok(user) => {
+                    record_user_creation_success();
+                    user_creation_span.record("db.success", &true);
+                    user_creation_span.record("business.result", &"success");
+                    
+                    Log::event(
+                        "INFO",
+                        "Registration", 
+                        &format!("User created successfully: {}", data.username), 
+                        "user_created",
+                        "process_registration"
+                    );
+                    
+                    Ok(user)
+                }
+                Err(e) => {
+                    record_user_creation_failure(error_types::DATABASE_ERROR);
+                    record_registration_failure();
+                    user_creation_span.record("db.success", &false);
+                    user_creation_span.record("business.result", &"failure");
+                    user_creation_span.record_error(&e);
+                    
+                    Log::event(
+                        "ERROR",
+                        "Registration", 
+                        &format!("Failed to create user: {}", e), 
+                        "user_creation_failure",
+                        "process_registration"
+                    );
+                    
+                    Err(e)
+                }
+            }
+        }.instrument(user_creation_span_clone).await?;
+        
+        let user = user_result;
+
+        // Step 6: Generate and store activation code + send email
+        let activation_span = business_operation_span("activation_setup");
+        let activation_span_clone = activation_span.clone();
+        
+        Log::event(
+            "INFO",
+            "Registration", 
+            "Starting activation setup", 
+            "activation_setup_start",
+            "process_registration"
+        );
+        
+        let activation_result = async {
+            match setup_user_activation(&user, redis_client).await {
+                Ok(code) => {
+                    record_activation_setup_success();
+                    activation_span.record("business.result", &"success");
+                    
+                    Log::event(
+                        "INFO",
+                        "Registration", 
+                        &format!("Activation code generated and stored for: {}", user.email), 
+                        "activation_setup_success",
+                        "process_registration"
+                    );
+                    
+                    // Step 7: Send activation email (non-fatal)
+                    let email_span = business_operation_span("email_delivery");
+                    let email_span_clone = email_span.clone();
+                    
+                    async {
+                        Log::event(
+                            "INFO",
+                            "Registration", 
+                            "Starting email delivery", 
+                            "email_delivery_start",
+                            "process_registration"
+                        );
+                        
+                        match email_cfg.send_activation_email(&user.email, &code, redis_client).await {
+                            Ok(()) => {
+                                record_email_delivery_success();
+                                email_span.record("business.result", &"success");
+                                
+                                Log::event(
+                                    "INFO",
+                                    "Registration", 
+                                    &format!("Activation email sent successfully to: {}", user.email), 
+                                    "activation_email_sent",
+                                    "process_registration"
+                                );
+                            }
+                            Err(e) => {
+                                // Categorize email failure for better monitoring
+                                let error_type = if e.to_string().contains("SMTP") || e.to_string().contains("connection") {
+                                    error_types::SMTP_ERROR
+                                } else {
+                                    error_types::CONFIGURATION_ERROR
+                                };
+                                
+                                record_email_delivery_failure(error_type);
+                                email_span.record("business.result", &"failure");
+                                email_span.record("failure_reason", &error_type);
+                                email_span.record_error(&e);
+                                
+                                Log::event(
+                                    "WARN",
+                                    "Registration", 
+                                    &format!("Failed to send activation email to {}: {}", user.email, e), 
+                                    "activation_email_failed",
+                                    "process_registration"
+                                );
+                                // Continue without failing - user is registered, they can resend activation
+                            }
+                        }
+                    }.instrument(email_span_clone).await;
+                    
+                    Ok(())
+                }
+                Err(e) => {
+                    record_activation_setup_failure(error_types::REDIS_ERROR);
+                    record_registration_failure();
+                    activation_span.record("business.result", &"failure");
+                    activation_span.record("failure_reason", &"redis_error");
+                    activation_span.record_error(&e);
+                    
+                    Log::event(
+                        "ERROR",
+                        "Registration", 
+                        &format!("Failed activation setup for {}: {}", user.email, e), 
+                        "activation_setup_failed",
+                        "process_registration"
+                    );
+                    
+                    Err(AuthServiceError::from(e))
+                }
+            }
+        }.instrument(activation_span_clone).await;
+        
+        // Handle activation setup result
+        activation_result?;
+
+        // Success - record final success metrics
+        record_registration_success();
+        process_span.record("business.result", &"success");
+        process_span.record("user.id", &user.username);
+        
+        Log::event(
+            "INFO",
+            "Registration", 
+            &format!("Registration completed successfully for: {}", data.username), 
+            "registration_success",
+            "process_registration"
+        );
+
+        // Return success response
+        Ok((
+            StatusCode::CREATED,
+            Json(json!({
+                "status": "success",
+                "message": "Registration successful! Please check your email to activate your account."
+            })),
+        ))
     }
+    .instrument(process_span_clone)
+    .await
 }
 
+// Pozostałe funkcje pomocnicze - bez większych zmian, poza usunięciem log_info! i log_warn!
 /// Helper function to validate all inputs (grouped for cleaner metrics)
 fn validate_all_inputs(username: &str, email: &str, password: &str) -> Result<(), AuthServiceError> {
-    // All validation functions already have their own detailed metrics from validation_metrics.rs
-    // This provides step-level aggregation
     validate_username(username)?;
     validate_email(email)?;
     validate_password(password)?;
@@ -202,21 +440,11 @@ fn validate_all_inputs(username: &str, email: &str, password: &str) -> Result<()
 fn check_uniqueness(conn: &mut diesel::r2d2::PooledConnection<diesel::r2d2::ConnectionManager<diesel::SqliteConnection>>, email: &str, username: &str) -> Result<(), AuthServiceError> {
     // Check email uniqueness
     if User::find_by_email(conn, email).is_ok() {
-        log_warn!(
-            "Registration", 
-            &format!("Registration attempt with existing email: {}", email), 
-            "email_already_exists"
-        );
         return Err(AuthServiceError::validation("email", "Email address is already registered"));
     }
 
     // Check username uniqueness
     if User::find_by_username(conn, username).is_ok() {
-        log_warn!(
-            "Registration", 
-            &format!("Registration attempt with existing username: {}", username), 
-            "username_already_exists"
-        );
         return Err(AuthServiceError::validation("username", "Username is already taken"));
     }
 
@@ -236,99 +464,15 @@ fn create_inactive_user(
     Ok(user)
 }
 
-/// Helper function to generate activation code, store it, and send email with complete step metrics.
-async fn create_and_send_activation(
-    user: &User,
-    redis_client: &RedisClient,
-    email_cfg: &EmailConfig,
-) -> Result<(), AuthServiceError> {
-    // ✅ Step 5a: Generate and store activation code with metrics
-    log_info!("Registration", "Starting activation setup", "activation_setup_start");
-    
-    match setup_user_activation(user, redis_client).await {
-        Ok(code) => {
-            record_activation_setup_success();
-            log_info!(
-                "Registration", 
-                &format!("Activation code generated and stored for: {}", user.email), 
-                "activation_setup_success"
-            );
-            
-            // ✅ Step 5b: Send activation email with metrics (non-fatal)
-            send_activation_email_with_metrics(user, &code, email_cfg, redis_client).await;
-            Ok(())
-        }
-        Err(e) => {
-            record_activation_setup_failure(error_types::REDIS_ERROR);
-            log_warn!(
-                "Registration", 
-                &format!("Failed activation setup for {}: {}", user.email, e), 
-                "activation_setup_failed"
-            );
-            Err(AuthServiceError::from(e))
-        }
-    }
-}
-
 /// Helper to setup activation code with Redis storage
 async fn setup_user_activation(user: &User, redis_client: &RedisClient) -> Result<String, AuthServiceError> {
     // Generate activation code
     let code = generate_activation_code();
     
-    log_info!(
-        "Registration", 
-        &format!("Generated activation code for user: {}", user.email), 
-        "activation_code_generated"
-    );
-
     // Store activation code in Redis
     store_activation_code(redis_client, &user.email, &code).await?;
     
-    log_info!(
-        "Registration", 
-        &format!("Activation code stored for user: {}", user.email), 
-        "activation_code_stored"
-    );
-
     Ok(code)
-}
-
-/// Helper to send activation email with detailed metrics (non-fatal)
-async fn send_activation_email_with_metrics(
-    user: &User, 
-    code: &str, 
-    email_cfg: &EmailConfig, 
-    redis_client: &RedisClient
-) {
-    log_info!("Registration", "Starting email delivery", "email_delivery_start");
-    
-    // Send activation email (non-fatal - log but don't fail registration)
-    match email_cfg.send_activation_email(&user.email, code, redis_client).await {
-        Ok(()) => {
-            record_email_delivery_success();
-            log_info!(
-                "Registration", 
-                &format!("Activation email sent successfully to: {}", user.email), 
-                "activation_email_sent"
-            );
-        }
-        Err(e) => {
-            // Categorize email failure for better monitoring
-            let error_type = if e.to_string().contains("SMTP") || e.to_string().contains("connection") {
-                error_types::SMTP_ERROR
-            } else {
-                error_types::CONFIGURATION_ERROR
-            };
-            
-            record_email_delivery_failure(error_type);
-            log_warn!(
-                "Registration", 
-                &format!("Failed to send activation email to {}: {}", user.email, e), 
-                "activation_email_failed"
-            );
-            // Continue without failing - user is registered, they can resend activation
-        }
-    }
 }
 
 /// Categorizes validation errors for detailed metrics tracking

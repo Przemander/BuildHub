@@ -13,17 +13,19 @@
 //! - Password strength validation
 //! - Comprehensive audit logging
 //! - Unified error handling with automatic HTTP response conversion
+//! - Complete OpenTelemetry observability with hierarchical spans
 
 use crate::{
     app::AppState,
-    config::redis::{verify_reset_token, invalidate_reset_token}, // ← POPRAWKA: Z config/redis.rs
+    config::redis::{verify_reset_token, invalidate_reset_token},
     db::users::User,
     utils::{
         email::send_password_reset_email,
         error_new::AuthServiceError,
         validators::validate_password,
+        log_new::Log,
+        telemetry::{business_operation_span, db_operation_span, redis_operation_span, SpanExt},
     },
-    log_info, log_warn,
     // Import password reset metrics
     metricss::password_metrics::{
         time_complete_request_flow, record_request_success, record_request_failure,
@@ -45,12 +47,13 @@ use base64::{engine::general_purpose, Engine as _};
 use rand::{rngs::OsRng, RngCore};
 use redis::AsyncCommands;
 use serde_json::json;
+use tracing::Instrument;
 
 /// Token time-to-live in seconds (30 minutes)
 const RESET_TOKEN_TTL_SECS: usize = 60 * 30;
 
 /// Redis key prefix for password reset tokens
-pub const REDIS_KEY_PREFIX: &str = "password_reset:token:"; // ← POPRAWKA: Dopasowane do config/redis.rs
+pub const REDIS_KEY_PREFIX: &str = "password_reset:token:";
 
 /// Processes a password reset link request using the unified error system.
 ///
@@ -64,108 +67,323 @@ pub const REDIS_KEY_PREFIX: &str = "password_reset:token:"; // ← POPRAWKA: Dop
 /// # Security Note
 /// Always returns 200 OK even if the email doesn't exist to prevent
 /// user enumeration attacks. The actual email is only sent if the email exists.
-///
-/// # Flow with Metrics
-/// 1. Start complete request timer
-/// 2. Check Redis client
-/// 3. Get database connection and look up user
-/// 4. Generate and store token if user exists
-/// 5. Send email if configured
-/// 6. Record complete success (always, due to anti-enumeration)
 pub async fn process_password_reset_request(
     app_state: &AppState,
     email: &str,
 ) -> Result<impl IntoResponse, AuthServiceError> {
     // Start complete request flow timer
     let _request_timer = time_complete_request_flow();
+    
+    // Create span for the entire request processing flow
+    let process_span = business_operation_span("process_password_reset_request");
+    
+    // Add masked email domain for context without exposing PII
+    if let Some(domain) = email.split('@').nth(1) {
+        process_span.record("email_domain", &domain);
+    }
+    
+    // Clone span before moving it into the async block
+    let process_span_clone = process_span.clone();
 
-    log_info!(
-        "Auth", 
+    Log::event(
+        "INFO",
+        "Password Reset", 
         "Starting password reset request", 
-        "reset_request_start"
+        "reset_request_start",
+        "process_password_reset_request"
     );
 
-    // Step 1: Check Redis client with metrics
-    let redis_client = match &app_state.redis_client {
-        Some(client) => {
-            record_redis_check_success();
-            client
+    // Wrap request logic in the process_span
+    async move {
+        // Step 1: Check Redis client with span and metrics
+        let redis_check_span = business_operation_span("check_redis_client");
+        let redis_check_span_clone = redis_check_span.clone();
+        
+        let redis_client = async {
+            match &app_state.redis_client {
+                Some(client) => {
+                    record_redis_check_success();
+                    redis_check_span.record("business.result", &"success");
+                    
+                    Log::event(
+                        "INFO",
+                        "Password Reset", 
+                        "Redis client available", 
+                        "redis_check_success",
+                        "process_password_reset_request"
+                    );
+                    
+                    Ok(client)
+                }
+                None => {
+                    record_redis_check_failure(error_types::REDIS_UNAVAILABLE);
+                    record_request_failure();
+                    redis_check_span.record("business.result", &"failure");
+                    redis_check_span.record("failure_reason", &"redis_unavailable");
+                    
+                    Log::event(
+                        "ERROR",
+                        "Password Reset",
+                        "Redis client not available for password reset operations",
+                        "redis_check_failure",
+                        "process_password_reset_request"
+                    );
+                    
+                    Err(AuthServiceError::configuration("Redis client not available for password reset operations"))
+                }
+            }
         }
-        None => {
-            record_redis_check_failure(error_types::REDIS_UNAVAILABLE);
-            record_request_failure();
-            return Err(AuthServiceError::configuration("Redis client not available for password reset operations"));
+        .instrument(redis_check_span_clone)
+        .await?;
+
+        // Step 2: Get database connection - create span
+        let db_conn_span = db_operation_span("get_connection", "pool");
+        let db_conn_span_clone = db_conn_span.clone();
+        
+        let db_conn = async {
+            match app_state.pool.get() {
+                Ok(conn) => {
+                    db_conn_span.record("db.success", &true);
+                    
+                    Log::event(
+                        "INFO",
+                        "Password Reset", 
+                        "Database connection established", 
+                        "db_connection_success",
+                        "process_password_reset_request"
+                    );
+                    
+                    Ok(conn)
+                }
+                Err(e) => {
+                    db_conn_span.record("db.success", &false);
+                    db_conn_span.record_error(&e);
+                    
+                    Log::event(
+                        "ERROR",
+                        "Password Reset",
+                        &format!("Failed to get database connection: {}", e),
+                        "db_connection_failure",
+                        "process_password_reset_request"
+                    );
+                    
+                    Err(AuthServiceError::database("Failed to get database connection"))
+                }
+            }
         }
-    };
+        .instrument(db_conn_span_clone)
+        .await?;
+        
+        let mut db_conn = db_conn;
 
-    // Step 2: Get database connection - treat as part of user lookup
-    let mut db_conn = app_state.pool.get()?;
+        // Step 3: Look up user by email with span and metrics
+        let user_lookup_span = db_operation_span("find_user", "users.by_email");
+        let user_lookup_span_clone = user_lookup_span.clone();
+        
+        Log::event(
+            "INFO",
+            "Password Reset", 
+            "Looking up user by email", 
+            "user_lookup_start",
+            "process_password_reset_request"
+        );
+        
+        let user_result = async {
+            match User::find_by_email(&mut db_conn, email) {
+                Ok(user) => {
+                    record_user_lookup_success();
+                    user_lookup_span.record("db.success", &true);
+                    
+                    Log::event(
+                        "INFO",
+                        "Password Reset", 
+                        "User found for reset request", 
+                        "user_found",
+                        "process_password_reset_request"
+                    );
+                    
+                    Some(user)
+                }
+                Err(_) => {
+                    record_user_lookup_failure(error_types::USER_NOT_FOUND);
+                    user_lookup_span.record("db.success", &false);
+                    user_lookup_span.record("failure_reason", &"user_not_found");
+                    
+                    Log::event(
+                        "INFO",
+                        "Password Reset", 
+                        &format!("Reset requested for non-existent email: {}", mask_email(email)), 
+                        "user_not_found",
+                        "process_password_reset_request"
+                    );
+                    
+                    None
+                }
+            }
+        }
+        .instrument(user_lookup_span_clone)
+        .await;
 
-    // Step 3: Look up user by email with metrics (silently for security)
-    match User::find_by_email(&mut db_conn, email) {
-        Ok(user) => {
-            record_user_lookup_success();
-            log_info!("Auth", "User found for reset request", "user_found");
-
-            // Step 4: Generate secure token with metrics (assumes success)
-            let token = generate_secure_token();
-            record_token_generation_success();
+        // If user exists, generate and store token
+        if let Some(user) = user_result {
+            // Step 4: Generate secure token with span and metrics
+            let token_gen_span = business_operation_span("generate_token");
+            let token_gen_span_clone = token_gen_span.clone();
+            
+            let token = async {
+                let token = generate_secure_token();
+                record_token_generation_success();
+                token_gen_span.record("business.result", &"success");
+                
+                Log::event(
+                    "INFO",
+                    "Password Reset", 
+                    "Reset token generated", 
+                    "token_generated",
+                    "process_password_reset_request"
+                );
+                
+                token
+            }
+            .instrument(token_gen_span_clone)
+            .await;
 
             let redis_key = format!("{}{}", REDIS_KEY_PREFIX, &token);
 
-            // Step 5: Store token in Redis with metrics
-            let mut redis_conn = redis_client.get_async_connection().await?;
-            match redis_conn
-                .set_ex::<_, _, ()>(&redis_key, &user.email, RESET_TOKEN_TTL_SECS)
-                .await {
-                Ok(_) => {
-                    record_redis_store_success();
-                    log_info!("Auth", "Reset token stored in Redis", "token_stored");
-                }
-                Err(e) => {
-                    record_redis_store_failure(error_types::REDIS_STORE_FAILED);
-                    record_request_failure();
-                    log_warn!("Auth", &format!("Failed to store reset token: {}", e), "redis_store_failed");
-                    return Err(AuthServiceError::database("Failed to store reset token"));
-                }
-            }
-
-            // Step 6: Send email if configured with metrics
-            if let Some(email_config) = &app_state.email_config {
-                match send_password_reset_email(email_config, &user.email, &token, redis_client).await {
+            // Step 5: Store token in Redis with span and metrics
+            let redis_store_span = redis_operation_span("store_token", REDIS_KEY_PREFIX);
+            let redis_store_span_clone = redis_store_span.clone();
+            
+            Log::event(
+                "INFO",
+                "Password Reset", 
+                "Storing token in Redis", 
+                "token_store_start",
+                "process_password_reset_request"
+            );
+            
+            let store_result = async {
+                let mut redis_conn = redis_client.get_async_connection().await?;
+                match redis_conn
+                    .set_ex::<_, _, ()>(&redis_key, &user.email, RESET_TOKEN_TTL_SECS)
+                    .await {
                     Ok(_) => {
-                        record_email_send_success();
-                        log_info!("Auth", &format!("Reset email sent to {}", mask_email(&user.email)), "email_sent");
+                        record_redis_store_success();
+                        redis_store_span.record("redis.success", &true);
+                        
+                        Log::event(
+                            "INFO",
+                            "Password Reset", 
+                            "Reset token stored in Redis", 
+                            "token_stored",
+                            "process_password_reset_request"
+                        );
+                        
+                        Ok(())
                     }
                     Err(e) => {
-                        record_email_send_failure(error_types::EMAIL_SEND_FAILED);
-                        // Email failure is non-fatal
-                        log_warn!("Auth", &format!("Failed to send reset email: {}", e), "email_failed");
+                        record_redis_store_failure(error_types::REDIS_STORE_FAILED);
+                        record_request_failure();
+                        redis_store_span.record("redis.success", &false);
+                        redis_store_span.record_error(&e);
+                        
+                        Log::event(
+                            "WARN",
+                            "Password Reset", 
+                            &format!("Failed to store reset token: {}", e), 
+                            "redis_store_failed",
+                            "process_password_reset_request"
+                        );
+                        
+                        Err(AuthServiceError::database("Failed to store reset token"))
                     }
                 }
+            }
+            .instrument(redis_store_span_clone)
+            .await;
+            
+            // If token storage failed, return error
+            store_result?;
+
+            // Step 6: Send email if configured with span and metrics
+            if let Some(email_config) = &app_state.email_config {
+                let email_send_span = business_operation_span("send_reset_email");
+                let email_send_span_clone = email_send_span.clone();
+                
+                Log::event(
+                    "INFO",
+                    "Password Reset", 
+                    "Sending reset email", 
+                    "email_send_start",
+                    "process_password_reset_request"
+                );
+                
+                async {
+                    match send_password_reset_email(email_config, &user.email, &token, redis_client).await {
+                        Ok(_) => {
+                            record_email_send_success();
+                            email_send_span.record("business.result", &"success");
+                            
+                            Log::event(
+                                "INFO",
+                                "Password Reset", 
+                                &format!("Reset email sent to {}", mask_email(&user.email)), 
+                                "email_sent",
+                                "process_password_reset_request"
+                            );
+                        }
+                        Err(e) => {
+                            record_email_send_failure(error_types::EMAIL_SEND_FAILED);
+                            email_send_span.record("business.result", &"failure");
+                            email_send_span.record_error(&e);
+                            
+                            Log::event(
+                                "WARN",
+                                "Password Reset", 
+                                &format!("Failed to send reset email: {}", e), 
+                                "email_failed",
+                                "process_password_reset_request"
+                            );
+                            // Email failure is non-fatal, continue
+                        }
+                    }
+                }
+                .instrument(email_send_span_clone)
+                .await;
             } else {
-                // No email config - consider as failure but continue
-                record_email_send_failure(error_types::EMAIL_SEND_FAILED);
-                log_warn!("Auth", "No email config available for reset", "no_email_config");
+                // No email config - log but continue
+                Log::event(
+                    "WARN",
+                    "Password Reset", 
+                    "No email config available for reset", 
+                    "no_email_config",
+                    "process_password_reset_request"
+                );
             }
         }
-        Err(_) => {
-            record_user_lookup_failure(error_types::USER_NOT_FOUND);
-            log_info!("Auth", &format!("Reset requested for non-existent email: {}", mask_email(email)), "user_not_found");
-            // Continue without error for anti-enumeration
-        }
+
+        // Always record overall success and return OK for security
+        record_request_success();
+        process_span.record("business.result", &"success");
+        
+        Log::event(
+            "INFO",
+            "Password Reset", 
+            "Password reset request processed", 
+            "request_complete",
+            "process_password_reset_request"
+        );
+
+        Ok((
+            StatusCode::OK,
+            Json(json!({
+                "status": "success",
+                "message": "If the email exists, a password reset link has been sent."
+            })),
+        ))
     }
-
-    // Always record overall success and return OK for security
-    record_request_success();
-
-    Ok((
-        StatusCode::OK,
-        Json(json!({
-            "status": "success",
-            "message": "If the email exists, a password reset link has been sent."
-        })),
-    ))
+    .instrument(process_span_clone)
+    .await
 }
 
 /// Processes a password reset confirmation using the unified error system.
@@ -177,15 +395,6 @@ pub async fn process_password_reset_request(
 ///
 /// # Returns
 /// Result that can be converted to HTTP response via unified error system
-///
-/// # Flow with Metrics
-/// 1. Start complete confirm timer
-/// 2. Check Redis client
-/// 3. Validate token
-/// 4. Validate new password
-/// 5. Update user password
-/// 6. Invalidate token
-/// 7. Record complete success/failure
 pub async fn process_password_reset_confirm(
     app_state: &AppState,
     token: &str,
@@ -193,108 +402,354 @@ pub async fn process_password_reset_confirm(
 ) -> Result<impl IntoResponse, AuthServiceError> {
     // Start complete confirm flow timer
     let _confirm_timer = time_complete_confirm_flow();
+    
+    // Create span for the entire confirmation processing flow
+    let process_span = business_operation_span("process_password_reset_confirm");
+    process_span.record("token_length", &token.len());
+    process_span.record("password_length", &new_password.len());
+    
+    // Clone span before moving it into the async block
+    let process_span_clone = process_span.clone();
 
-    log_info!(
-        "Auth", 
+    Log::event(
+        "INFO",
+        "Password Reset", 
         "Starting password reset confirmation", 
-        "reset_confirm_start"
+        "reset_confirm_start",
+        "process_password_reset_confirm"
     );
 
-    // Step 1: Check Redis client with metrics
-    let redis_client = match &app_state.redis_client {
-        Some(client) => {
-            record_redis_check_success();
-            client
+    // Wrap confirmation logic in the process_span
+    async move {
+        // Step 1: Check Redis client with span and metrics
+        let redis_check_span = business_operation_span("check_redis_client");
+        let redis_check_span_clone = redis_check_span.clone();
+        
+        let redis_client = async {
+            match &app_state.redis_client {
+                Some(client) => {
+                    record_redis_check_success();
+                    redis_check_span.record("business.result", &"success");
+                    
+                    Log::event(
+                        "INFO",
+                        "Password Reset", 
+                        "Redis client available", 
+                        "redis_check_success",
+                        "process_password_reset_confirm"
+                    );
+                    
+                    Ok(client)
+                }
+                None => {
+                    record_redis_check_failure(error_types::REDIS_UNAVAILABLE);
+                    record_confirm_failure();
+                    redis_check_span.record("business.result", &"failure");
+                    redis_check_span.record("failure_reason", &"redis_unavailable");
+                    
+                    Log::event(
+                        "ERROR",
+                        "Password Reset",
+                        "Redis client not available for password reset operations",
+                        "redis_check_failure",
+                        "process_password_reset_confirm"
+                    );
+                    
+                    Err(AuthServiceError::configuration("Redis client not available for password reset operations"))
+                }
+            }
         }
-        None => {
-            record_redis_check_failure(error_types::REDIS_UNAVAILABLE);
-            record_confirm_failure();
-            return Err(AuthServiceError::configuration("Redis client not available for password reset operations"));
-        }
-    };
+        .instrument(redis_check_span_clone)
+        .await?;
 
-    // Step 2: Verify token with metrics
-    let email = match verify_reset_token(redis_client, token).await {
-        Ok(email) => {
-            record_token_validation_success();
-            log_info!("Auth", "Reset token validated", "token_valid");
-            email
+        // Step 2: Verify token with span and metrics
+        let token_validation_span = redis_operation_span("verify_token", REDIS_KEY_PREFIX);
+        let token_validation_span_clone = token_validation_span.clone();
+        
+        Log::event(
+            "INFO",
+            "Password Reset", 
+            "Validating reset token", 
+            "token_validation_start",
+            "process_password_reset_confirm"
+        );
+        
+        let email = async {
+            match verify_reset_token(redis_client, token).await {
+                Ok(email) => {
+                    record_token_validation_success();
+                    token_validation_span.record("redis.success", &true);
+                    token_validation_span.record("business.result", &"success");
+                    
+                    Log::event(
+                        "INFO",
+                        "Password Reset", 
+                        "Reset token validated", 
+                        "token_valid",
+                        "process_password_reset_confirm"
+                    );
+                    
+                    Ok(email)
+                }
+                Err(e) => {
+                    record_token_validation_failure(error_types::INVALID_TOKEN);
+                    record_confirm_failure();
+                    token_validation_span.record("redis.success", &false);
+                    token_validation_span.record("business.result", &"failure");
+                    token_validation_span.record("failure_reason", &"invalid_token");
+                    token_validation_span.record_error(&e);
+                    
+                    Log::event(
+                        "WARN",
+                        "Password Reset", 
+                        "Invalid or expired reset token", 
+                        "invalid_token",
+                        "process_password_reset_confirm"
+                    );
+                    
+                    Err(AuthServiceError::validation("token", "Invalid or expired reset token"))
+                }
+            }
         }
-        Err(_) => {
-            record_token_validation_failure(error_types::INVALID_TOKEN);
-            record_confirm_failure();
-            log_warn!("Auth", "Invalid or expired reset token", "invalid_token");
-            return Err(AuthServiceError::validation("token", "Invalid or expired reset token"));
-        }
-    };
+        .instrument(token_validation_span_clone)
+        .await?;
 
-    // Step 3: Validate new password with metrics
-    match validate_password(new_password) {
-        Ok(_) => {
-            record_password_validation_success();
-            log_info!("Auth", "New password validated", "password_valid");
+        // Step 3: Validate new password with span and metrics
+        let password_validation_span = business_operation_span("validate_password");
+        let password_validation_span_clone = password_validation_span.clone();
+        
+        Log::event(
+            "INFO",
+            "Password Reset", 
+            "Validating new password", 
+            "password_validation_start",
+            "process_password_reset_confirm"
+        );
+        
+        async {
+            match validate_password(new_password) {
+                Ok(_) => {
+                    record_password_validation_success();
+                    password_validation_span.record("business.result", &"success");
+                    
+                    Log::event(
+                        "INFO",
+                        "Password Reset", 
+                        "New password validated", 
+                        "password_valid",
+                        "process_password_reset_confirm"
+                    );
+                    
+                    Ok(())
+                }
+                Err(e) => {
+                    record_password_validation_failure(error_types::WEAK_PASSWORD);
+                    record_confirm_failure();
+                    password_validation_span.record("business.result", &"failure");
+                    password_validation_span.record("failure_reason", &"weak_password");
+                    password_validation_span.record_error(&e);
+                    
+                    Log::event(
+                        "WARN",
+                        "Password Reset", 
+                        &format!("Weak new password in reset: {}", e), 
+                        "weak_password",
+                        "process_password_reset_confirm"
+                    );
+                    
+                    Err(AuthServiceError::validation("new_password", "Password does not meet requirements"))
+                }
+            }
         }
-        Err(_) => {
-            record_password_validation_failure(error_types::WEAK_PASSWORD);
-            record_confirm_failure();
-            log_warn!("Auth", "Weak new password in reset", "weak_password");
-            return Err(AuthServiceError::validation("new_password", "Password does not meet requirements"));
+        .instrument(password_validation_span_clone)
+        .await?;
+
+        // Step 4: Get DB connection and update password with span and metrics
+        let db_conn_span = db_operation_span("get_connection", "pool");
+        let db_conn_span_clone = db_conn_span.clone();
+        
+        let db_conn = async {
+            match app_state.pool.get() {
+                Ok(conn) => {
+                    db_conn_span.record("db.success", &true);
+                    Ok(conn)
+                }
+                Err(e) => {
+                    db_conn_span.record("db.success", &false);
+                    db_conn_span.record_error(&e);
+                    
+                    Log::event(
+                        "ERROR",
+                        "Password Reset",
+                        &format!("Failed to get database connection: {}", e),
+                        "db_connection_failure",
+                        "process_password_reset_confirm"
+                    );
+                    
+                    Err(AuthServiceError::database("Failed to get database connection"))
+                }
+            }
         }
+        .instrument(db_conn_span_clone)
+        .await?;
+        
+        let mut db_conn = db_conn;
+
+        // Find user by email from token with span and metrics
+        let user_lookup_span = db_operation_span("find_user", "users.by_email");
+        let user_lookup_span_clone = user_lookup_span.clone();
+        
+        let user = async {
+            match User::find_by_email(&mut db_conn, &email) {
+                Ok(user) => {
+                    user_lookup_span.record("db.success", &true);
+                    Ok(user)
+                }
+                Err(e) => {
+                    record_password_update_failure(error_types::USER_NOT_FOUND);
+                    record_confirm_failure();
+                    user_lookup_span.record("db.success", &false);
+                    user_lookup_span.record("failure_reason", &"user_not_found");
+                    user_lookup_span.record_error(&e);
+                    
+                    Log::event(
+                        "WARN",
+                        "Password Reset", 
+                        "User not found for valid token", 
+                        "user_not_found",
+                        "process_password_reset_confirm"
+                    );
+                    
+                    Err(AuthServiceError::validation("token", "Invalid reset token"))
+                }
+            }
+        }
+        .instrument(user_lookup_span_clone)
+        .await?;
+        
+        let mut user = user;
+
+        // Update password with span and metrics
+        let password_update_span = db_operation_span("update_password", "users");
+        let password_update_span_clone = password_update_span.clone();
+        
+        Log::event(
+            "INFO",
+            "Password Reset", 
+            "Updating user password in database", 
+            "password_update_start",
+            "process_password_reset_confirm"
+        );
+        
+        async {
+            match user.set_password_and_update(&mut db_conn, new_password) {
+                Ok(_) => {
+                    record_password_update_success();
+                    password_update_span.record("db.success", &true);
+                    password_update_span.record("business.result", &"success");
+                    
+                    Log::event(
+                        "INFO",
+                        "Password Reset", 
+                        "Password updated in DB", 
+                        "password_updated",
+                        "process_password_reset_confirm"
+                    );
+                    
+                    Ok(())
+                }
+                Err(e) => {
+                    record_password_update_failure(error_types::PASSWORD_UPDATE_FAILED);
+                    record_confirm_failure();
+                    password_update_span.record("db.success", &false);
+                    password_update_span.record("business.result", &"failure");
+                    password_update_span.record_error(&e);
+                    
+                    Log::event(
+                        "WARN",
+                        "Password Reset", 
+                        &format!("Failed to update password: {}", e), 
+                        "update_failed",
+                        "process_password_reset_confirm"
+                    );
+                    
+                    Err(AuthServiceError::database("Failed to update password"))
+                }
+            }
+        }
+        .instrument(password_update_span_clone)
+        .await?;
+
+        // Step 5: Invalidate token with span and metrics (non-fatal)
+        let token_invalidate_span = redis_operation_span("invalidate_token", REDIS_KEY_PREFIX);
+        let token_invalidate_span_clone = token_invalidate_span.clone();
+        
+        Log::event(
+            "INFO",
+            "Password Reset", 
+            "Invalidating used token", 
+            "token_invalidation_start",
+            "process_password_reset_confirm"
+        );
+        
+        async {
+            match invalidate_reset_token(redis_client, token).await {
+                Ok(_) => {
+                    record_token_invalidation_success();
+                    token_invalidate_span.record("redis.success", &true);
+                    token_invalidate_span.record("business.result", &"success");
+                    
+                    Log::event(
+                        "INFO",
+                        "Password Reset", 
+                        "Reset token invalidated", 
+                        "token_invalidated",
+                        "process_password_reset_confirm"
+                    );
+                }
+                Err(e) => {
+                    record_token_invalidation_failure(error_types::TOKEN_INVALIDATION_FAILED);
+                    token_invalidate_span.record("redis.success", &false);
+                    token_invalidate_span.record("business.result", &"failure");
+                    token_invalidate_span.record_error(&e);
+                    
+                    // Non-fatal, log warning
+                    Log::event(
+                        "WARN",
+                        "Password Reset", 
+                        &format!("Failed to invalidate token: {}", e), 
+                        "invalidation_failed",
+                        "process_password_reset_confirm"
+                    );
+                    // Continue without failing - token will expire naturally
+                }
+            }
+        }
+        .instrument(token_invalidate_span_clone)
+        .await;
+
+        // Record overall success
+        record_confirm_success();
+        process_span.record("business.result", &"success");
+        
+        Log::event(
+            "INFO",
+            "Password Reset",
+            &format!("Password reset completed for {}", mask_email(&email)),
+            "reset_success",
+            "process_password_reset_confirm"
+        );
+
+        Ok((
+            StatusCode::OK,
+            Json(json!({
+                "status": "success",
+                "message": "Password has been reset successfully."
+            })),
+        ))
     }
-
-    // Step 4: Get DB connection and update password with metrics
-    let mut db_conn = app_state.pool.get()?;
-    let mut user = match User::find_by_email(&mut db_conn, &email) {
-        Ok(user) => user,
-        Err(_) => {
-            record_password_update_failure(error_types::USER_NOT_FOUND);
-            record_confirm_failure();
-            log_warn!("Auth", "User not found for valid token", "user_not_found");
-            return Err(AuthServiceError::validation("token", "Invalid reset token"));
-        }
-    };
-
-    match user.set_password_and_update(&mut db_conn, new_password) {
-        Ok(_) => {
-            record_password_update_success();
-            log_info!("Auth", "Password updated in DB", "password_updated");
-        }
-        Err(e) => {
-            record_password_update_failure(error_types::PASSWORD_UPDATE_FAILED);
-            record_confirm_failure();
-            log_warn!("Auth", &format!("Failed to update password: {}", e), "update_failed");
-            return Err(AuthServiceError::database("Failed to update password"));
-        }
-    }
-
-    // Step 5: Invalidate token with metrics (non-fatal)
-    match invalidate_reset_token(redis_client, token).await {
-        Ok(_) => {
-            record_token_invalidation_success();
-            log_info!("Auth", "Reset token invalidated", "token_invalidated");
-        }
-        Err(e) => {
-            record_token_invalidation_failure(error_types::TOKEN_INVALIDATION_FAILED);
-            // Non-fatal, log warning
-            log_warn!("Auth", &format!("Failed to invalidate token: {}", e), "invalidation_failed");
-        }
-    }
-
-    // Record overall success
-    record_confirm_success();
-    log_info!(
-        "Auth",
-        &format!("Password reset completed for {}", mask_email(&email)),
-        "reset_success"
-    );
-
-    Ok((
-        StatusCode::OK,
-        Json(json!({
-            "status": "success",
-            "message": "Password has been reset successfully."
-        })),
-    ))
+    .instrument(process_span_clone)
+    .await
 }
 
 /// Generates a cryptographically secure random token for password reset.

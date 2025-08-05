@@ -195,18 +195,24 @@ pub fn time_refresh_step(step: &str) -> HistogramTimer {
         .start_timer()
 }
 
+/// Time a complete HTTP refresh operation and return a timer guard
+pub fn time_refresh_operation(step: &str) -> prometheus::HistogramTimer {
+    REFRESH_DURATION.with_label_values(&[step]).start_timer()
+}
+
 // =============================================================================
 // CONSTANTS (Type-safe refresh step classification)
 // =============================================================================
 
 /// Refresh step constants for type safety
 pub mod steps {
+    pub const COMPLETE_FLOW: &str = "complete_flow";
     pub const TOKEN_VALIDATION: &str = "token_validation";
     pub const TOKEN_TYPE_CHECK: &str = "token_type_check";
     pub const TOKEN_REVOCATION: &str = "token_revocation";
     pub const ACCESS_TOKEN_GENERATION: &str = "access_token_generation";
     pub const REFRESH_TOKEN_GENERATION: &str = "refresh_token_generation";
-    pub const COMPLETE_FLOW: &str = "complete_flow";
+    pub const HTTP_REQUEST: &str = "http_request"; // Add this new step for HTTP handling
 }
 
 /// Result constants for consistent labeling

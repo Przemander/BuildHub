@@ -1,4 +1,4 @@
-//! User logout HTTP handler.
+//! User logout HTTP handler with OpenTelemetry integration.
 //!
 //! This module provides the HTTP endpoint for user logout functionality:
 //! - POST /auth/logout: Revokes JWT tokens by adding them to Redis blocklist
@@ -8,6 +8,7 @@
 //! - Comprehensive logging and metrics
 //! - Graceful handling of invalid or expired tokens
 //! - Unified error handling with automatic HTTP response conversion
+//! - Complete OpenTelemetry observability with hierarchical spans
 
 use std::sync::Arc;
 use axum::{
@@ -15,13 +16,19 @@ use axum::{
     response::IntoResponse,
 };
 use serde::Deserialize;
-use tracing::instrument;
+use tracing::Instrument;
 
-use crate::app::AppState;
-use crate::handlers::logout_logic::process_logout;
-use crate::utils::error_new::AuthServiceError;
-use crate::metricss::logout_metrics::{
-    record_http_request, http::{POST, OK, BAD_REQUEST, UNAUTHORIZED, INTERNAL_SERVER_ERROR},
+use crate::{
+    app::AppState,
+    handlers::logout_logic::process_logout,
+    utils::{
+        error_new::AuthServiceError,
+        telemetry::{http_request_span, business_operation_span, SpanExt},
+        log_new::Log,
+    },
+    metricss::logout_metrics::{
+        record_http_request, http::{POST, OK, BAD_REQUEST, UNAUTHORIZED, INTERNAL_SERVER_ERROR},
+    },
 };
 
 /// Request payload for logout operations.
@@ -39,90 +46,75 @@ pub struct TokenRequest {
 ///
 /// Takes a JWT token and revokes it by adding to the Redis blocklist,
 /// preventing future use of the token for authentication.
-///
-/// ## Request Body
-/// ```json
-/// {
-///   "token": "<jwt-token-to-revoke>"
-/// }
-/// ```
-///
-/// ## Responses
-///
-/// * `200 OK` - Token successfully revoked
-/// * `400 Bad Request` - Malformed request or missing fields
-/// * `401 Unauthorized` - Invalid or malformed token
-/// * `500 Internal Server Error` - Server-side error
-/// * `503 Service Unavailable` - Redis unavailable
-///
-/// ## Example success response
-/// ```json
-/// {
-///   "status": "success",
-///   "message": "Logged out successfully"
-/// }
-/// ```
-///
-/// ## Example error responses
-/// ```json
-/// {
-///   "status": "configuration_error",
-///   "message": "Redis client not available for logout operation"
-/// }
-/// ```
-/// ```json
-/// {
-///   "status": "unauthorized",
-///   "message": "Invalid token"
-/// }
-/// ```
-#[instrument(
-    name = "logout_user",
-    level = "info",
-    skip(app_state, logout_request),
-    fields(
-        path = "/auth/logout", 
-        method = "POST",
-        token_length = tracing::field::Empty
-    )
-)]
 pub async fn logout_handler(
     State(app_state): State<Arc<AppState>>,
     Json(logout_request): Json<TokenRequest>,
 ) -> Result<impl IntoResponse, AuthServiceError> {
-    // Add useful trace information without exposing the token
-    tracing::Span::current().record(
-        "token_length",
-        &tracing::field::display(logout_request.token.len()),
-    );
-
-    // Start HTTP duration timer
-    let start = std::time::Instant::now();
-
-    // Process the logout request
-    let result = process_logout(&app_state, &logout_request.token).await;
-
-    // Record HTTP metrics
-    let duration = start.elapsed().as_secs_f64();
-    let status_code = match &result {
-        Ok(_) => OK,
-        Err(err) => match err {
-            AuthServiceError::Configuration(_) => INTERNAL_SERVER_ERROR,
-            AuthServiceError::Jwt(_) => UNAUTHORIZED,
-            AuthServiceError::Cache(_) => INTERNAL_SERVER_ERROR,
-            _ => BAD_REQUEST,
-        },
-    };
-
-    crate::metricss::logout_metrics::LOGOUT_HTTP_DURATION
-        .with_label_values(&[POST, &status_code.to_string()])
-        .observe(duration);
+    // Create HTTP request span with method and path
+    let http_span = http_request_span("POST", "/auth/logout");
     
-    record_http_request(POST, status_code);
+    // Add business context to the span without exposing the token itself
+    http_span.record("token_length", &logout_request.token.len());
+    
+    // Clone span before moving it into the async block
+    let http_span_clone = http_span.clone();
+    
+    // Wrap the handler logic in the HTTP span for automatic tracing
+    async move {
+        // Log the logout attempt using structured logging
+        Log::event(
+            "INFO",
+            "Authentication",
+            &format!("Logout attempt (token length: {})", logout_request.token.len()),
+            "attempt",
+            "logout_handler"
+        );
 
-    result
+        // Start HTTP duration timer
+        let start = std::time::Instant::now();
+
+        // Create child business operation span for the actual logout operation
+        let business_span = business_operation_span("user_logout");
+        
+        // Process the logout within the business span
+        let result = process_logout(&app_state, &logout_request.token)
+            .instrument(business_span)
+            .await;
+        
+        // Record HTTP metrics
+        let duration = start.elapsed().as_secs_f64();
+        let status_code = match &result {
+            Ok(_) => OK,
+            Err(err) => match err {
+                AuthServiceError::Configuration(_) => INTERNAL_SERVER_ERROR,
+                AuthServiceError::Jwt(_) => UNAUTHORIZED,
+                AuthServiceError::Cache(_) => INTERNAL_SERVER_ERROR,
+                _ => BAD_REQUEST,
+            },
+        };
+        
+        // Record status code in the HTTP span
+        http_span.record("http.status_code", &status_code.to_string());
+        
+        // If there was an error, record it in the span
+        if let Err(ref e) = result {
+            http_span.record_error(e);
+        }
+
+        crate::metricss::logout_metrics::LOGOUT_HTTP_DURATION
+            .with_label_values(&[POST, &status_code.to_string()])
+            .observe(duration);
+        
+        record_http_request(POST, status_code);
+
+        // Return the result, letting ? operator handle error conversion
+        result
+    }
+    .instrument(http_span_clone)
+    .await
 }
 
+// Test module remains unchanged
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -552,4 +544,4 @@ mod tests {
         assert_eq!(final_http_bad, initial_http_bad + 1.0);
         assert_eq!(final_http_duration, initial_http_duration + 1);
     }
-} 
+}

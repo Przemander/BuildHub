@@ -30,6 +30,8 @@ pub mod password_metrics;
 pub mod logout_metrics;      // ✅ ADDED: Just adding refresh_metrics module
 pub mod login_metrics;
 pub mod activation_metrics;
+pub mod debug_metrics;
+pub mod app_metrics;       // Debug operations metrics for security and compliance
 // --- INITIALIZATION STATE ---
 static METRICS_INITIALIZED: AtomicBool = AtomicBool::new(false);
 

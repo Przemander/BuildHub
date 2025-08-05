@@ -1,4 +1,4 @@
-//! Business logic for account activation.
+//! Business logic for account activation with OpenTelemetry integration.
 //!
 //! This module implements the core functionality for handling user account activation:
 //! - Validating activation codes stored in Redis
@@ -6,7 +6,8 @@
 //! - Handling various edge cases (expired codes, already active accounts)
 //! - Clean-up of used activation codes
 //!
-//! The activation flow is secure, atomic, and includes comprehensive logging and metrics.
+//! The activation flow is secure, atomic, and includes comprehensive logging,
+//! metrics, and OpenTelemetry trace integration.
 
 use crate::{
     app::AppState,
@@ -14,8 +15,9 @@ use crate::{
     db::users::User,
     utils::{
         error_new::AuthServiceError,
+        log_new::Log,
+        telemetry::{business_operation_span, db_operation_span, redis_operation_span, SpanExt},
     },
-    log_info, log_warn,
     // Import activation metrics
     metricss::activation_metrics::{
         time_complete_activation_flow, record_activation_success, record_activation_failure,
@@ -28,8 +30,9 @@ use crate::{
     },
 };
 use redis::AsyncCommands;
+use tracing::Instrument;
 
-/// Processes the activation logic using the unified error system.
+/// Processes the activation logic using the unified error system with OpenTelemetry integration.
 ///
 /// # Arguments
 ///
@@ -55,87 +58,336 @@ pub async fn process_activation(
 ) -> Result<(), AuthServiceError> {
     // Start complete activation flow timer
     let _activation_timer = time_complete_activation_flow();
-
-    log_info!("Auth", "Starting account activation", "activation_start");
-
-    // Step 1: Verify Redis availability with metrics
-    let redis_client = match &app_state.redis_client {
-        Some(client) => {
-            record_redis_check_success();
-            client
-        }
-        None => {
-            record_redis_check_failure(error_types::REDIS_UNAVAILABLE);
-            record_activation_failure();
-            return Err(AuthServiceError::configuration("Redis client not available for activation"));
-        }
-    };
-
-    // Step 2: Validate activation code with metrics
-    let email = match verify_activation_code(redis_client, code).await {
-        Ok(email) => {
-            record_code_validation_success();
-            email
-        }
-        Err(_) => {
-            record_code_validation_failure(error_types::INVALID_CODE);
-            record_activation_failure();
-            return Err(AuthServiceError::validation("code", "Invalid or expired activation code"));
-        }
-    };
-
-    // Step 4: Lookup user by email with metrics
-    let mut conn = app_state.pool.get()?;
-    let mut user = match User::find_by_email(&mut conn, &email) {
-        Ok(user) => {
-            record_user_lookup_success();
-            user
-        }
-        Err(_) => {
-            record_user_lookup_failure(error_types::USER_NOT_FOUND);
-            record_activation_failure();
-            return Err(AuthServiceError::validation("code", "No user found for activation code"));
-        }
-    };
-
-    // Step 5: If already active, return success (idempotent operation)
-    if user.is_active.unwrap_or(false) {
-        log_info!("Activation", &format!("Account already active for email: {}", email), "success");
-        record_activation_success();
-        return Ok(());
-    }
-
-    // Step 6: Activate the account with metrics
-    user.is_active = Some(true);
-    match user.update(&mut conn) {
-        Ok(_) => {
-            record_account_activation_success();
-        }
-        Err(_) => {
-            record_account_activation_failure(error_types::ACTIVATION_FAILED);
-            record_activation_failure();
-            return Err(AuthServiceError::database("Failed to activate account"));
-        }
-    }
-
-    // Step 7: Clean up activation code from Redis (non-fatal) with metrics
-    match clean_up_activation_code(redis_client, code).await {
-        Ok(_) => {
-            record_code_cleanup_success();
-        }
-        Err(_) => {
-            record_code_cleanup_failure(error_types::CLEANUP_FAILED);
-            // Non-fatal, continue with success
-        }
-    }
-
-    // Record overall success
-    record_activation_success();
-
-    // Log success
-    log_info!("Activation", &format!("Account successfully activated for email: {}", email), "success");
     
-    Ok(())
+    // Create span for the entire activation processing flow
+    let process_span = business_operation_span("process_activation");
+    process_span.record("code_length", &code.len());
+    
+    // Clone span before moving it into the async block
+    let process_span_clone = process_span.clone();
+    
+    Log::event(
+        "INFO",
+        "Account Activation", 
+        "Starting account activation process", 
+        "activation_start",
+        "process_activation"
+    );
+
+    // Wrap activation logic in the process_span
+    async move {
+        // Step 1: Verify Redis availability with span and metrics
+        let redis_check_span = business_operation_span("check_redis_client");
+        let redis_check_span_clone = redis_check_span.clone();
+        
+        let redis_client = async {
+            match &app_state.redis_client {
+                Some(client) => {
+                    record_redis_check_success();
+                    redis_check_span.record("business.result", &"success");
+                    
+                    Log::event(
+                        "INFO",
+                        "Account Activation", 
+                        "Redis client available", 
+                        "redis_check_success",
+                        "process_activation"
+                    );
+                    
+                    Ok(client)
+                }
+                None => {
+                    record_redis_check_failure(error_types::REDIS_UNAVAILABLE);
+                    record_activation_failure();
+                    redis_check_span.record("business.result", &"failure");
+                    redis_check_span.record("failure_reason", &"redis_unavailable");
+                    
+                    Log::event(
+                        "ERROR",
+                        "Account Activation",
+                        "Redis client not available for activation",
+                        "redis_check_failure",
+                        "process_activation"
+                    );
+                    
+                    Err(AuthServiceError::configuration("Redis client not available for activation"))
+                }
+            }
+        }
+        .instrument(redis_check_span_clone)
+        .await?;
+
+        // Step 2: Validate activation code with span and metrics
+        let code_validation_span = redis_operation_span("validate_code", "activation:code:*");
+        let code_validation_span_clone = code_validation_span.clone();
+        
+        Log::event(
+            "INFO",
+            "Account Activation", 
+            "Validating activation code", 
+            "code_validation_start",
+            "process_activation"
+        );
+        
+        let email = async {
+            match verify_activation_code(redis_client, code).await {
+                Ok(email) => {
+                    record_code_validation_success();
+                    code_validation_span.record("redis.success", &true);
+                    code_validation_span.record("business.result", &"success");
+                    
+                    Log::event(
+                        "INFO",
+                        "Account Activation", 
+                        "Activation code validated successfully", 
+                        "code_validation_success",
+                        "process_activation"
+                    );
+                    
+                    Ok(email)
+                }
+                Err(e) => {
+                    record_code_validation_failure(error_types::INVALID_CODE);
+                    record_activation_failure();
+                    code_validation_span.record("redis.success", &false);
+                    code_validation_span.record("business.result", &"failure");
+                    code_validation_span.record("failure_reason", &"invalid_code");
+                    code_validation_span.record_error(&e);
+                    
+                    Log::event(
+                        "WARN",
+                        "Account Activation", 
+                        &format!("Invalid activation code: {}", e), 
+                        "code_validation_failure",
+                        "process_activation"
+                    );
+                    
+                    Err(AuthServiceError::validation("code", "Invalid or expired activation code"))
+                }
+            }
+        }
+        .instrument(code_validation_span_clone)
+        .await?;
+
+        // Step 3: Get database connection with span
+        let db_conn_span = db_operation_span("get_connection", "pool");
+        let db_conn_span_clone = db_conn_span.clone();
+        
+        let db_conn = async {
+            match app_state.pool.get() {
+                Ok(conn) => {
+                    db_conn_span.record("db.success", &true);
+                    Ok(conn)
+                }
+                Err(e) => {
+                    db_conn_span.record("db.success", &false);
+                    db_conn_span.record_error(&e);
+                    
+                    Log::event(
+                        "ERROR",
+                        "Account Activation", 
+                        &format!("Failed to get database connection: {}", e), 
+                        "db_connection_failure",
+                        "process_activation"
+                    );
+                    
+                    Err(AuthServiceError::database("Failed to get database connection"))
+                }
+            }
+        }
+        .instrument(db_conn_span_clone)
+        .await?;
+        
+        let mut conn = db_conn;
+
+        // Step 4: Lookup user by email with span and metrics
+        let user_lookup_span = db_operation_span("find_user", "users.by_email");
+        let user_lookup_span_clone = user_lookup_span.clone();
+        
+        Log::event(
+            "INFO",
+            "Account Activation", 
+            "Looking up user by email", 
+            "user_lookup_start",
+            "process_activation"
+        );
+        
+        let user = async {
+            match User::find_by_email(&mut conn, &email) {
+                Ok(user) => {
+                    record_user_lookup_success();
+                    user_lookup_span.record("db.success", &true);
+                    user_lookup_span.record("business.result", &"success");
+                    
+                    Log::event(
+                        "INFO",
+                        "Account Activation", 
+                        "User found by email", 
+                        "user_lookup_success",
+                        "process_activation"
+                    );
+                    
+                    Ok(user)
+                }
+                Err(e) => {
+                    record_user_lookup_failure(error_types::USER_NOT_FOUND);
+                    record_activation_failure();
+                    user_lookup_span.record("db.success", &false);
+                    user_lookup_span.record("business.result", &"failure");
+                    user_lookup_span.record("failure_reason", &"user_not_found");
+                    user_lookup_span.record_error(&e);
+                    
+                    Log::event(
+                        "WARN",
+                        "Account Activation", 
+                        "No user found for activation code", 
+                        "user_lookup_failure",
+                        "process_activation"
+                    );
+                    
+                    Err(AuthServiceError::validation("code", "No user found for activation code"))
+                }
+            }
+        }
+        .instrument(user_lookup_span_clone)
+        .await?;
+        
+        let mut user = user;
+
+        // Step 5: If already active, return success (idempotent operation)
+        if user.is_active.unwrap_or(false) {
+            Log::event(
+                "INFO",
+                "Account Activation", 
+                &format!("Account already active for email: {}", email), 
+                "already_active",
+                "process_activation"
+            );
+            
+            record_activation_success();
+            process_span.record("business.result", &"success");
+            process_span.record("already_active", &true);
+            
+            return Ok(());
+        }
+
+        // Step 6: Activate the account with span and metrics
+        let activation_span = db_operation_span("activate_account", "users");
+        let activation_span_clone = activation_span.clone();
+        
+        Log::event(
+            "INFO",
+            "Account Activation", 
+            "Activating user account", 
+            "account_activation_start",
+            "process_activation"
+        );
+        
+        async {
+            user.is_active = Some(true);
+            match user.update(&mut conn) {
+                Ok(_) => {
+                    record_account_activation_success();
+                    activation_span.record("db.success", &true);
+                    activation_span.record("business.result", &"success");
+                    
+                    Log::event(
+                        "INFO",
+                        "Account Activation", 
+                        "Account successfully activated", 
+                        "account_activation_success",
+                        "process_activation"
+                    );
+                    
+                    Ok(())
+                }
+                Err(e) => {
+                    record_account_activation_failure(error_types::ACTIVATION_FAILED);
+                    record_activation_failure();
+                    activation_span.record("db.success", &false);
+                    activation_span.record("business.result", &"failure");
+                    activation_span.record("failure_reason", &"activation_failed");
+                    activation_span.record_error(&e);
+                    
+                    Log::event(
+                        "ERROR",
+                        "Account Activation", 
+                        &format!("Failed to activate account: {}", e), 
+                        "account_activation_failure",
+                        "process_activation"
+                    );
+                    
+                    Err(AuthServiceError::database("Failed to activate account"))
+                }
+            }
+        }
+        .instrument(activation_span_clone)
+        .await?;
+
+        // Step 7: Clean up activation code from Redis (non-fatal) with span and metrics
+        let cleanup_span = redis_operation_span("cleanup_code", "activation:code:*");
+        let cleanup_span_clone = cleanup_span.clone();
+        
+        Log::event(
+            "INFO",
+            "Account Activation", 
+            "Cleaning up activation code", 
+            "code_cleanup_start",
+            "process_activation"
+        );
+        
+        async {
+            match clean_up_activation_code(redis_client, code).await {
+                Ok(_) => {
+                    record_code_cleanup_success();
+                    cleanup_span.record("redis.success", &true);
+                    cleanup_span.record("business.result", &"success");
+                    
+                    Log::event(
+                        "INFO",
+                        "Account Activation", 
+                        &format!("Cleaned up activation code: {}", code), 
+                        "code_cleanup_success",
+                        "process_activation"
+                    );
+                }
+                Err(e) => {
+                    record_code_cleanup_failure(error_types::CLEANUP_FAILED);
+                    cleanup_span.record("redis.success", &false);
+                    cleanup_span.record("business.result", &"failure");
+                    cleanup_span.record("failure_reason", &"cleanup_failed");
+                    cleanup_span.record_error(&e);
+                    
+                    Log::event(
+                        "WARN",
+                        "Account Activation", 
+                        &format!("Failed to clean up activation code: {}", e), 
+                        "code_cleanup_failure",
+                        "process_activation"
+                    );
+                    // Non-fatal error, continue
+                }
+            }
+        }
+        .instrument(cleanup_span_clone)
+        .await;
+
+        // Record overall success
+        record_activation_success();
+        process_span.record("business.result", &"success");
+        
+        Log::event(
+            "INFO",
+            "Account Activation",
+            &format!("Account successfully activated for email: {}", email),
+            "activation_success",
+            "process_activation"
+        );
+        
+        Ok(())
+    }
+    .instrument(process_span_clone)
+    .await
 }
 
 /// Cleans up a used activation code from Redis.
@@ -146,22 +398,8 @@ async fn clean_up_activation_code(redis_client: &redis::Client, code: &str) -> R
     let mut r = redis_client.get_async_connection().await?;
     let key = format!("activation:code:{}", code);
     match r.del::<_, i64>(&key).await {
-        Ok(_) => {
-            log_info!(
-                "Activation", 
-                &format!("Cleaned up activation code: {}", code), 
-                "cleanup"
-            );
-            Ok(())
-        },
-        Err(e) => {
-            log_warn!(
-                "Activation", 
-                &format!("Failed to clean up activation code {}: {}", code, e), 
-                "cleanup_failed"
-            );
-            Err(e)
-        },
+        Ok(_) => Ok(()),
+        Err(e) => Err(e),
     }
 }
 

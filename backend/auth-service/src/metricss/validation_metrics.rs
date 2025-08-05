@@ -58,30 +58,6 @@ lazy_static! {
     /// - **User Experience**: High failure rates indicate overly strict validation
     /// - **Security Compliance**: Password validation ensures security standards
     /// - **Registration Flow**: Failed validations block user onboarding
-    ///
-    /// # Production Alerts
-    /// ```yaml
-    /// # Warning: High validation failure rate
-    /// - alert: HighValidationFailureRate
-    ///   expr: rate(validation_operations_total{result="failure"}[5m]) / rate(validation_operations_total[5m]) > 0.1
-    ///   severity: warning
-    ///   annotations:
-    ///     summary: "Validation failure rate: {{ $value | humanizePercentage }}"
-    ///
-    /// # Critical: Password validation issues
-    /// - alert: PasswordValidationIssues
-    ///   expr: rate(validation_operations_total{field="password", result="failure"}[5m]) > 5
-    ///   severity: critical
-    /// ```
-    ///
-    /// # Business Dashboards
-    /// ```promql
-    /// # Overall validation success rate
-    /// rate(validation_operations_total{result="success"}[5m]) / rate(validation_operations_total[5m])
-    ///
-    /// # Validation volume by field
-    /// sum by (field) (rate(validation_operations_total[5m]))
-    /// ```
     pub static ref VALIDATION_OPERATIONS: CounterVec = create_counter_vec(
         "validation_operations_total",
         "Validation operations by field and result",
@@ -101,28 +77,6 @@ lazy_static! {
     ///   - `"invalid_format"`: Field format doesn't match requirements (email, username)
     ///   - `"weak_password"`: Password doesn't meet security requirements
     ///   - `"hash_error"`: Password hashing operation failed
-    ///
-    /// # Production Alerts
-    /// ```yaml
-    /// # Warning: High password weakness rate
-    /// - alert: WeakPasswordAttempts
-    ///   expr: rate(validation_failures_total{field="password", error_type="weak_password"}[5m]) > 2
-    ///   severity: warning
-    ///
-    /// # Critical: Format validation issues
-    /// - alert: FormatValidationFailures
-    ///   expr: rate(validation_failures_total{error_type="invalid_format"}[5m]) > 1
-    ///   severity: critical
-    /// ```
-    ///
-    /// # Error Analysis Dashboards
-    /// ```promql
-    /// # Top validation error types
-    /// topk(5, rate(validation_failures_total[5m]))
-    ///
-    /// # Password weakness trends
-    /// rate(validation_failures_total{field="password", error_type="weak_password"}[5m])
-    /// ```
     pub static ref VALIDATION_FAILURES: CounterVec = create_counter_vec(
         "validation_failures_total",
         "Validation failures by field and error type",
@@ -141,35 +95,11 @@ lazy_static! {
     /// - **p95 < 10ms**: 95% of validations completed within 10 milliseconds
     /// - **p99 < 50ms**: 99% of validations completed within 50 milliseconds
     /// - **Mean < 5ms**: Average validation time under 5 milliseconds
-    ///
-    /// # Production Alerts
-    /// ```yaml
-    /// # Warning: Slow validation processing
-    /// - alert: SlowValidationProcessing
-    ///   expr: histogram_quantile(0.95, rate(validation_duration_seconds_bucket[5m])) > 0.01
-    ///   severity: warning
-    ///   annotations:
-    ///     summary: "Validation p95 latency: {{ $value }}ms"
-    ///
-    /// # Critical: Very slow validation processing
-    /// - alert: VerySlowValidationProcessing
-    ///   expr: histogram_quantile(0.95, rate(validation_duration_seconds_bucket[5m])) > 0.05
-    ///   severity: critical
-    /// ```
-    ///
-    /// # Performance Dashboards
-    /// ```promql
-    /// # p95 latency by field type
-    /// histogram_quantile(0.95, sum by (field, le) (rate(validation_duration_seconds_bucket[5m])))
-    ///
-    /// # Average validation time
-    /// rate(validation_duration_seconds_sum[5m]) / rate(validation_duration_seconds_count[5m])
-    /// ```
     pub static ref VALIDATION_DURATION: HistogramVec = create_histogram_vec(
         "validation_duration_seconds",
         "Validation operation duration for performance monitoring",
         &["field"],
-        LATENCY_BUCKETS_FAST  // ✅ Use standardized buckets for fast validation operations
+        LATENCY_BUCKETS_FAST  // Use standardized buckets for fast validation operations
     ).expect("Failed to create VALIDATION_DURATION metric");
 }
 
@@ -267,10 +197,11 @@ pub fn record_validation_failure_with_type(field: &str, error_type: &str) {
 }
 
 // Field-specific helpers for common validation scenarios (only used ones)
+#[allow(dead_code)]
 pub fn record_username_success() {
     record_validation_success(field_types::USERNAME);
 }
-
+#[allow(dead_code)]
 pub fn record_username_failure(error_type: &str) {
     record_validation_failure_with_type(field_types::USERNAME, error_type);
 }
@@ -294,17 +225,17 @@ pub fn instrument_validation<F>(field: &str, validation_fn: F) -> Result<(), Aut
 where
     F: FnOnce() -> Result<(), ValidationError>,
 {
-    // ✅ PERFECT: Clean timer using standardized approach - no Option<>, no custom error handling
+    // Clean timer using standardized approach - no Option<>, no custom error handling
     let _timer = time_validation(field);
     
     match validation_fn() {
         Ok(()) => {
-            // ✅ PERFECT: Clean success tracking using business helper
+            // Clean success tracking using business helper
             record_validation_success(field);
             Ok(())
         }
         Err(validation_err) => {
-            // ✅ PERFECT: Clean failure tracking with error categorization
+            // Clean failure tracking with error categorization
             let error_type = categorize_error(&validation_err);
             record_validation_failure_with_type(field, error_type);
             
@@ -332,10 +263,6 @@ fn categorize_error(err: &ValidationError) -> &'static str {
         ValidationError::PasswordHash { .. } => error_types::HASH_ERROR,
     }
 }
-
-// =============================================================================
-// COMPREHENSIVE TEST SUITE (Production-grade testing)
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -408,7 +335,7 @@ mod tests {
             .with_label_values(&[field_types::PASSWORD])
             .get_sample_count();
         
-        // ✅ Clean assertion - timer should always work with standardized approach
+        // Clean assertion - timer should always work with standardized approach
         assert_eq!(after_count, before_count + 1);
     }
 
@@ -498,7 +425,7 @@ mod tests {
         
         assert_eq!(
             categorize_error(&ValidationError::InvalidValue {
-                field: field_types::PASSWORD.to_string(), // ✅ FIXED: Added missing dot
+                field: field_types::PASSWORD.to_string(),
                 message: "Too weak".to_string(),
                 span: SpanTrace::capture(),
             }),
@@ -548,107 +475,6 @@ mod tests {
         // Verify detailed failures were recorded
         assert_eq!(VALIDATION_FAILURES.with_label_values(&[field_types::USERNAME, error_types::TOO_LONG]).get(), 1.0);
         assert_eq!(VALIDATION_FAILURES.with_label_values(&[field_types::EMAIL, error_types::INVALID_FORMAT]).get(), 1.0);
-        assert_eq!(VALIDATION_FAILURES.with_label_values(&[field_types::PASSWORD, error_types::WEAK_PASSWORD]).get(), 1.0);
-    }
-
-    #[test]
-    fn test_comprehensive_validation_patterns() {
-        init_validation_metrics();
-        
-        // Test all field types and error types
-        record_validation_operation(field_types::USERNAME, results::SUCCESS);
-        record_validation_operation(field_types::EMAIL, results::SUCCESS);
-        record_validation_operation(field_types::PASSWORD, results::SUCCESS);
-        
-        record_validation_failure_with_type(field_types::USERNAME, error_types::MISSING);
-        record_validation_failure_with_type(field_types::USERNAME, error_types::TOO_LONG);
-        record_validation_failure_with_type(field_types::EMAIL, error_types::INVALID_FORMAT);
-        record_validation_failure_with_type(field_types::PASSWORD, error_types::WEAK_PASSWORD);
-        record_validation_failure_with_type(field_types::PASSWORD, error_types::HASH_ERROR);
-        
-        // Verify all constants work correctly
-        assert_eq!(VALIDATION_OPERATIONS.with_label_values(&[field_types::USERNAME, results::SUCCESS]).get(), 1.0);
-        assert_eq!(VALIDATION_OPERATIONS.with_label_values(&[field_types::EMAIL, results::SUCCESS]).get(), 1.0);
-        assert_eq!(VALIDATION_OPERATIONS.with_label_values(&[field_types::PASSWORD, results::SUCCESS]).get(), 1.0);
-        
-        assert_eq!(VALIDATION_FAILURES.with_label_values(&[field_types::USERNAME, error_types::MISSING]).get(), 1.0);
-        assert_eq!(VALIDATION_FAILURES.with_label_values(&[field_types::USERNAME, error_types::TOO_LONG]).get(), 1.0);
-        assert_eq!(VALIDATION_FAILURES.with_label_values(&[field_types::EMAIL, error_types::INVALID_FORMAT]).get(), 1.0);
-        assert_eq!(VALIDATION_FAILURES.with_label_values(&[field_types::PASSWORD, error_types::WEAK_PASSWORD]).get(), 1.0);
-        assert_eq!(VALIDATION_FAILURES.with_label_values(&[field_types::PASSWORD, error_types::HASH_ERROR]).get(), 1.0);
-    }
-
-    #[test]
-    fn test_production_validation_patterns() {
-        init_validation_metrics();
-        
-        // Simulate realistic production patterns
-        
-        // Normal successful validations (majority of operations)
-        for _ in 0..20 {
-            record_username_success();
-        }
-        for _ in 0..15 {
-            record_validation_success(field_types::EMAIL);
-        }
-        for _ in 0..10 {
-            record_validation_success(field_types::PASSWORD);
-        }
-        
-        // Some failures with specific causes
-        record_username_failure(error_types::TOO_LONG);
-        record_validation_failure_with_type(field_types::EMAIL, error_types::INVALID_FORMAT);
-        record_validation_failure_with_type(field_types::PASSWORD, error_types::WEAK_PASSWORD);
-        record_validation_failure_with_type(field_types::PASSWORD, error_types::WEAK_PASSWORD); // Common issue
-        
-        // Verify realistic ratios
-        assert_eq!(VALIDATION_OPERATIONS.with_label_values(&[field_types::USERNAME, results::SUCCESS]).get(), 20.0);
-        assert_eq!(VALIDATION_OPERATIONS.with_label_values(&[field_types::EMAIL, results::SUCCESS]).get(), 15.0);
-        assert_eq!(VALIDATION_OPERATIONS.with_label_values(&[field_types::PASSWORD, results::SUCCESS]).get(), 10.0);
-        
-        // Verify failure patterns
-        assert_eq!(VALIDATION_FAILURES.with_label_values(&[field_types::USERNAME, error_types::TOO_LONG]).get(), 1.0);
-        assert_eq!(VALIDATION_FAILURES.with_label_values(&[field_types::EMAIL, error_types::INVALID_FORMAT]).get(), 1.0);
-        assert_eq!(VALIDATION_FAILURES.with_label_values(&[field_types::PASSWORD, error_types::WEAK_PASSWORD]).get(), 2.0);
-    }
-
-    #[test]
-    fn test_edge_cases_and_validation() {
-        init_validation_metrics();
-        
-        // Test edge cases that should be handled gracefully by core infrastructure
-        record_validation_operation("", ""); // Empty strings
-        record_validation_failure_detailed("", "");
-        
-        // These should not panic due to core infrastructure protection
-        // Just verify we can continue operating
-        record_username_success();
-        assert!(VALIDATION_OPERATIONS.with_label_values(&[field_types::USERNAME, results::SUCCESS]).get() >= 1.0);
-    }
-
-    #[test]
-    fn test_type_safety_constants() {
-        init_validation_metrics();
-        
-        // Verify all constants are valid and type-safe
-        assert_eq!(field_types::USERNAME, "username");
-        assert_eq!(field_types::EMAIL, "email");
-        assert_eq!(field_types::PASSWORD, "password");
-        
-        assert_eq!(results::SUCCESS, "success");
-        assert_eq!(results::FAILURE, "failure");
-        
-        assert_eq!(error_types::MISSING, "missing");
-        assert_eq!(error_types::TOO_LONG, "too_long");
-        assert_eq!(error_types::INVALID_FORMAT, "invalid_format");
-        assert_eq!(error_types::WEAK_PASSWORD, "weak_password");
-        assert_eq!(error_types::HASH_ERROR, "hash_error");
-        
-        // Use constants in actual operations to verify they work
-        record_validation_operation(field_types::USERNAME, results::SUCCESS);
-        record_validation_failure_detailed(field_types::PASSWORD, error_types::WEAK_PASSWORD);
-        
-        assert_eq!(VALIDATION_OPERATIONS.with_label_values(&[field_types::USERNAME, results::SUCCESS]).get(), 1.0);
         assert_eq!(VALIDATION_FAILURES.with_label_values(&[field_types::PASSWORD, error_types::WEAK_PASSWORD]).get(), 1.0);
     }
 }

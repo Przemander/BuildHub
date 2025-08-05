@@ -14,13 +14,16 @@ use axum::{
     response::IntoResponse,
 };
 use serde::Deserialize;
-use tracing::instrument;
+use tracing::Instrument;
 
 use crate::{
     app::AppState,
     handlers::login_logic::process_login,
-    utils::error_new::AuthServiceError, // ← Add unified error system
-    log_info,
+    utils::{
+        error_new::AuthServiceError,
+        telemetry::{http_request_span, business_operation_span, SpanExt},
+        log_new::Log,
+    },
     metricss::login_metrics::{
         record_http_request, http::{POST, OK, BAD_REQUEST, INTERNAL_SERVER_ERROR, TOO_MANY_REQUESTS},
     },
@@ -44,109 +47,77 @@ pub struct LoginRequest {
 ///
 /// Authenticates a user using either username or email address along with
 /// their password. Returns JWT tokens (access and refresh) on successful authentication.
-///
-/// ## Request Body
-/// ```json
-/// {
-///   "login": "username_or_email",
-///   "password": "user_password"
-/// }
-/// ```
-///
-/// ## Responses
-///
-/// * `200 OK` - Authentication successful, returns tokens and user info
-/// * `400 Bad Request` - Invalid credentials or validation error
-/// * `500 Internal Server Error` - Server-side error
-/// * `503 Service Unavailable` - Database unavailable
-///
-/// ## Example success response
-/// ```json
-/// {
-///   "status": "success",
-///   "message": "Authentication successful",
-///   "data": {
-///     "access_token": "<jwt-access-token>",
-///     "refresh_token": "<jwt-refresh-token>",
-///     "token_type": "Bearer",
-///     "username": "user123",
-///     "email": "user@example.com"
-///   }
-/// }
-/// ```
-///
-/// ## Example error responses
-/// ```json
-/// {
-///   "status": "validation_error",
-///   "message": "credentials: Invalid credentials"
-/// }
-/// ```
-/// ```json
-/// {
-///   "status": "service_unavailable",
-///   "message": "Could not get a database connection"
-/// }
-/// ```
-///
-/// ## Security Features
-///
-/// - Constant-time password comparison to prevent timing attacks
-/// - Generic error messages that don't reveal user existence
-/// - Consistent response timing regardless of error type
-/// - Comprehensive logging for security auditing
-#[instrument(
-    name = "login_user",
-    level = "info",
-    skip(app_state, login_request),
-    fields(
-        path = "/auth/login", 
-        method = "POST",
-        login_type = tracing::field::Empty,
-        login_length = tracing::field::Empty
-    )
-)]
 pub async fn login_handler(
     State(app_state): State<Arc<AppState>>,
     Json(login_request): Json<LoginRequest>,
-) -> Result<impl IntoResponse, AuthServiceError> { // ← Changed return type
-    // Determine login type and add useful trace information without exposing credentials
-    let login_type = if login_request.login.contains('@') { "email" } else { "username" };
-    tracing::Span::current()
-        .record("login_type", &tracing::field::display(login_type))
-        .record("login_length", &tracing::field::display(login_request.login.len()));
-
-    // Log the login attempt without revealing sensitive information
-    log_info!("Auth", &format!("Login attempt via {} (length: {})", login_type, login_request.login.len()), "attempt");
-
-    // Start HTTP duration timer
-    let start = std::time::Instant::now();
-
-    // Process the login request
-    let result = process_login(&app_state, &login_request).await;
-
-    // Record HTTP metrics
-    let duration = start.elapsed().as_secs_f64();
-    let status_code = match &result {
-        Ok(_) => OK,
-        Err(err) => match err {
-            AuthServiceError::Validation(_) => BAD_REQUEST,
-            AuthServiceError::Database(_) => INTERNAL_SERVER_ERROR,
-            AuthServiceError::Jwt(_) => INTERNAL_SERVER_ERROR,
-            AuthServiceError::Cache(_) => INTERNAL_SERVER_ERROR,
-            AuthServiceError::Configuration(_) => INTERNAL_SERVER_ERROR,
-            AuthServiceError::RateLimit(_) => TOO_MANY_REQUESTS, // Add this line
-        },
-    };
-
-    crate::metricss::login_metrics::LOGIN_HTTP_DURATION
-        .with_label_values(&[POST, &status_code.to_string()])
-        .observe(duration);
+) -> Result<impl IntoResponse, AuthServiceError> {
+    // Create HTTP request span with method and path
+    let http_span = http_request_span("POST", "/auth/login");
     
-    record_http_request(POST, status_code);
+    // Determine login type for better context without exposing credentials
+    let login_type = if login_request.login.contains('@') { "email" } else { "username" };
+    
+    // Add business context to the span
+    http_span.record("login_type", &login_type);
+    http_span.record("login_length", &login_request.login.len());
+    
+    // Clone span before moving it into the async block
+    let http_span_clone = http_span.clone();
+    
+    // Wrap the handler logic in the HTTP span for automatic tracing
+    async move {
+        // Log the login attempt using structured logging
+        Log::event(
+            "INFO",
+            "Authentication",
+            &format!("Login attempt via {} (length: {})", login_type, login_request.login.len()),
+            "attempt",
+            "login_handler"
+        );
 
-    // Return the result, letting ? operator handle error conversion
-    result
+        // Start HTTP duration timer
+        let start = std::time::Instant::now();
+
+        // Create child business operation span for the actual login operation
+        let business_span = business_operation_span("user_login");
+        // Process the login within the business span
+        let result = process_login(&app_state, &login_request)
+            .instrument(business_span)
+            .await;
+
+        // Record HTTP metrics
+        let duration = start.elapsed().as_secs_f64();
+        let status_code = match &result {
+            Ok(_) => OK,
+            Err(err) => match err {
+                AuthServiceError::Validation(_) => BAD_REQUEST,
+                AuthServiceError::Database(_) => INTERNAL_SERVER_ERROR,
+                AuthServiceError::Jwt(_) => INTERNAL_SERVER_ERROR,
+                AuthServiceError::Cache(_) => INTERNAL_SERVER_ERROR,
+                AuthServiceError::Configuration(_) => INTERNAL_SERVER_ERROR,
+                AuthServiceError::RateLimit(_) => TOO_MANY_REQUESTS,
+            },
+        };
+
+        // Record status code in the HTTP span
+        http_span.record("http.status_code", &status_code.to_string());
+
+        // If there was an error, record it in the span
+        if let Err(ref e) = result {
+            http_span.record_error(e);
+        }
+
+        crate::metricss::login_metrics::LOGIN_HTTP_DURATION
+            .with_label_values(&[POST, &status_code.to_string()])
+            .observe(duration);
+        
+        record_http_request(POST, status_code);
+
+        // Return the result, letting ? operator handle error conversion
+        result
+    }
+    .instrument(http_span_clone)
+    .await
 }
 
 #[cfg(test)]

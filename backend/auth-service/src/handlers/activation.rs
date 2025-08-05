@@ -1,4 +1,4 @@
-//! Account activation HTTP handler.
+//! Account activation HTTP handler with OpenTelemetry integration.
 //!
 //! This module implements the endpoint that handles user account activation
 //! via email confirmation links. It renders appropriate HTML responses based
@@ -19,13 +19,19 @@ use axum::{
     response::{Html, IntoResponse},
 };
 use serde::Deserialize;
-use tracing::instrument;
+use tracing::Instrument;
 
-use crate::app::AppState;
-use crate::handlers::activation_logic::process_activation; // ← Zmienione z process_activation_unified
-use crate::utils::error_new::AuthServiceError;
-use crate::metricss::activation_metrics::{
-    record_http_request, http::{GET, OK, BAD_REQUEST, INTERNAL_SERVER_ERROR},
+use crate::{
+    app::AppState,
+    handlers::activation_logic::process_activation,
+    utils::{
+        error_new::AuthServiceError,
+        telemetry::{http_request_span, business_operation_span, SpanExt},
+        log_new::Log,
+    },
+    metricss::activation_metrics::{
+        record_http_request, http::{GET, OK, BAD_REQUEST, INTERNAL_SERVER_ERROR},
+    },
 };
 
 /// Query parameters for account activation.
@@ -48,107 +54,185 @@ pub struct ActivationParams {
 ///
 /// # Returns
 /// An HTML response with a user-friendly message about the activation result
-#[instrument(
-    name = "activate_account",
-    level = "info",
-    skip(app_state),
-    fields(
-        path = "/auth/activate", 
-        method = "GET",
-        code_length = tracing::field::Empty
-    )
-)]
 pub async fn activate_account_handler(
     Query(params): Query<ActivationParams>,
     State(app_state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    // Add activation code length to trace span (without exposing the actual code)
-    tracing::Span::current().record(
-        "code_length",
-        &tracing::field::display(params.code.len())
-    );
-
-    // Start HTTP duration timer
-    let start = std::time::Instant::now();
-
-    // Process the activation code using unified error system
-    let result = process_activation(&app_state, &params.code).await;
-
-    // Record HTTP metrics
-    let duration = start.elapsed().as_secs_f64();
-    let status_code = match &result {
-        Ok(_) => OK,
-        Err(err) => match err {
-            AuthServiceError::Validation(_) => BAD_REQUEST,
-            AuthServiceError::Configuration(_) => INTERNAL_SERVER_ERROR,
-            AuthServiceError::Database(_) => INTERNAL_SERVER_ERROR,
-            _ => BAD_REQUEST,
-        },
-    };
-
-    crate::metricss::activation_metrics::ACTIVATION_HTTP_DURATION
-        .with_label_values(&[GET, &status_code.to_string()])
-        .observe(duration);
+    // Create HTTP request span with method and path
+    let http_span = http_request_span("GET", "/auth/activate");
     
-    record_http_request(GET, status_code);
+    // Add business context to the span without exposing the actual code
+    http_span.record("code_length", &params.code.len());
+    
+    // Clone span before moving it into the async block
+    let http_span_clone = http_span.clone();
+    
+    // Wrap the handler logic in the HTTP span for automatic tracing
+    async move {
+        // Log the activation attempt using structured logging
+        Log::event(
+            "INFO",
+            "Account Activation",
+            &format!("Account activation attempt with code length: {}", params.code.len()),
+            "attempt",
+            "activate_account_handler"
+        );
 
-    // Render page based on result
-    match result {
-        Ok(()) => Html(render_page(
-            "Account Activated",
-            "Your account has been successfully activated. You can now log in.",
-            "success",
-        ))
-        .into_response(),
+        // Start HTTP duration timer
+        let start = std::time::Instant::now();
+
+        // Create child business operation span for the actual activation operation
+        let business_span = business_operation_span("account_activation");
         
-        Err(AuthServiceError::Validation(validation_err)) => {
-            // Check the specific validation error type for better UX
-            let (title, message) = match validation_err.to_string().as_str() {
-                msg if msg.contains("Invalid or expired") => (
-                    "Invalid Activation Link",
-                    "The activation link is invalid or has expired. Please request a new activation link."
-                ),
-                msg if msg.contains("No user found") => (
-                    "Account Not Found", 
-                    "We couldn't find an account for this activation link. Please register or contact support."
-                ),
-                _ => (
-                    "Validation Error",
-                    "There was an issue with your activation request. Please try again or contact support."
-                ),
-            };
+        // Process the activation within the business span
+        let result = process_activation(&app_state, &params.code)
+            .instrument(business_span)
+            .await;
+
+        // Record HTTP metrics
+        let duration = start.elapsed().as_secs_f64();
+        let status_code = match &result {
+            Ok(_) => {
+                http_span.record("http.status_code", &OK.to_string());
+                OK
+            },
+            Err(err) => {
+                let code = match err {
+                    AuthServiceError::Validation(_) => BAD_REQUEST,
+                    AuthServiceError::Configuration(_) => INTERNAL_SERVER_ERROR,
+                    AuthServiceError::Database(_) => INTERNAL_SERVER_ERROR,
+                    _ => BAD_REQUEST,
+                };
+                http_span.record("http.status_code", &code.to_string());
+                http_span.record_error(err);
+                code
+            },
+        };
+
+        crate::metricss::activation_metrics::ACTIVATION_HTTP_DURATION
+            .with_label_values(&[GET, &status_code.to_string()])
+            .observe(duration);
+        
+        record_http_request(GET, status_code);
+
+        // Render page based on result
+        match result {
+            Ok(()) => {
+                Log::event(
+                    "INFO",
+                    "Account Activation",
+                    "Account successfully activated",
+                    "success",
+                    "activate_account_handler"
+                );
+                
+                Html(render_page(
+                    "Account Activated",
+                    "Your account has been successfully activated. You can now log in.",
+                    "success",
+                ))
+                .into_response()
+            },
             
-            Html(render_page(title, message, "error")).into_response()
+            Err(AuthServiceError::Validation(validation_err)) => {
+                // Check the specific validation error type for better UX
+                let (title, message) = match validation_err.to_string().as_str() {
+                    msg if msg.contains("Invalid or expired") => (
+                        "Invalid Activation Link",
+                        "The activation link is invalid or has expired. Please request a new activation link."
+                    ),
+                    msg if msg.contains("No user found") => (
+                        "Account Not Found", 
+                        "We couldn't find an account for this activation link. Please register or contact support."
+                    ),
+                    _ => (
+                        "Validation Error",
+                        "There was an issue with your activation request. Please try again or contact support."
+                    ),
+                };
+                
+                Log::event(
+                    "WARN",
+                    "Account Activation",
+                    &format!("Activation failed: {}", validation_err),
+                    "validation_error",
+                    "activate_account_handler"
+                );
+                
+                Html(render_page(title, message, "error")).into_response()
+            },
+            
+            Err(AuthServiceError::Configuration(err)) => {
+                Log::event(
+                    "ERROR",
+                    "Account Activation",
+                    &format!("Configuration error during activation: {}", err),
+                    "configuration_error",
+                    "activate_account_handler"
+                );
+                
+                Html(render_page(
+                    "Service Unavailable",
+                    "We're experiencing technical difficulties. Please try again later.",
+                    "error",
+                ))
+                .into_response()
+            },
+            
+            Err(AuthServiceError::Database(err)) => {
+                Log::event(
+                    "ERROR",
+                    "Account Activation",
+                    &format!("Database error during activation: {}", err),
+                    "database_error",
+                    "activate_account_handler"
+                );
+                
+                Html(render_page(
+                    "Service Unavailable", 
+                    "We're experiencing database issues. Please try again later.",
+                    "error",
+                ))
+                .into_response()
+            },
+            
+            Err(AuthServiceError::RateLimit(err)) => {
+                Log::event(
+                    "WARN",
+                    "Account Activation",
+                    &format!("Rate limit exceeded: {}", err),
+                    "rate_limit",
+                    "activate_account_handler"
+                );
+                
+                Html(render_page(
+                    "Too Many Requests",
+                    "You've made too many activation attempts. Please wait a moment before trying again.",
+                    "error",
+                ))
+                .into_response()
+            },
+            
+            Err(err) => {
+                Log::event(
+                    "ERROR",
+                    "Account Activation",
+                    &format!("Unexpected error during activation: {}", err),
+                    "unexpected_error",
+                    "activate_account_handler"
+                );
+                
+                Html(render_page(
+                    "Activation Failed",
+                    "We couldn't activate your account. Please try again or contact support.",
+                    "error",
+                ))
+                .into_response()
+            },
         }
-        
-        Err(AuthServiceError::Configuration(_)) => Html(render_page(
-            "Service Unavailable",
-            "We're experiencing technical difficulties. Please try again later.",
-            "error",
-        ))
-        .into_response(),
-        
-        Err(AuthServiceError::Database(_)) => Html(render_page(
-            "Service Unavailable", 
-            "We're experiencing database issues. Please try again later.",
-            "error",
-        ))
-        .into_response(),
-        
-        Err(AuthServiceError::RateLimit(_)) => Html(render_page(
-            "Too Many Requests",
-            "You've made too many activation attempts. Please wait a moment before trying again.",
-            "error",
-        ))
-        .into_response(),
-        
-        Err(_) => Html(render_page(
-            "Activation Failed",
-            "We couldn't activate your account. Please try again or contact support.",
-            "error",
-        ))
-        .into_response(),
     }
+    .instrument(http_span_clone)
+    .await
 }
 
 /// Renders a simple HTML page with a title and message.

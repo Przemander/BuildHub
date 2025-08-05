@@ -15,12 +15,15 @@
 //! - **Performance Optimization**: Tuned pool settings for high-concurrency workloads
 
 use crate::utils::error_new::DatabaseError;
+use crate::utils::log_new::Log; // ✅ NOWY SYSTEM LOGOWANIA
+use crate::utils::telemetry::{business_operation_span, SpanExt}; // ✅ OPENTELEMETRY SPANS
 use crate::metricss::database_metrics::{pool, connection, migration};
-use crate::{log_error, log_info};
 use diesel::r2d2::{ConnectionManager, Pool, PooledConnection};
 use diesel::SqliteConnection;
+use diesel::prelude::*; // ✅ FIX 1: Dodajemy prelude dla RunQueryDsl trait
 use std::env;
 use std::time::Duration;
+use tracing::Instrument; // ✅ ASYNC INSTRUMENTATION
 use tracing_error::SpanTrace;
 
 // =============================================================================
@@ -62,50 +65,82 @@ const DEFAULT_MIN_IDLE: u32 = 1;
 /// - The database URL is invalid or inaccessible
 /// - Pool creation fails due to filesystem permissions or other system issues
 pub fn init_pool() -> DbPool {
-    let database_url = env::var(DATABASE_URL_ENV)
-        .expect("DATABASE_URL must be set in .env or environment variables");
-
-    pool::record_startup_attempt();
-
-    log_info!(
-        "Database", 
-        &format!("Initializing connection pool with URL: {}", mask_db_url(&database_url)), 
-        "initialization"
-    );
+    // Create span for pool initialization
+    let span = business_operation_span("init_database_pool");
+    span.record("max_pool_size", &DEFAULT_MAX_POOL_SIZE);
+    span.record("min_idle", &DEFAULT_MIN_IDLE);
+    span.record("timeout_seconds", &DEFAULT_CONNECTION_TIMEOUT_SECONDS);
     
-    let manager = ConnectionManager::<SqliteConnection>::new(database_url);
-
-    // Configure the pool with production-optimized settings
-    let pool = Pool::builder()
-        .max_size(DEFAULT_MAX_POOL_SIZE)
-        .min_idle(Some(DEFAULT_MIN_IDLE))
-        .connection_timeout(Duration::from_secs(DEFAULT_CONNECTION_TIMEOUT_SECONDS))
-        .build(manager)
-        .unwrap_or_else(|e| {
-            log_error!(
-                "Database", 
-                &format!("Failed to create connection pool: {}", e), 
-                "initialization_error"
+    // Use span to wrap the initialization logic
+    span.in_scope(|| {
+        let database_url = env::var(DATABASE_URL_ENV).unwrap_or_else(|e| {
+            Log::event(
+                "ERROR",
+                "Database Configuration",
+                &format!("Missing {} environment variable", DATABASE_URL_ENV),
+                "initialization_error",
+                "init_pool"
             );
-            
-            pool::record_startup_failure();
-            panic!("Failed to create database connection pool: {}", e);
+            span.record("result", &"failure");
+            span.record("failure_reason", &"missing_env_var");
+            span.record_error(&e);
+            panic!("DATABASE_URL must be set in .env or environment variables");
         });
 
-    log_info!(
-        "Database", 
-        &format!(
-            "Connection pool initialized successfully (max_size={}, min_idle={}, timeout={}s)", 
-            DEFAULT_MAX_POOL_SIZE, 
-            DEFAULT_MIN_IDLE, 
-            DEFAULT_CONNECTION_TIMEOUT_SECONDS
-        ), 
-        "initialization_success"
-    );
-    
-    pool::record_startup_success();
-    
-    pool
+        pool::record_startup_attempt();
+
+        Log::event(
+            "INFO",
+            "Database Configuration",
+            &format!("Initializing connection pool with URL: {}", mask_db_url(&database_url)),
+            "initialization_attempt",
+            "init_pool"
+        );
+        
+        span.record("database_url_masked", &mask_db_url(&database_url));
+        
+        let manager = ConnectionManager::<SqliteConnection>::new(database_url);
+
+        // Configure the pool with production-optimized settings
+        let pool = Pool::builder()
+            .max_size(DEFAULT_MAX_POOL_SIZE)
+            .min_idle(Some(DEFAULT_MIN_IDLE))
+            .connection_timeout(Duration::from_secs(DEFAULT_CONNECTION_TIMEOUT_SECONDS))
+            .build(manager)
+            .unwrap_or_else(|e| {
+                Log::event(
+                    "ERROR",
+                    "Database Configuration",
+                    &format!("Failed to create connection pool: {}", e),
+                    "initialization_error",
+                    "init_pool"
+                );
+                
+                pool::record_startup_failure();
+                span.record("result", &"failure");
+                span.record("failure_reason", &"pool_creation_failed");
+                span.record_error(&e);
+                panic!("Failed to create database connection pool: {}", e);
+            });
+
+        Log::event(
+            "INFO",
+            "Database Configuration",
+            &format!(
+                "Connection pool initialized successfully (max_size={}, min_idle={}, timeout={}s)",
+                DEFAULT_MAX_POOL_SIZE,
+                DEFAULT_MIN_IDLE,
+                DEFAULT_CONNECTION_TIMEOUT_SECONDS
+            ),
+            "initialization_success",
+            "init_pool"
+        );
+        
+        pool::record_startup_success();
+        span.record("result", &"success");
+        
+        pool
+    })
 }
 
 // =============================================================================
@@ -121,28 +156,58 @@ pub fn init_pool() -> DbPool {
 /// * `pool` - Database connection pool
 #[allow(dead_code)]
 pub fn get_connection(pool: &DbPool) -> Result<DbConnection, DatabaseError> {
-    connection::record_runtime_attempt();
+    // Create span for connection acquisition
+    let span = business_operation_span("get_database_connection");
+    span.record("connection_type", &"runtime");
     
-    match pool.get() {
-        Ok(conn) => {
-            connection::record_runtime_success();
-            Ok(conn)
+    // Use span to wrap the connection acquisition
+    span.in_scope(|| {
+        connection::record_runtime_attempt();
+        
+        Log::event(
+            "DEBUG",
+            "Database Connection",
+            "Acquiring runtime connection from pool",
+            "connection_attempt",
+            "get_connection"
+        );
+        
+        match pool.get() {
+            Ok(conn) => {
+                connection::record_runtime_success();
+                span.record("result", &"success");
+                
+                Log::event(
+                    "DEBUG",
+                    "Database Connection",
+                    "Runtime connection acquired successfully",
+                    "connection_success",
+                    "get_connection"
+                );
+                
+                Ok(conn)
+            }
+            Err(e) => {
+                Log::event(
+                    "ERROR",
+                    "Database Connection",
+                    &format!("Failed to acquire connection from pool: {}", e),
+                    "connection_error",
+                    "get_connection"
+                );
+                
+                connection::record_runtime_failure();
+                span.record("result", &"failure");
+                span.record("failure_reason", &"pool_acquisition_failed");
+                span.record_error(&e);
+                
+                Err(DatabaseError::ConnectionPool {
+                    source: e,
+                    span: SpanTrace::capture(),
+                })
+            }
         }
-        Err(e) => {
-            log_error!(
-                "Database", 
-                &format!("Failed to acquire connection from pool: {}", e), 
-                "connection_error"
-            );
-            
-            connection::record_runtime_failure();
-            
-            Err(DatabaseError::ConnectionPool {
-                source: e,
-                span: SpanTrace::capture(),
-            })
-        }
-    }
+    })
 }
 
 /// Acquires a database connection for startup operations (migrations, health checks).
@@ -153,28 +218,58 @@ pub fn get_connection(pool: &DbPool) -> Result<DbConnection, DatabaseError> {
 /// # Arguments
 /// * `pool` - Database connection pool
 pub fn get_startup_connection(pool: &DbPool) -> Result<DbConnection, DatabaseError> {
-    connection::record_startup_attempt();
+    // Create span for startup connection acquisition
+    let span = business_operation_span("get_startup_connection");
+    span.record("connection_type", &"startup");
     
-    match pool.get() {
-        Ok(conn) => {
-            connection::record_startup_success();
-            Ok(conn)
+    // Use span to wrap the connection acquisition
+    span.in_scope(|| {
+        connection::record_startup_attempt();
+        
+        Log::event(
+            "DEBUG",
+            "Database Connection",
+            "Acquiring startup connection from pool",
+            "startup_connection_attempt",
+            "get_startup_connection"
+        );
+        
+        match pool.get() {
+            Ok(conn) => {
+                connection::record_startup_success();
+                span.record("result", &"success");
+                
+                Log::event(
+                    "DEBUG",
+                    "Database Connection",
+                    "Startup connection acquired successfully",
+                    "startup_connection_success",
+                    "get_startup_connection"
+                );
+                
+                Ok(conn)
+            }
+            Err(e) => {
+                Log::event(
+                    "ERROR",
+                    "Database Connection",
+                    &format!("Failed to acquire startup connection from pool: {}", e),
+                    "startup_connection_error",
+                    "get_startup_connection"
+                );
+                
+                connection::record_startup_failure();
+                span.record("result", &"failure");
+                span.record("failure_reason", &"startup_pool_acquisition_failed");
+                span.record_error(&e);
+                
+                Err(DatabaseError::ConnectionPool {
+                    source: e,
+                    span: SpanTrace::capture(),
+                })
+            }
         }
-        Err(e) => {
-            log_error!(
-                "Database", 
-                &format!("Failed to acquire startup connection from pool: {}", e), 
-                "startup_connection_error"
-            );
-            
-            connection::record_startup_failure();
-            
-            Err(DatabaseError::ConnectionPool {
-                source: e,
-                span: SpanTrace::capture(),
-            })
-        }
-    }
+    })
 }
 
 // =============================================================================
@@ -191,51 +286,157 @@ pub fn run_migrations(pool: &DbPool) -> Result<(), DatabaseError> {
 
     const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
-    // Acquire connection for migration execution using startup context
-    let mut conn = get_startup_connection(pool)?;
-
-    log_info!("Database", "Starting migration execution...", "migration_attempt");
+    // Create span for migration execution
+    let span = business_operation_span("run_database_migrations");
+    span.record("migration_source", &"embedded");
     
-    migration::record_startup_attempt();
-    
-    // Execute pending migrations with comprehensive result handling
-    match conn.run_pending_migrations(MIGRATIONS) {
-        Ok(applied_migrations) => {
-            let migration_count = applied_migrations.len();
-            
-            if migration_count > 0 {
-                log_info!(
-                    "Database", 
-                    &format!("Successfully applied {} migration(s)", migration_count), 
-                    "migration_success"
-                );
-            } else {
-                log_info!(
-                    "Database", 
-                    "Database schema is up to date - no pending migrations", 
-                    "migration_success"
-                );
+    // Use span to wrap the migration logic
+    span.in_scope(|| {
+        Log::event(
+            "INFO",
+            "Database Migration",
+            "Starting migration execution...",
+            "migration_attempt",
+            "run_migrations"
+        );
+        
+        migration::record_startup_attempt();
+        
+        // Acquire connection for migration execution using startup context
+        let mut conn = get_startup_connection(pool)?;
+        
+        // Execute pending migrations with comprehensive result handling
+        match conn.run_pending_migrations(MIGRATIONS) {
+            Ok(applied_migrations) => {
+                let migration_count = applied_migrations.len();
+                span.record("migrations_applied", &migration_count);
+                span.record("result", &"success");
+                
+                if migration_count > 0 {
+                    Log::event(
+                        "INFO",
+                        "Database Migration",
+                        &format!("Successfully applied {} migration(s)", migration_count),
+                        "migration_success",
+                        "run_migrations"
+                    );
+                } else {
+                    Log::event(
+                        "INFO",
+                        "Database Migration",
+                        "Database schema is up to date - no pending migrations",
+                        "migration_success",
+                        "run_migrations"
+                    );
+                }
+                
+                migration::record_startup_success();
+                Ok(())
             }
-            
-            migration::record_startup_success();
-            Ok(())
+            Err(migration_error) => {
+                Log::event(
+                    "ERROR",
+                    "Database Migration",
+                    &format!("Migration execution failed: {}", migration_error),
+                    "migration_failure",
+                    "run_migrations"
+                );
+                
+                migration::record_startup_failure();
+                span.record("result", &"failure");
+                span.record("failure_reason", &"migration_execution_failed");
+                span.record_error(&migration_error);
+                
+                // Wrap migration error with context for debugging
+                Err(DatabaseError::Migration {
+                    source: migration_error,
+                    span: SpanTrace::capture(),
+                })
+            }
         }
-        Err(migration_error) => {
-            log_error!(
-                "Database",
-                &format!("Migration execution failed: {}", migration_error),
-                "migration_failure"
-            );
-            
-            migration::record_startup_failure();
-            
-            // Wrap migration error with context for debugging
-            Err(DatabaseError::Migration {
-                source: migration_error,
-                span: SpanTrace::capture(),
-            })
+    })
+}
+
+/// Performs a comprehensive database health check with detailed diagnostics.
+pub async fn check_database_health(pool: &DbPool) -> Result<bool, DatabaseError> {
+    // Create span for health check
+    let span = business_operation_span("database_health_check");
+    
+    // Clone span before moving it into async operation
+    let span_clone = span.clone();
+    
+    // Wrap the health check in async instrumentation
+    async move {
+        Log::event(
+            "DEBUG",
+            "Database Health",
+            "Starting database health check",
+            "health_check_attempt",
+            "check_database_health"
+        );
+        
+        // Test connection acquisition
+        match get_connection(pool) {
+            Ok(mut conn) => {
+                span.record("connection_acquired", &true);
+                
+                // ✅ FIX 1: Test a simple query with proper RunQueryDsl trait
+                match diesel::sql_query("SELECT 1").execute(&mut conn) {
+                    Ok(_) => {
+                        span.record("query_successful", &true);
+                        span.record("result", &"healthy");
+                        
+                        Log::event(
+                            "INFO",
+                            "Database Health",
+                            "Database health check successful",
+                            "health_check_success",
+                            "check_database_health"
+                        );
+                        
+                        Ok(true)
+                    }
+                    Err(e) => {
+                        span.record("query_successful", &false);
+                        span.record("result", &"unhealthy");
+                        span.record("failure_reason", &"query_failed");
+                        span.record_error(&e);
+                        
+                        Log::event(
+                            "ERROR",
+                            "Database Health",
+                            &format!("Database health check query failed: {}", e),
+                            "health_check_query_failure",
+                            "check_database_health"
+                        );
+                        
+                        Err(DatabaseError::Query {
+                            source: e,
+                            span: SpanTrace::capture(),
+                        })
+                    }
+                }
+            }
+            Err(e) => {
+                span.record("connection_acquired", &false);
+                span.record("result", &"unhealthy");
+                span.record("failure_reason", &"connection_failed");
+                span.record_error(&e);
+                
+                Log::event(
+                    "ERROR",
+                    "Database Health",
+                    &format!("Database health check connection failed: {}", e),
+                    "health_check_connection_failure",
+                    "check_database_health"
+                );
+                
+                Err(e)
+            }
         }
     }
+    .instrument(span_clone)
+    .await
 }
 
 // =============================================================================
@@ -332,6 +533,18 @@ mod tests {
         let _pool = init_pool();
     }
 
+    #[tokio::test]
+    async fn test_database_health_check() {
+        setup_test_environment();
+        let db_url = create_unique_test_db_url();
+        env::set_var(DATABASE_URL_ENV, &db_url);
+        
+        let pool = init_pool();
+        let health_result = check_database_health(&pool).await;
+        assert!(health_result.is_ok());
+        assert_eq!(health_result.unwrap(), true);
+    }
+
     #[test]
     fn test_migration_execution_is_idempotent() {
         setup_test_environment();
@@ -346,7 +559,7 @@ mod tests {
         assert!(second_result.is_ok());
         
         let third_result = run_migrations(&pool);
-        assert!(third_result.is_ok());
+        assert!(third_result.is_ok()); // ✅ FIX 2: Poprawiony typo
     }
     
     #[test]

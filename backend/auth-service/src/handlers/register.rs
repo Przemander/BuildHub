@@ -5,23 +5,25 @@
 //! - User creation in the database
 //! - Account activation flow via email
 //! - Unified error handling with automatic HTTP response conversion
-//! - **Complete HTTP-level metrics integration**
-//! - OpenAPI documentation
-//! - Comprehensive request tracing
+//! - Complete HTTP-level metrics integration
+//! - Comprehensive request tracing with OpenTelemetry
 
 use axum::{
     extract::{Json, State},
     response::IntoResponse,
 };
 use std::sync::Arc;
-use tracing::instrument;
+use tracing::Instrument;
 
 use crate::{
     app::AppState,
     db::users::RegisterData,
     handlers::register_logic::process_registration,
-    utils::error_new::AuthServiceError,
-    // ✅ PERFECT: Import HTTP metrics from our register_metrics module
+    utils::{
+        error_new::AuthServiceError,
+        telemetry::{http_request_span, business_operation_span, SpanExt},
+        log_new::Log,
+    },
     metricss::register_metrics::{
         record_http_request, http
     },
@@ -33,89 +35,79 @@ use crate::{
 ///
 /// Takes JSON user data, validates it, creates an inactive account, 
 /// and initiates the email verification flow.
-///
-/// ## HTTP Metrics Generated
-/// - `registration_http_requests_total{method="POST", status_code="201|400|500"}`
-/// - `registration_http_duration_seconds{method="POST", status_code="201|400|500"}`
-/// - Plus all business-level metrics from `process_registration()`
-///
-/// ## Request body
-/// ```json
-/// {
-///   "username": "johndoe",
-///   "email": "john.doe@example.com",
-///   "password": "SecureP@ssw0rd"
-/// }
-/// ```
-///
-/// ## Responses
-///
-/// * `201 Created` - Registration successful, verification email sent
-/// * `400 Bad Request` - Invalid input data (validation errors)
-/// * `500 Internal Server Error` - Server-side error (config/database issues)
-///
-/// ## Example success response
-/// ```json
-/// {
-///   "status": "success",
-///   "message": "Registration successful! Please check your email to activate your account."
-/// }
-/// ```
-#[instrument(
-    name = "register_user",
-    level = "info",
-    skip(app_state, register_data),
-    fields(
-        path = "/auth/register",
-        method = "POST",
-        username = tracing::field::Empty,
-        email_domain = tracing::field::Empty,
-        http_status = tracing::field::Empty
-    )
-)]
 pub async fn register_handler(
     State(app_state): State<Arc<AppState>>,
     Json(register_data): Json<RegisterData>,
 ) -> Result<impl IntoResponse, AuthServiceError> {
-    // Add useful trace information without exposing full PII
-    tracing::Span::current()
-        .record("username", &tracing::field::display(&register_data.username))
-        .record(
-            "email_domain",
-            &tracing::field::display(
-                register_data
-                    .email
-                    .split('@')
-                    .nth(1)
-                    .unwrap_or("invalid"),
+    // Create HTTP request span with method and path
+    let http_span = http_request_span("POST", "/auth/register");
+    
+    // Add business context to the span without exposing full PII
+    http_span.record("username", &register_data.username);
+    http_span.record(
+        "email_domain",
+        &register_data
+            .email
+            .split('@')
+            .nth(1)
+            .unwrap_or("invalid"),
+    );
+    
+    // Clone span before moving it into the async block
+    let http_span_clone = http_span.clone();
+    
+    // Wrap the handler logic in the HTTP span for automatic tracing
+    async move {
+        // Log the registration attempt using structured logging
+        Log::event(
+            "INFO",
+            "Registration",
+            &format!(
+                "Registration attempt for username: {}, email domain: {}", 
+                register_data.username,
+                register_data.email.split('@').nth(1).unwrap_or("invalid")
             ),
+            "attempt",
+            "register_handler"
         );
 
-    // ✅ PERFECT: Process registration with automatic HTTP metrics
-    let result = process_registration(&app_state, register_data).await;
-    
-    // ✅ Record HTTP metrics based on result with proper status code mapping
-    match &result {
-        Ok(_) => {
-            record_http_request(http::POST, http::CREATED);
-            tracing::Span::current().record("http_status", 201);
+        // Create child business operation span for the actual registration operation
+        let business_span = business_operation_span("user_registration");
+        
+        // Process the registration within the business span
+        let result = process_registration(&app_state, register_data)
+            .instrument(business_span)
+            .await;
+        
+        // Map result to HTTP status for metrics and span context
+        let status_code = match &result {
+            Ok(_) => {
+                http_span.record("http.status_code", &http::CREATED.to_string());
+                http::CREATED
+            }
+            Err(AuthServiceError::Validation(_)) => {
+                http_span.record("http.status_code", &http::BAD_REQUEST.to_string());
+                http::BAD_REQUEST
+            }
+            Err(_) => {
+                http_span.record("http.status_code", &http::INTERNAL_SERVER_ERROR.to_string());
+                http::INTERNAL_SERVER_ERROR
+            }
+        };
+        
+        // If there was an error, record it in the span
+        if let Err(ref e) = result {
+            http_span.record_error(e);
         }
-        Err(AuthServiceError::Validation(_)) => {
-            record_http_request(http::POST, http::BAD_REQUEST);
-            tracing::Span::current().record("http_status", 400);
-        }
-        Err(AuthServiceError::Configuration(_)) => {
-            record_http_request(http::POST, http::INTERNAL_SERVER_ERROR);
-            tracing::Span::current().record("http_status", 500);
-        }
-        Err(_) => {
-            // Any other error type is treated as internal server error
-            record_http_request(http::POST, http::INTERNAL_SERVER_ERROR);
-            tracing::Span::current().record("http_status", 500);
-        }
+        
+        // Record HTTP metrics
+        record_http_request(http::POST, status_code);
+        
+        // Return the result, letting ? operator handle error conversion
+        result
     }
-    
-    result
+    .instrument(http_span_clone)
+    .await
 }
 
 #[cfg(test)]

@@ -11,7 +11,7 @@ use prometheus::{
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::{fmt, error};
-use crate::log_warn;
+use crate::utils::log_new::Log; // ✅ FIX: Używamy nowego systemu logowania
 
 // =============================================================================
 // ERROR HANDLING
@@ -103,6 +103,64 @@ pub const LATENCY_BUCKETS_MEDIUM: &[f64] = &[
 pub const LATENCY_BUCKETS_SLOW: &[f64] = &[
     0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
 ];
+
+// =============================================================================
+// STARTUP METRICS - ✅ DODANO BRAKUJĄCE FUNKCJE
+// =============================================================================
+
+lazy_static! {
+    /// Service startup metrics
+    static ref STARTUP_COUNTER: Counter = Counter::new(
+        "buildhub_auth_service_startup_attempts_total",
+        "Total number of service startup attempts"
+    ).expect("Failed to create startup counter");
+    
+    static ref STARTUP_SUCCESS_COUNTER: Counter = Counter::new(
+        "buildhub_auth_service_startup_success_total",
+        "Total number of successful service startups"
+    ).expect("Failed to create startup success counter");
+    
+    static ref STARTUP_FAILURE_COUNTER: Counter = Counter::new(
+        "buildhub_auth_service_startup_failures_total",
+        "Total number of failed service startups"
+    ).expect("Failed to create startup failure counter");
+}
+
+/// Records a service startup attempt
+pub fn record_startup_attempt() {
+    STARTUP_COUNTER.inc();
+    Log::event(
+        "DEBUG",
+        "Startup Metrics",
+        "Recorded service startup attempt",
+        "startup_attempt_recorded",
+        "record_startup_attempt"
+    );
+}
+
+/// Records a successful service startup
+pub fn record_startup_success() {
+    STARTUP_SUCCESS_COUNTER.inc();
+    Log::event(
+        "INFO",
+        "Startup Metrics",
+        "Recorded successful service startup",
+        "startup_success_recorded",
+        "record_startup_success"
+    );
+}
+
+/// Records a failed service startup
+pub fn record_startup_failure() {
+    STARTUP_FAILURE_COUNTER.inc();
+    Log::event(
+        "ERROR",
+        "Startup Metrics",
+        "Recorded failed service startup",
+        "startup_failure_recorded",
+        "record_startup_failure"
+    );
+}
 
 // =============================================================================
 // LABEL VALIDATION & CARDINALITY PROTECTION
@@ -230,10 +288,12 @@ pub fn register_metric<C: Collector + Clone + 'static>(metric: &C) -> Result<(),
         Ok(_) => Ok(()),
         Err(err) => {
             // Most likely a duplicate, which is fine during hot reloads or tests
-            log_warn!(
-                "Metrics", 
+            Log::event(
+                "WARN",
+                "Metrics Registration",
                 &format!("Metric registration issue (likely duplicate): {}", err),
-                "metric_registration"
+                "metric_registration_warning",
+                "register_metric"
             );
             Err(MetricError::Registration(err.to_string()))
         }
@@ -337,7 +397,6 @@ pub fn create_histogram_vec(
 // SAFE OBSERVATION FUNCTIONS
 // =============================================================================
 
-// ✅ Usunięto nieużywany komentarz dokumentacyjny
 lazy_static! {
     static ref METRIC_ERRORS: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
 }
@@ -463,7 +522,13 @@ fn log_metric_error(message: &str) {
     *count += 1;
     
     if *count <= MAX_METRIC_ERRORS_TO_LOG {
-        log_warn!("Metrics", message, "metric_error");
+        Log::event(
+            "WARN",
+            "Metrics",
+            message,
+            "metric_error",
+            "log_metric_error"
+        );
     }
 }
 
@@ -474,6 +539,19 @@ fn log_metric_error(message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    
+    #[test]
+    fn test_startup_metrics() {
+        // Test startup metrics functions
+        record_startup_attempt();
+        assert!(STARTUP_COUNTER.get() >= 1.0);
+        
+        record_startup_success();
+        assert!(STARTUP_SUCCESS_COUNTER.get() >= 1.0);
+        
+        record_startup_failure();
+        assert!(STARTUP_FAILURE_COUNTER.get() >= 1.0);
+    }
     
     #[test]
     fn test_label_validation() {

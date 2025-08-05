@@ -1,4 +1,4 @@
-//! Business logic for JWT token refresh operations.
+//! Business logic for JWT token refresh operations with OpenTelemetry integration.
 //!
 //! This module implements the OAuth2-compatible token refresh flow with:
 //! - Validated token exchange (refresh token → access token)
@@ -6,7 +6,7 @@
 //! - Comprehensive token validation checks
 //! - Redis-based token revocation
 //! - Unified error handling with automatic HTTP response conversion
-//! - **Full observability through comprehensive refresh metrics**
+//! - Complete OpenTelemetry observability with hierarchical spans
 //!
 //! Security features include:
 //! - Immediate revocation of used refresh tokens to prevent replay attacks
@@ -15,14 +15,15 @@
 
 use crate::{
     app::AppState,
-    log_info, log_warn,
     utils::{
         error_new::AuthServiceError,
         jwt::{
             generate_token, revoke_token, validate_token, TOKEN_TYPE_ACCESS, TOKEN_TYPE_REFRESH,
         },
+        log_new::Log,
+        telemetry::{business_operation_span, redis_operation_span, SpanExt},
     },
-    // Import the new refresh metrics
+    // Import the refresh metrics
     metricss::refresh_metrics::{
         // High-level complete flow tracking
         time_complete_refresh_flow, record_refresh_success, record_refresh_failure,
@@ -38,8 +39,9 @@ use crate::{
 };
 use axum::{http::StatusCode, response::IntoResponse, Json};
 use serde_json::json;
+use tracing::Instrument;
 
-/// Processes a token refresh operation according to OAuth2 specification with complete metrics.
+/// Processes a token refresh operation according to OAuth2 specification with complete observability.
 ///
 /// # Metrics Generated
 /// - `refresh_operations_total{step="complete_flow|token_validation|token_type_check|token_revocation|access_token_generation|refresh_token_generation", result="success|failure"}`
@@ -71,141 +73,322 @@ pub async fn process_token_refresh(
     // Start complete refresh flow timer for end-to-end performance monitoring
     let _complete_flow_timer = time_complete_refresh_flow();
     
-    log_info!(
-        "Auth", 
+    // Create span for the entire token refresh processing flow
+    let process_span = business_operation_span("process_token_refresh");
+    process_span.record("token_length", &token.len());
+    
+    // Clone span before moving it into the async block
+    let process_span_clone = process_span.clone();
+    
+    Log::event(
+        "INFO",
+        "Token Refresh", 
         "Starting token refresh operation", 
-        "refresh_start"
+        "refresh_start",
+        "process_token_refresh"
     );
 
-    // Step 1: Get Redis client for token operations with configuration validation
-    let redis_client = app_state
-        .redis_client
-        .as_ref()
-        .ok_or_else(|| {
-            record_refresh_failure(); // Record overall failure
-            AuthServiceError::configuration("Redis client not available for token operations")
-        })?;
+    // Wrap token refresh logic in the process_span
+    async move {
+        // Step 1: Get Redis client for token operations with configuration validation
+        let redis_client = app_state
+            .redis_client
+            .as_ref()
+            .ok_or_else(|| {
+                record_refresh_failure(); // Record overall failure
+                process_span.record("business.result", &"failure");
+                process_span.record("failure_reason", &"missing_redis_client");
+                
+                Log::event(
+                    "ERROR",
+                    "Token Refresh",
+                    "Redis client not available for token operations",
+                    "configuration_error",
+                    "process_token_refresh"
+                );
+                
+                AuthServiceError::configuration("Redis client not available for token operations")
+            })?;
 
-    // Step 2: Validate the refresh token with detailed metrics
-    log_info!("Auth", "Starting token validation", "token_validation_start");
-    
-    let claims = match validate_token(token, redis_client).await {
-        Ok(claims) => {
-            record_token_validation_success();
-            log_info!("Auth", "Token validation successful", "token_validation_success");
-            claims
-        }
-        Err(e) => {
-            // Categorize validation failure for detailed monitoring
-            let error_type = categorize_jwt_error(&e);
-            record_token_validation_failure(error_type);
-            record_refresh_failure(); // Also record overall failure
-            
-            log_warn!("Auth", &format!("Token validation failed: {}", e), "token_validation_failure");
-            return Err(e);
-        }
-    };
-
-    // Step 3: Verify token is of the correct type with metrics
-    log_info!("Auth", "Starting token type check", "token_type_check_start");
-    
-    if claims.token_type != TOKEN_TYPE_REFRESH {
-        record_token_type_check_failure(error_types::WRONG_TOKEN_TYPE);
-        record_refresh_failure(); // Also record overall failure
+        // Step 2: Validate the refresh token with detailed metrics and span
+        let validation_span = business_operation_span("validate_token");
+        let validation_span_clone = validation_span.clone();
         
-        log_warn!(
-            "Auth",
-            &format!("Wrong token type: expected {}, got {}", TOKEN_TYPE_REFRESH, claims.token_type),
-            "wrong_token_type"
+        Log::event(
+            "INFO",
+            "Token Refresh", 
+            "Starting token validation", 
+            "token_validation_start",
+            "process_token_refresh"
         );
         
-        return Err(AuthServiceError::validation(
-            "token_type",
-            "Expected a refresh token"
-        ));
-    }
-    
-    record_token_type_check_success();
-    log_info!("Auth", "Token type check successful", "token_type_check_success");
-
-    // Step 4: Generate new access token with metrics
-    log_info!("Auth", "Starting access token generation", "access_token_generation_start");
-    
-    let access_token = match generate_token(&claims.sub, TOKEN_TYPE_ACCESS, None) {
-        Ok(token) => {
-            record_access_token_generation_success();
-            log_info!("Auth", "Access token generation successful", "access_token_generation_success");
-            token
-        }
-        Err(e) => {
-            record_access_token_generation_failure(error_types::GENERATION_ERROR);
-            record_refresh_failure(); // Also record overall failure
-            
-            log_warn!("Auth", &format!("Access token generation failed: {}", e), "access_token_generation_failure");
-            return Err(e);
-        }
-    };
-
-    // Step 5: Revoke old refresh token (implement token rotation for security) with metrics
-    log_info!("Auth", "Starting token revocation", "token_revocation_start");
-    
-    match revoke_token(token, redis_client).await {
-        Ok(()) => {
-            record_token_revocation_success();
-            log_info!("Auth", "Token revocation successful", "token_revocation_success");
-        }
-        Err(e) => {
-            record_token_revocation_failure(error_types::REVOCATION_FAILED);
-            // Note: We continue even if revocation fails to provide better UX
-            // but we log it as a warning for security monitoring
-            log_warn!(
-                "Auth",
-                &format!("Failed to revoke old refresh token: {}", e),
-                "token_revocation_warning"
-            );
-            // Continue without failing - user gets new tokens but old one might still be valid briefly
-        }
-    }
-
-    // Step 6: Generate new refresh token with metrics
-    log_info!("Auth", "Starting refresh token generation", "refresh_token_generation_start");
-    
-    let refresh_token = match generate_token(&claims.sub, TOKEN_TYPE_REFRESH, None) {
-        Ok(token) => {
-            record_refresh_token_generation_success();
-            log_info!("Auth", "Refresh token generation successful", "refresh_token_generation_success");
-            token
-        }
-        Err(e) => {
-            record_refresh_token_generation_failure(error_types::GENERATION_ERROR);
-            record_refresh_failure(); // Also record overall failure
-            
-            log_warn!("Auth", &format!("Refresh token generation failed: {}", e), "refresh_token_generation_failure");
-            return Err(e);
-        }
-    };
-
-    // Complete success - record overall success
-    record_refresh_success();
-    log_info!(
-        "Auth",
-        &format!("Token refresh completed successfully for user: {}", claims.sub),
-        "refresh_success"
-    );
-
-    // Return new token pair in OAuth2-compatible format using Axum's Json wrapper
-    Ok((
-        StatusCode::OK,
-        Json(json!({
-            "status": "success",
-            "message": "Tokens refreshed successfully",
-            "data": {
-                "access_token": access_token,
-                "refresh_token": refresh_token,
-                "token_type": "Bearer"
+        let claims = async {
+            match validate_token(token, redis_client).await {
+                Ok(claims) => {
+                    record_token_validation_success();
+                    validation_span.record("business.result", &"success");
+                    
+                    Log::event(
+                        "INFO",
+                        "Token Refresh", 
+                        "Token validation successful", 
+                        "token_validation_success",
+                        "process_token_refresh"
+                    );
+                    
+                    Ok(claims)
+                }
+                Err(e) => {
+                    // Categorize validation failure for detailed monitoring
+                    let error_type = categorize_jwt_error(&e);
+                    record_token_validation_failure(error_type);
+                    record_refresh_failure(); // Also record overall failure
+                    validation_span.record("business.result", &"failure");
+                    validation_span.record("failure_reason", &error_type);
+                    validation_span.record_error(&e);
+                    
+                    Log::event(
+                        "WARN",
+                        "Token Refresh", 
+                        &format!("Token validation failed: {}", e), 
+                        "token_validation_failure",
+                        "process_token_refresh"
+                    );
+                    
+                    Err(e)
+                }
             }
-        })),
-    ))
+        }
+        .instrument(validation_span_clone)
+        .await?;
+
+        // Step 3: Verify token is of the correct type with metrics and span
+        let type_check_span = business_operation_span("token_type_check");
+        let type_check_span_clone = type_check_span.clone();
+        
+        Log::event(
+            "INFO",
+            "Token Refresh", 
+            "Starting token type check", 
+            "token_type_check_start",
+            "process_token_refresh"
+        );
+        
+        async {
+            if claims.token_type != TOKEN_TYPE_REFRESH {
+                record_token_type_check_failure(error_types::WRONG_TOKEN_TYPE);
+                record_refresh_failure(); // Also record overall failure
+                type_check_span.record("business.result", &"failure");
+                type_check_span.record("failure_reason", &"wrong_token_type");
+                type_check_span.record("expected", &TOKEN_TYPE_REFRESH);
+                type_check_span.record("actual", &claims.token_type);
+                
+                Log::event(
+                    "WARN",
+                    "Token Refresh",
+                    &format!("Wrong token type: expected {}, got {}", TOKEN_TYPE_REFRESH, claims.token_type),
+                    "wrong_token_type",
+                    "process_token_refresh"
+                );
+                
+                return Err(AuthServiceError::validation(
+                    "token_type",
+                    "Expected a refresh token"
+                ));
+            }
+            
+            record_token_type_check_success();
+            type_check_span.record("business.result", &"success");
+            
+            Log::event(
+                "INFO",
+                "Token Refresh", 
+                "Token type check successful", 
+                "token_type_check_success",
+                "process_token_refresh"
+            );
+            
+            Ok(())
+        }
+        .instrument(type_check_span_clone)
+        .await?;
+
+        // Step 4: Revoke old refresh token with metrics and span
+        let revocation_span = redis_operation_span("revoke_token", "jwt:revoked:*");
+        let revocation_span_clone = revocation_span.clone();
+        
+        Log::event(
+            "INFO",
+            "Token Refresh", 
+            "Starting token revocation", 
+            "token_revocation_start",
+            "process_token_refresh"
+        );
+        
+        async {
+            match revoke_token(token, redis_client).await {
+                Ok(()) => {
+                    record_token_revocation_success();
+                    revocation_span.record("redis.success", &true);
+                    
+                    Log::event(
+                        "INFO",
+                        "Token Refresh", 
+                        "Token revocation successful", 
+                        "token_revocation_success",
+                        "process_token_refresh"
+                    );
+                    
+                    Ok::<(), AuthServiceError>(()) // Fix: added explicit type annotation
+                }
+                Err(e) => {
+                    record_token_revocation_failure(error_types::REVOCATION_FAILED);
+                    revocation_span.record("redis.success", &false);
+                    revocation_span.record_error(&e);
+                    
+                    Log::event(
+                        "WARN",
+                        "Token Refresh",
+                        &format!("Failed to revoke old refresh token: {}", e),
+                        "token_revocation_warning",
+                        "process_token_refresh"
+                    );
+                    
+                    // Continue without failing - user gets new tokens but old one might still be valid briefly
+                    Ok::<(), AuthServiceError>(())
+                }
+            }
+        }
+        .instrument(revocation_span_clone)
+        .await?;
+
+        // Step 5: Generate new access token with metrics and span
+        let access_gen_span = business_operation_span("generate_access_token");
+        let access_gen_span_clone = access_gen_span.clone();
+        
+        Log::event(
+            "INFO",
+            "Token Refresh", 
+            "Starting access token generation", 
+            "access_token_generation_start",
+            "process_token_refresh"
+        );
+        
+        let access_token = async {
+            match generate_token(&claims.sub, TOKEN_TYPE_ACCESS, None) {
+                Ok(token) => {
+                    record_access_token_generation_success();
+                    access_gen_span.record("business.result", &"success");
+                    
+                    Log::event(
+                        "INFO",
+                        "Token Refresh", 
+                        "Access token generation successful", 
+                        "access_token_generation_success",
+                        "process_token_refresh"
+                    );
+                    
+                    Ok(token)
+                }
+                Err(e) => {
+                    record_access_token_generation_failure(error_types::GENERATION_ERROR);
+                    record_refresh_failure(); // Also record overall failure
+                    access_gen_span.record("business.result", &"failure");
+                    access_gen_span.record_error(&e);
+                    
+                    Log::event(
+                        "WARN",
+                        "Token Refresh", 
+                        &format!("Access token generation failed: {}", e), 
+                        "access_token_generation_failure",
+                        "process_token_refresh"
+                    );
+                    
+                    Err(e)
+                }
+            }
+        }
+        .instrument(access_gen_span_clone)
+        .await?;
+
+        // Step 6: Generate new refresh token with metrics and span
+        let refresh_gen_span = business_operation_span("generate_refresh_token");
+        let refresh_gen_span_clone = refresh_gen_span.clone();
+        
+        Log::event(
+            "INFO",
+            "Token Refresh", 
+            "Starting refresh token generation", 
+            "refresh_token_generation_start",
+            "process_token_refresh"
+        );
+        
+        let refresh_token = async {
+            match generate_token(&claims.sub, TOKEN_TYPE_REFRESH, None) {
+                Ok(token) => {
+                    record_refresh_token_generation_success();
+                    refresh_gen_span.record("business.result", &"success");
+                    
+                    Log::event(
+                        "INFO",
+                        "Token Refresh", 
+                        "Refresh token generation successful", 
+                        "refresh_token_generation_success",
+                        "process_token_refresh"
+                    );
+                    
+                    Ok(token)
+                }
+                Err(e) => {
+                    record_refresh_token_generation_failure(error_types::GENERATION_ERROR);
+                    record_refresh_failure(); // Also record overall failure
+                    refresh_gen_span.record("business.result", &"failure");
+                    refresh_gen_span.record_error(&e);
+                    
+                    Log::event(
+                        "WARN",
+                        "Token Refresh", 
+                        &format!("Refresh token generation failed: {}", e), 
+                        "refresh_token_generation_failure",
+                        "process_token_refresh"
+                    );
+                    
+                    Err(e)
+                }
+            }
+        }
+        .instrument(refresh_gen_span_clone)
+        .await?;
+
+        // Record overall success metrics
+        record_refresh_success();
+        process_span.record("business.result", &"success");
+        process_span.record("user.id", &claims.sub);
+        
+        Log::event(
+            "INFO",
+            "Token Refresh",
+            &format!("Token refresh completed successfully for user: {}", claims.sub),
+            "refresh_success",
+            "process_token_refresh"
+        );
+
+        // Return new token pair in OAuth2-compatible format
+        Ok((
+            StatusCode::OK,
+            Json(json!({
+                "status": "success",
+                "message": "Tokens refreshed successfully",
+                "data": {
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                    "token_type": "Bearer"
+                }
+            })),
+        ))
+    }
+    .instrument(process_span_clone)
+    .await
 }
 
 /// Categorizes JWT validation errors for detailed metrics tracking

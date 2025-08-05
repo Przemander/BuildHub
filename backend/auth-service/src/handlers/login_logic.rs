@@ -9,20 +9,22 @@
 //! - Rate-limiting compatibility (enforced at middleware level)
 //! - Unified error handling with automatic HTTP response conversion
 
-use axum::{response::IntoResponse, Json}; // ← Removed StatusCode
+use axum::{response::IntoResponse, Json, http::StatusCode};
 use serde_json::json;
 use std::env;
 use std::time::Duration;
 use tokio::time::sleep;
+use tracing::Instrument;
 
 use crate::{
     app::AppState,
     db::users::User, 
     handlers::login::LoginRequest, 
-    log_error, log_info, 
     utils::{
         error_new::AuthServiceError,
-        jwt::{generate_token, TOKEN_TYPE_ACCESS, TOKEN_TYPE_REFRESH}, 
+        jwt::{generate_token, TOKEN_TYPE_ACCESS, TOKEN_TYPE_REFRESH},
+        log_new::Log,
+        telemetry::{db_operation_span, business_operation_span, SpanExt},
     },
     metricss::login_metrics::{
         time_complete_login_flow, record_login_success, record_login_failure,
@@ -68,138 +70,244 @@ pub async fn process_login(
     // Start complete login flow timer
     let _login_timer = time_complete_login_flow();
 
+    // Create span for the entire login processing flow
+    let process_span = business_operation_span("process_login");
+    process_span.record("login_type", &if req.login.contains('@') { "email" } else { "username" });
+    
+    // Clone span before moving it into the async block
+    let process_span_clone = process_span.clone();
+    
     // Log authentication attempt (without revealing password)
-    log_info!("Auth", &format!("Login attempt for {}", req.login), "attempt");
+    Log::event(
+        "INFO",
+        "Authentication",
+        &format!("Processing login for {}", req.login),
+        "processing",
+        "process_login"
+    );
 
     // Get configured delay for invalid credentials (default: 100ms)
-    // This helps prevent timing attacks by keeping response time consistent
     let delay_ms = env::var("INVALID_CREDENTIAL_DELAY_MS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(100);
 
-    // Step 1: Get database connection with metrics
-    let mut conn = match app_state.pool.get() {
-        Ok(conn) => {
-            record_db_connection_success();
-            conn
-        }
-        Err(e) => {
-            record_db_connection_failure(error_types::DB_UNAVAILABLE);
-            record_login_failure();
-            log_error!("Auth", &format!("DB error: {}", e), "system_error");
-            return Err(AuthServiceError::database("Could not get a database connection"));
-        }
-    };
-
-    // Try to find user by email if login contains @, otherwise by username
-    let user_opt = if req.login.contains('@') {
-        User::find_by_email(&mut conn, &req.login).ok()
-    } else {
-        User::find_by_username(&mut conn, &req.login).ok()
-    };
-
-    // Step 2: Verify password or perform dummy hash with metrics
-    // We always perform a hash operation whether user exists or not
-    // to prevent timing attacks that could reveal user existence
-    let password_good = if let Some(u) = &user_opt {
-        match u.verify_password(&req.password) {
-            Ok(true) => {
-                record_password_verification_success();
-                true
-            }
-            Ok(false) => {
-                record_password_verification_failure(error_types::INVALID_PASSWORD);
-                false
+    // Wrap login logic in the process_span
+    async move {
+        // Step 1: Get database connection with metrics and span
+        let db_conn_span = db_operation_span("get_connection", "pool");
+        let mut conn = match app_state.pool.get() {
+            Ok(conn) => {
+                record_db_connection_success();
+                db_conn_span.record("db.success", &true);
+                conn
             }
             Err(e) => {
-                record_password_verification_failure(error_types::INVALID_PASSWORD);
-                log_error!("Auth", &format!("Password verification error: {}", e), "system_error");
-                return Err(AuthServiceError::validation("credentials", "Invalid credentials"));
+                record_db_connection_failure(error_types::DB_UNAVAILABLE);
+                record_login_failure();
+                db_conn_span.record_error(&e);
+                
+                Log::event(
+                    "ERROR",
+                    "Database",
+                    &format!("DB connection error: {}", e),
+                    "failure",
+                    "process_login"
+                );
+                return Err(AuthServiceError::database("Could not get a database connection"));
+            }
+        };
+
+        // Step 2: Find user with proper span context
+        let user_lookup_span = db_operation_span(
+            "find_user", 
+            if req.login.contains('@') { "users.by_email" } else { "users.by_username" }
+        );
+        let user_lookup_span_clone = user_lookup_span.clone();
+        
+        let user_opt = async {
+            if req.login.contains('@') {
+                User::find_by_email(&mut conn, &req.login).ok()
+            } else {
+                User::find_by_username(&mut conn, &req.login).ok()
             }
         }
-    } else {
-        // Perform dummy hash to maintain consistent timing
-        let _ = User::hash_password(&req.password);
-        record_user_lookup_failure(error_types::USER_NOT_FOUND);
-        false
-    };
+        .instrument(user_lookup_span_clone)
+        .await;
 
-    // If password doesn't match or user doesn't exist, return error
-    if !password_good {
-        // Add delay to prevent timing attacks
-        sleep(Duration::from_millis(delay_ms)).await;
-        log_error!("Auth", &format!("Bad password for {}", req.login), "failure");
-        record_login_failure();
-        
-        return Err(AuthServiceError::validation("credentials", "Invalid credentials"));
-    }
+        // Step 3: Verify password or perform dummy hash with metrics and span
+        let pw_verify_span = business_operation_span("verify_password");
+        let password_good = if let Some(u) = &user_opt {
+            user_lookup_span.record("db.success", &true);
+            pw_verify_span.record("user_exists", &true);
+            
+            match u.verify_password(&req.password) {
+                Ok(true) => {
+                    record_password_verification_success();
+                    pw_verify_span.record("business.result", &"success");
+                    true
+                }
+                Ok(false) => {
+                    record_password_verification_failure(error_types::INVALID_PASSWORD);
+                    pw_verify_span.record("business.result", &"failure");
+                    pw_verify_span.record("failure_reason", &"invalid_password");
+                    false
+                }
+                Err(e) => {
+                    record_password_verification_failure(error_types::INVALID_PASSWORD);
+                    pw_verify_span.record_error(&e);
+                    
+                    Log::event(
+                        "ERROR",
+                        "Authentication",
+                        &format!("Password verification error: {}", e),
+                        "system_error",
+                        "process_login"
+                    );
+                    return Err(AuthServiceError::validation("credentials", "Invalid credentials"));
+                }
+            }
+        } else {
+            // Perform dummy hash to maintain consistent timing
+            let _ = User::hash_password(&req.password);
+            record_user_lookup_failure(error_types::USER_NOT_FOUND);
+            user_lookup_span.record("db.success", &false);
+            user_lookup_span.record("failure_reason", &"user_not_found");
+            pw_verify_span.record("user_exists", &false);
+            false
+        };
 
-    // At this point we know user exists and password is correct
-    let user = user_opt.unwrap();
-
-    // Step 3: Check if account is active with metrics
-    if !user.is_active.unwrap_or(false) {
-        // Add delay to prevent timing attacks
-        sleep(Duration::from_millis(delay_ms)).await;
-        record_account_check_failure(error_types::INACTIVE_ACCOUNT);
-        record_login_failure();
-        log_error!("Auth", &format!("Inactive account for {}", req.login), "inactive");
-        
-        return Err(AuthServiceError::validation("credentials", "Invalid credentials"));
-    } else {
-        record_account_check_success();
-    }
-
-    // Step 4: Generate access and refresh JWTs with metrics
-    let access = match generate_token(&user.username, TOKEN_TYPE_ACCESS, None) {
-        Ok(token) => {
-            record_token_generation_access_success();
-            token
-        }
-        Err(e) => {
-            record_token_generation_access_failure(error_types::TOKEN_GENERATION_FAILED);
+        // If password doesn't match or user doesn't exist, return error
+        if !password_good {
+            // Add delay to prevent timing attacks
+            sleep(Duration::from_millis(delay_ms)).await;
             record_login_failure();
-            log_error!("Auth", &format!("Access token error: {}", e), "system_error");
-            return Err(e);
+            process_span.record("business.result", &"failure");
+            process_span.record("failure_reason", &"invalid_credentials");
+            
+            Log::event(
+                "WARN",
+                "Authentication",
+                &format!("Failed login attempt for {}", req.login),
+                "invalid_credentials",
+                "process_login"
+            );
+            
+            return Err(AuthServiceError::validation("credentials", "Invalid credentials"));
         }
-    };
+
+        // At this point we know user exists and password is correct
+        let user = user_opt.unwrap();
+
+        // Step 4: Check if account is active with metrics and span
+        let account_span = business_operation_span("check_account_status");
+        let account_span_clone = account_span.clone();
         
-    let refresh = match generate_token(&user.username, TOKEN_TYPE_REFRESH, None) {
-        Ok(token) => {
-            record_token_generation_refresh_success();
-            token
+        let account_active = async {
+            if !user.is_active.unwrap_or(false) {
+                record_account_check_failure(error_types::INACTIVE_ACCOUNT);
+                account_span.record("business.result", &"inactive");
+                false
+            } else {
+                record_account_check_success();
+                account_span.record("business.result", &"active");
+                true
+            }
         }
-        Err(e) => {
-            record_token_generation_refresh_failure(error_types::TOKEN_GENERATION_FAILED);
+        .instrument(account_span_clone)
+        .await;
+
+        if !account_active {
+            // Add delay to prevent timing attacks
+            sleep(Duration::from_millis(delay_ms)).await;
             record_login_failure();
-            log_error!("Auth", &format!("Refresh token error: {}", e), "system_error");
-            return Err(e);
+            process_span.record("business.result", &"failure");
+            process_span.record("failure_reason", &"inactive_account");
+            
+            Log::event(
+                "WARN",
+                "Authentication",
+                &format!("Login attempt on inactive account: {}", req.login),
+                "inactive_account",
+                "process_login"
+            );
+            
+            return Err(AuthServiceError::validation("credentials", "Invalid credentials"));
         }
-    };
 
-    // Log successful authentication
-    log_info!("Auth", &format!("Login success for {}", req.login), "success");
-
-    // Record overall success
-    record_login_success();
-
-    // Build OAuth2-compatible response with tokens and user info using Axum's Json wrapper
-    // Fix 2: Need to import StatusCode for this specific use case
-    use axum::http::StatusCode;
-    let body = json!({
-        "status": "success",
-        "message": "Authentication successful",
-        "data": {
-            "access_token": access,
-            "refresh_token": refresh,
-            "token_type": "Bearer",
-            "username": user.username,
-            "email": user.email
+        // Step 5: Generate access token with span
+        let access_token_span = business_operation_span("generate_access_token");
+        let access_token_span_clone = access_token_span.clone();
+        
+        let access = async {
+            match generate_token(&user.username, TOKEN_TYPE_ACCESS, None) {
+                Ok(token) => {
+                    record_token_generation_access_success();
+                    access_token_span.record("business.result", &"success");
+                    Ok(token)
+                }
+                Err(e) => {
+                    record_token_generation_access_failure(error_types::TOKEN_GENERATION_FAILED);
+                    access_token_span.record_error(&e);
+                    Err(e)
+                }
+            }
         }
-    });
+        .instrument(access_token_span_clone)
+        .await?;
+            
+        // Step 6: Generate refresh token with span
+        let refresh_token_span = business_operation_span("generate_refresh_token");
+        let refresh_token_span_clone = refresh_token_span.clone();
+        
+        let refresh = async {
+            match generate_token(&user.username, TOKEN_TYPE_REFRESH, None) {
+                Ok(token) => {
+                    record_token_generation_refresh_success();
+                    refresh_token_span.record("business.result", &"success");
+                    Ok(token)
+                }
+                Err(e) => {
+                    record_token_generation_refresh_failure(error_types::TOKEN_GENERATION_FAILED);
+                    refresh_token_span.record_error(&e);
+                    Err(e)
+                }
+            }
+        }
+        .instrument(refresh_token_span_clone)
+        .await?;
 
-    Ok((StatusCode::OK, Json(body)))
+        // Log successful authentication
+        Log::event(
+            "INFO",
+            "Authentication",
+            &format!("Successful login for {}", req.login),
+            "success",
+            "process_login"
+        );
+
+        // Record overall success
+        record_login_success();
+        process_span.record("business.result", &"success");
+        process_span.record("user.id", &user.username);
+
+        // Build OAuth2-compatible response with tokens and user info
+        let body = json!({
+            "status": "success",
+            "message": "Authentication successful",
+            "data": {
+                "access_token": access,
+                "refresh_token": refresh,
+                "token_type": "Bearer",
+                "username": user.username,
+                "email": user.email
+            }
+        });
+
+        Ok((StatusCode::OK, Json(body)))
+    }
+    .instrument(process_span_clone)
+    .await
 }
 
 #[cfg(test)]

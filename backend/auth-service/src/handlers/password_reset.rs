@@ -19,20 +19,28 @@
 //! - Secure password requirements enforcement
 //! - Same response timing regardless of whether email exists (prevents user enumeration)
 //! - Unified error handling with automatic HTTP response conversion
+//! - Complete OpenTelemetry observability with hierarchical spans
 
 use std::sync::Arc;
 use axum::{
     extract::{Json, State},
+    http::StatusCode,  // Add this import
     response::IntoResponse,
 };
 use serde::Deserialize;
-use tracing::instrument;
+use tracing::Instrument;
 
-use crate::app::AppState;
-use crate::handlers::password_reset_logic::{
-    process_password_reset_confirm, process_password_reset_request,
+use crate::{
+    app::AppState,
+    handlers::password_reset_logic::{
+        process_password_reset_confirm, process_password_reset_request,
+    },
+    utils::{
+        error_new::AuthServiceError,
+        telemetry::{http_request_span, business_operation_span, SpanExt},
+        log_new::Log,
+    },
 };
-use crate::utils::error_new::AuthServiceError; // ← Add unified error system
 
 /// Request payload for initiating a password reset.
 ///
@@ -63,88 +71,135 @@ pub struct PasswordResetConfirm {
 ///
 /// Takes an email address and, if it corresponds to a registered user,
 /// generates a password reset token and sends an email with instructions.
-///
-/// ## Request Body
-/// ```json
-/// {
-///   "email": "user@example.com"
-/// }
-/// ```
-///
-/// ## Responses
-///
-/// * `200 OK` - Request processed (sent only if email exists)
-/// * `400 Bad Request` - Invalid email format
-/// * `500 Internal Server Error` - Server-side error
-///
-/// ## Security Note
-///
-/// Always returns 200 OK even if the email doesn't exist, to prevent
-/// user enumeration attacks. The actual email is only sent if the account exists.
-///
-/// ## Example success response
-/// ```json
-/// {
-///   "status": "success",
-///   "message": "If the email exists, a password reset link has been sent."
-/// }
-/// ```
-///
-/// ## Example error response
-/// ```json
-/// {
-///   "status": "configuration_error",
-///   "message": "Redis client not available for password reset operations"
-/// }
-/// ```
-#[instrument(
-    name = "password_reset_request",
-    level = "info",
-    skip(app_state, req),
-    fields(
-        path = "/auth/password-reset/request", 
-        method = "POST",
-        email_domain = tracing::field::Empty
-    )
-)]
 pub async fn password_reset_request_handler(
     State(app_state): State<Arc<AppState>>,
     Json(req): Json<PasswordResetRequest>,
-) -> Result<impl IntoResponse, AuthServiceError> { // ← Changed return type
+) -> Result<impl IntoResponse, AuthServiceError> {
+    // Create HTTP request span with method and path
+    let http_span = http_request_span("POST", "/auth/password-reset/request");
+    
     // Log email domain for debugging without exposing full PII
     if let Some(domain) = req.email.split('@').nth(1) {
-        tracing::Span::current().record("email_domain", &tracing::field::display(domain));
+        http_span.record("email_domain", &domain);
     }
     
-    // Process the password reset request using unified error system
-    // The ? operator will automatically convert AuthServiceError to HTTP response
-    process_password_reset_request(&app_state, &req.email).await
+    // Clone span before moving it into the async block
+    let http_span_clone = http_span.clone();
+    
+    // Wrap the handler logic in the HTTP span for automatic tracing
+    async move {
+        // Log the reset request using structured logging
+        Log::event(
+            "INFO",
+            "Password Reset",
+            &format!("Password reset request for email domain: {}", 
+                req.email.split('@').nth(1).unwrap_or("invalid")),
+            "request_initiated",
+            "password_reset_request_handler"
+        );
+
+        // Create child business operation span for the actual reset request operation
+        let business_span = business_operation_span("password_reset_request");
+        
+        // Process the reset request within the business span
+        let result = process_password_reset_request(&app_state, &req.email)
+            .instrument(business_span)
+            .await;
+        
+        // Handle result and update span
+        match &result {
+            Ok(_) => {
+                // For success responses, use OK (200) status code
+                http_span.record("http.status_code", &StatusCode::OK.as_u16().to_string());
+            }
+            Err(err) => {
+                // For errors, we can get the status code from the error type
+                let status_code = match err {
+                    AuthServiceError::Validation(_) => StatusCode::BAD_REQUEST,
+                    AuthServiceError::Configuration(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                    AuthServiceError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                    AuthServiceError::Jwt(_) => StatusCode::UNAUTHORIZED,
+                    AuthServiceError::Cache(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                    AuthServiceError::RateLimit(_) => StatusCode::TOO_MANY_REQUESTS,
+                };
+                http_span.record("http.status_code", &status_code.as_u16().to_string());
+                http_span.record_error(err);
+            }
+        }
+        
+        // Return the result, letting ? operator handle error conversion
+        result
+    }
+    .instrument(http_span_clone)
+    .await
 }
 
-
-#[instrument(
-    name = "password_reset_confirm",
-    level = "info",
-    skip(app_state, req),
-    fields(
-        path = "/auth/password-reset/confirm", 
-        method = "POST",
-        token_length = tracing::field::Empty,
-        password_length = tracing::field::Empty
-    )
-)]
+/// Handles password reset confirmation.
+///
+/// # Endpoint: POST /auth/password-reset/confirm
+///
+/// Takes a reset token and new password, validates both, and if valid,
+/// updates the user's password.
 pub async fn password_reset_confirm_handler(
     State(app_state): State<Arc<AppState>>,
     Json(req): Json<PasswordResetConfirm>,
-) -> Result<impl IntoResponse, AuthServiceError> { // ← Changed return type
-    // Log metadata without exposing sensitive information
-    tracing::Span::current()
-        .record("token_length", &tracing::field::display(req.token.len()))
-        .record("password_length", &tracing::field::display(req.new_password.len()));
+) -> Result<impl IntoResponse, AuthServiceError> {
+    // Create HTTP request span with method and path
+    let http_span = http_request_span("POST", "/auth/password-reset/confirm");
     
-    // Process the password reset confirmation using unified error system
-    // The ? operator will automatically convert AuthServiceError to HTTP response
-    process_password_reset_confirm(&app_state, &req.token, &req.new_password).await
+    // Add business context to the span without exposing sensitive information
+    http_span.record("token_length", &req.token.len());
+    http_span.record("password_length", &req.new_password.len());
+    
+    // Clone span before moving it into the async block
+    let http_span_clone = http_span.clone();
+    
+    // Wrap the handler logic in the HTTP span for automatic tracing
+    async move {
+        // Log the reset confirmation using structured logging
+        Log::event(
+            "INFO",
+            "Password Reset",
+            &format!("Password reset confirmation attempt (token length: {}, password length: {})",
+                req.token.len(), req.new_password.len()),
+            "confirmation_attempt",
+            "password_reset_confirm_handler"
+        );
+
+        // Create child business operation span for the actual reset confirmation operation
+        let business_span = business_operation_span("password_reset_confirm");
+        
+        // Process the reset confirmation within the business span
+        let result = process_password_reset_confirm(&app_state, &req.token, &req.new_password)
+            .instrument(business_span)
+            .await;
+        
+        // Handle result and update span
+        match &result {
+            Ok(_) => {
+                // For success responses, use OK (200) status code
+                http_span.record("http.status_code", &StatusCode::OK.as_u16().to_string());
+            }
+            Err(err) => {
+                // For errors, we can get the status code from the error type
+                let status_code = match err {
+                    AuthServiceError::Validation(_) => StatusCode::BAD_REQUEST,
+                    AuthServiceError::Configuration(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                    AuthServiceError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                    AuthServiceError::Jwt(_) => StatusCode::UNAUTHORIZED,
+                    AuthServiceError::Cache(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                    AuthServiceError::RateLimit(_) => StatusCode::TOO_MANY_REQUESTS,
+                };
+                http_span.record("http.status_code", &status_code.as_u16().to_string());
+                http_span.record_error(err);
+            }
+        }
+        
+        // Return the result, letting ? operator handle error conversion
+        result
+    }
+    .instrument(http_span_clone)
+    .await
 }
 
 #[cfg(test)]

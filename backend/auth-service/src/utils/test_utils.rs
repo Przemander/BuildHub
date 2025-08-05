@@ -1,22 +1,22 @@
-//! Shared test helpers for auth-service tests.
+//! # Test Utilities for BuildHub Auth Service
 //!
-//! This module provides specialized testing utilities to streamline test development
-//! and ensure consistency across the auth service test suite. It includes:
+//! This module provides enterprise-grade testing infrastructure that enables:
 //!
-//! - Database fixtures with isolated in-memory SQLite instances
-//! - Mock AppState configurations with various dependencies enabled/disabled
-//! - Validation assertion helpers for cleaner test cases
-//! - Environment variable management for tests
-//! - Thread-safe counters for parallel test execution
+//! - **Isolated Testing:** Thread-safe database fixtures with zero cross-test pollution
+//! - **Configurable Test States:** Mock AppState configurations for different scenarios
+//! - **Simplified Assertions:** Validation helpers for concise, readable test cases
+//! - **Environment Management:** Clean test environments with controlled variables
+//! - **Observability Testing:** Tools for testing tracing and metrics components
 //!
-//! All utilities are designed for test code only and should not be used in production.
+//! All utilities are optimized for concurrent test execution and maintainability.
 
 // Since we're keeping the module for test purposes only
 #![allow(dead_code)]
 
 use crate::app::AppState;
 use crate::config::database::{init_pool, run_migrations, DbPool};
-use crate::utils::error_new::{AuthServiceError, ValidationError}; // ← Updated import
+use crate::utils::error_new::{AuthServiceError, ValidationError};
+use crate::utils::log_new::Log;
 use once_cell::sync::Lazy;
 use redis::Client as RedisClient;
 use std::{
@@ -26,6 +26,12 @@ use std::{
         Mutex,
     },
 };
+use tracing::{subscriber::DefaultGuard, Level};
+use tracing_subscriber::fmt;
+
+// =============================================================================
+// CONSTANTS & STATIC VARIABLES
+// =============================================================================
 
 /// Counter for generating unique database identifiers.
 /// 
@@ -44,6 +50,16 @@ const TEST_JWT_SECRET: &str = "test-secret-key-for-unit-tests-only";
 
 /// Default Redis URL for testing.
 const TEST_REDIS_URL: &str = "redis://127.0.0.1/";
+
+/// Default SMTP URL for testing email functionality.
+const TEST_SMTP_URL: &str = "smtp://username:password@localhost:25";
+
+/// Default OpenTelemetry endpoint for testing.
+const TEST_OTEL_ENDPOINT: &str = "http://localhost:4317";
+
+// =============================================================================
+// DATABASE TEST UTILITIES
+// =============================================================================
 
 /// Creates a unique in-memory SQLite database pool and runs migrations.
 ///
@@ -85,11 +101,45 @@ pub fn make_pool() -> DbPool {
     // Set environment variable for database connection
     env::set_var("DATABASE_URL", &url);
 
+    Log::event(
+        "DEBUG", 
+        "Test Setup",
+        &format!("Creating test database: {}", url),
+        "test_db_created",
+        "make_pool"
+    );
+
     // Initialize pool and run migrations
     let pool = init_pool();
-    run_migrations(&pool).expect("Failed to run database migrations for test");
+    
+    match run_migrations(&pool) {
+        Ok(_) => {
+            Log::event(
+                "DEBUG",
+                "Test Setup",
+                "Test database migrations completed successfully",
+                "test_migrations_success",
+                "make_pool"
+            );
+        },
+        Err(e) => {
+            Log::event(
+                "ERROR",
+                "Test Setup",
+                &format!("Failed to run migrations: {}", e),
+                "test_migrations_failed",
+                "make_pool"
+            );
+            panic!("Failed to run database migrations for test: {}", e);
+        }
+    }
+    
     pool
 }
+
+// =============================================================================
+// JWT TEST UTILITIES
+// =============================================================================
 
 /// Sets up a JWT secret for token-based tests.
 ///
@@ -113,7 +163,19 @@ pub fn make_pool() -> DbPool {
 /// ```
 pub fn init_jwt_secret() {
     env::set_var("JWT_SECRET", TEST_JWT_SECRET);
+    
+    Log::event(
+        "DEBUG",
+        "Test Setup",
+        "JWT secret initialized for testing",
+        "jwt_secret_initialized",
+        "init_jwt_secret"
+    );
 }
+
+// =============================================================================
+// APP STATE TEST UTILITIES
+// =============================================================================
 
 /// Creates an AppState with Redis enabled for integration tests.
 ///
@@ -146,12 +208,42 @@ pub fn state_with_redis() -> AppState {
     // Initialize JWT secret for token operations
     init_jwt_secret();
     
+    Log::event(
+        "DEBUG",
+        "Test Setup",
+        "Creating AppState with Redis enabled",
+        "app_state_with_redis",
+        "state_with_redis"
+    );
+    
+    // Create the Redis client, with proper error handling
+    let redis_client = match RedisClient::open(TEST_REDIS_URL) {
+        Ok(client) => {
+            Log::event(
+                "DEBUG",
+                "Test Setup",
+                "Redis client created successfully",
+                "redis_client_created",
+                "state_with_redis"
+            );
+            Some(client)
+        },
+        Err(e) => {
+            Log::event(
+                "ERROR",
+                "Test Setup",
+                &format!("Failed to create Redis client: {}", e),
+                "redis_client_failed",
+                "state_with_redis"
+            );
+            panic!("Failed to create Redis client for tests: {}", e);
+        }
+    };
+    
     // Create the AppState with Redis enabled
     AppState {
         pool: make_pool(),
-        redis_client: Some(RedisClient::open(TEST_REDIS_URL).unwrap_or_else(|e| {
-            panic!("Failed to create Redis client for tests: {}", e);
-        })),
+        redis_client,
         email_config: None,
     }
 }
@@ -183,6 +275,14 @@ pub fn state_no_redis() -> AppState {
     // Initialize JWT secret for token operations
     init_jwt_secret();
     
+    Log::event(
+        "DEBUG",
+        "Test Setup",
+        "Creating AppState without Redis",
+        "app_state_no_redis",
+        "state_no_redis"
+    );
+    
     // Create the AppState without Redis
     AppState {
         pool: make_pool(),
@@ -190,6 +290,10 @@ pub fn state_no_redis() -> AppState {
         email_config: None,
     }
 }
+
+// =============================================================================
+// VALIDATION TEST UTILITIES
+// =============================================================================
 
 /// Asserts that a validation function accepts a valid input.
 ///
@@ -220,11 +324,29 @@ pub fn state_no_redis() -> AppState {
 /// ```
 pub fn assert_valid<F>(value: &str, validator: F)
 where
-    F: Fn(&str) -> Result<(), AuthServiceError>, // ← Updated to use AuthServiceError
+    F: Fn(&str) -> Result<(), AuthServiceError>,
 {
     match validator(value) {
-        Ok(_) => {}, // Test passes
-        Err(e) => panic!("Expected '{}' to be valid, but got error: {:?}", value, e),
+        Ok(_) => {
+            // Test passes
+            Log::event(
+                "TRACE",
+                "Test Assertion",
+                &format!("Value '{}' was valid as expected", value),
+                "assert_valid_passed",
+                "assert_valid"
+            );
+        },
+        Err(e) => {
+            Log::event(
+                "ERROR",
+                "Test Assertion",
+                &format!("Value '{}' was expected to be valid but got error: {:?}", value, e),
+                "assert_valid_failed",
+                "assert_valid"
+            );
+            panic!("Expected '{}' to be valid, but got error: {:?}", value, e);
+        }
     }
 }
 
@@ -263,55 +385,165 @@ where
 /// ```
 pub fn assert_invalid<F>(expected_field: &str, value: &str, error_contains: &str, validator: F)
 where
-    F: Fn(&str) -> Result<(), AuthServiceError>, // ← Updated to use AuthServiceError
+    F: Fn(&str) -> Result<(), AuthServiceError>,
 {
     match validator(value) {
-        Ok(_) => panic!("Expected '{}' to be invalid, but validation passed", value),
+        Ok(_) => {
+            Log::event(
+                "ERROR",
+                "Test Assertion",
+                &format!("Value '{}' was expected to be invalid but validation passed", value),
+                "assert_invalid_failed",
+                "assert_invalid"
+            );
+            panic!("Expected '{}' to be invalid, but validation passed", value);
+        },
         Err(AuthServiceError::Validation(validation_err)) => {
             // Handle the new ValidationError structure
             match validation_err {
                 ValidationError::InvalidValue { field, message, .. } => {
-                    assert_eq!(
-                        field, expected_field,
-                        "Expected field '{}' but got '{}'",
-                        expected_field, field
+                    if field != expected_field {
+                        Log::event(
+                            "ERROR",
+                            "Test Assertion",
+                            &format!(
+                                "Expected field '{}' but got '{}' for value '{}'", 
+                                expected_field, field, value
+                            ),
+                            "assert_invalid_wrong_field",
+                            "assert_invalid"
+                        );
+                        panic!(
+                            "Expected field '{}' but got '{}'",
+                            expected_field, field
+                        );
+                    }
+                    
+                    if !message.contains(error_contains) {
+                        Log::event(
+                            "ERROR",
+                            "Test Assertion",
+                            &format!(
+                                "Error message '{}' doesn't contain '{}' for value '{}'", 
+                                message, error_contains, value
+                            ),
+                            "assert_invalid_wrong_message",
+                            "assert_invalid"
+                        );
+                        panic!(
+                            "Error message '{}' doesn't contain '{}'",
+                            message, error_contains
+                        );
+                    }
+                    
+                    // Test passes
+                    Log::event(
+                        "TRACE",
+                        "Test Assertion",
+                        &format!("Value '{}' was invalid as expected", value),
+                        "assert_invalid_passed",
+                        "assert_invalid"
                     );
-                    assert!(
-                        message.contains(error_contains),
-                        "Error message '{}' doesn't contain '{}'",
-                        message, error_contains
-                    );
-                }
+                },
                 ValidationError::MissingField { field, .. } => {
-                    assert_eq!(
-                        field, expected_field,
-                        "Expected field '{}' but got '{}'",
-                        expected_field, field
+                    if field != expected_field {
+                        Log::event(
+                            "ERROR",
+                            "Test Assertion",
+                            &format!(
+                                "Expected field '{}' but got '{}' for missing field validation", 
+                                expected_field, field
+                            ),
+                            "assert_invalid_wrong_field",
+                            "assert_invalid"
+                        );
+                        panic!(
+                            "Expected field '{}' but got '{}'",
+                            expected_field, field
+                        );
+                    }
+                    
+                    // Test passes for missing field errors
+                    Log::event(
+                        "TRACE",
+                        "Test Assertion",
+                        &format!("Field '{}' was missing as expected", field),
+                        "assert_invalid_passed",
+                        "assert_invalid"
                     );
-                    // For missing field errors, just check the field name
-                }
+                },
                 ValidationError::TooLong { field, .. } => {
-                    assert_eq!(
-                        field, expected_field,
-                        "Expected field '{}' but got '{}'",
-                        expected_field, field
+                    if field != expected_field {
+                        Log::event(
+                            "ERROR",
+                            "Test Assertion",
+                            &format!(
+                                "Expected field '{}' but got '{}' for too long validation", 
+                                expected_field, field
+                            ),
+                            "assert_invalid_wrong_field",
+                            "assert_invalid"
+                        );
+                        panic!(
+                            "Expected field '{}' but got '{}'",
+                            expected_field, field
+                        );
+                    }
+                    
+                    // Test passes for too long errors
+                    Log::event(
+                        "TRACE",
+                        "Test Assertion",
+                        &format!("Field '{}' was too long as expected", field),
+                        "assert_invalid_passed",
+                        "assert_invalid"
                     );
-                    // You can add more specific checks for TooLong if needed
-                }
+                },
                 ValidationError::PasswordHash { message, .. } => {
-                    assert!(
-                        message.contains(error_contains),
-                        "Error message '{}' doesn't contain '{}'",
-                        message, error_contains
+                    if !message.contains(error_contains) {
+                        Log::event(
+                            "ERROR",
+                            "Test Assertion",
+                            &format!(
+                                "Error message '{}' doesn't contain '{}' for password hash validation", 
+                                message, error_contains
+                            ),
+                            "assert_invalid_wrong_message",
+                            "assert_invalid"
+                        );
+                        panic!(
+                            "Error message '{}' doesn't contain '{}'",
+                            message, error_contains
+                        );
+                    }
+                    
+                    // Test passes for password hash errors
+                    Log::event(
+                        "TRACE",
+                        "Test Assertion",
+                        "Password hash error was detected as expected",
+                        "assert_invalid_passed",
+                        "assert_invalid"
                     );
                 }
             }
-        }
+        },
         Err(other_err) => {
+            Log::event(
+                "ERROR",
+                "Test Assertion",
+                &format!("Expected ValidationError, but got: {:?}", other_err),
+                "assert_invalid_wrong_error_type",
+                "assert_invalid"
+            );
             panic!("Expected ValidationError, but got: {:?}", other_err);
         }
     }
 }
+
+// =============================================================================
+// ENVIRONMENT TEST UTILITIES
+// =============================================================================
 
 /// Resets all test environment variables to ensure a clean testing state.
 ///
@@ -333,16 +565,84 @@ where
 /// }
 /// ```
 pub fn reset_test_env() {
+    // Database-related
     env::remove_var("DATABASE_URL");
+    
+    // Authentication-related
     env::remove_var("JWT_SECRET");
+    env::remove_var("JWT_EXPIRY");
+    env::remove_var("REFRESH_TOKEN_EXPIRY");
+    
+    // Infrastructure-related
     env::remove_var("REDIS_URL");
-    // Add any other environment variables your tests might set
+    env::remove_var("SMTP_URL");
+    
+    // Telemetry-related
+    env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+    env::remove_var("RUST_LOG");
+    env::remove_var("OTEL_TRACE_SAMPLE_RATE");
+    
+    // Application-related
+    env::remove_var("APP_ENV");
+    env::remove_var("PORT");
+    
+    Log::event(
+        "DEBUG",
+        "Test Setup",
+        "Test environment variables have been reset",
+        "test_env_reset",
+        "reset_test_env"
+    );
 }
+
+// =============================================================================
+// TRACING TEST UTILITIES
+// =============================================================================
+
+/// Sets up minimal tracing for tests with specified level.
+///
+/// This function configures a simple non-global tracing subscriber suitable
+/// for capturing log output during tests without interfering with other tests.
+///
+/// # Arguments
+///
+/// * `level` - The tracing level to use (default: INFO)
+///
+/// # Returns
+///
+/// A guard that will clean up the subscriber when dropped
+///
+/// # Example
+///
+/// ```
+/// #[cfg(test)]
+/// mod tests {
+///     use crate::utils::test_utils::init_test_tracing;
+///     use tracing::Level;
+///
+///     #[test]
+///     fn test_with_logs() {
+///         let _guard = init_test_tracing(Level::DEBUG);
+///         // Now logs will be captured at DEBUG level
+///     }
+/// }
+/// ```
+pub fn init_test_tracing(level: Level) -> DefaultGuard {
+    let subscriber = fmt::Subscriber::builder()
+        .with_max_level(level)
+        .with_test_writer()
+        .finish();
+    
+    tracing::subscriber::set_default(subscriber)
+}
+
+// =============================================================================
+// TESTS
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::error_new::{AuthServiceError, ValidationError};
     use std::env::var;
     use tracing_error::SpanTrace;
 
@@ -487,5 +787,34 @@ mod tests {
         
         // This should panic due to message content mismatch
         assert_invalid("field", "test", "expected text", wrong_message);
+    }
+    
+    #[test]
+    fn reset_test_env_clears_environment_variables() {
+        // Setup test environment
+        env::set_var("DATABASE_URL", "test_value");
+        env::set_var("JWT_SECRET", "test_value");
+        
+        // Act
+        reset_test_env();
+        
+        // Verify variables are cleared
+        assert!(var("DATABASE_URL").is_err(), "DATABASE_URL should be removed");
+        assert!(var("JWT_SECRET").is_err(), "JWT_SECRET should be removed");
+    }
+    
+    #[test]
+    fn init_test_tracing_sets_up_logging() {
+        // Set up test tracing
+        let guard = init_test_tracing(Level::TRACE);
+        
+        // Log a test message
+        tracing::trace!("Test trace message");
+        tracing::debug!("Test debug message");
+        
+        // Drop the guard explicitly
+        drop(guard);
+        
+        // No assertions needed - we're just verifying it doesn't panic
     }
 }

@@ -6,8 +6,8 @@
 //! error handling, logging, and observability.
 
 use crate::db::schema::users;
-use crate::utils::error_new::{AuthServiceError, DatabaseError}; // Add ValidationError
-use crate::{log_debug, log_error, log_info, log_warn};
+use crate::utils::error_new::{AuthServiceError, DatabaseError};
+use crate::utils::log_new::Log; // Nowy system logowania
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordVerifier, SaltString},
     Argon2, PasswordHasher,
@@ -17,6 +17,7 @@ use diesel::{AsChangeset, Insertable, Queryable};
 use serde::{Deserialize, Serialize};
 use tracing_error::SpanTrace;
 use crate::metricss::database_metrics::user;
+use crate::utils::telemetry::{db_operation_span, SpanExt};
 
 /// Represents a user in the database.
 #[derive(Debug, Serialize, Deserialize, Queryable, Insertable, AsChangeset)]
@@ -58,12 +59,22 @@ impl User {
     /// # Returns
     /// A new User instance ready to be saved to the database
     pub fn new(username: &str, email: &str, password: &str) -> Self {
-        log_debug!("User Management", "Begin user creation", "user_creation_start");
+        Log::event(
+            "DEBUG",
+            "User Management",
+            "Begin user creation",
+            "user_creation_start",
+            "new"
+        );
+        
         let password_hash = User::hash_password(password);
-        log_info!(
-            "User Management", 
-            &format!("Created user object for username: {}", username), 
-            "user_object_created"
+        
+        Log::event(
+            "INFO",
+            "User Management",
+            &format!("Created user object for username: {}", username),
+            "user_object_created",
+            "new"
         );
 
         User {
@@ -89,7 +100,14 @@ impl User {
     /// # Panics
     /// Panics if password hashing fails (extremely rare, indicates system issues)
     pub fn hash_password(password: &str) -> String {
-        log_debug!("User Management", "Starting password hashing", "password_hash_start");
+        Log::event(
+            "DEBUG",
+            "User Management",
+            "Starting password hashing",
+            "password_hash_start",
+            "hash_password"
+        );
+        
         let salt = SaltString::generate(&mut OsRng);
         let argon2 = Argon2::default();
         let hash = argon2
@@ -97,7 +115,14 @@ impl User {
             .expect("Password hashing failed - this indicates a serious system error")
             .to_string();
 
-        log_debug!("User Management", "Password hash generated successfully", "password_hash_success");
+        Log::event(
+            "DEBUG",
+            "User Management",
+            "Password hash generated successfully",
+            "password_hash_success",
+            "hash_password"
+        );
+        
         hash
     }
 
@@ -113,26 +138,65 @@ impl User {
     /// * `Ok(false)` - Password does not match
     /// * `Err(AuthServiceError)` - Hash parsing or verification error
     pub fn verify_password(&self, password: &str) -> Result<bool, AuthServiceError> {
-        log_debug!("User Management", "Starting password verification", "password_verify_start");
+        // Create span for password verification
+        let span = db_operation_span("verify_password", "users.auth");
+        span.record("username", &self.username);
+        
+        span.in_scope(|| {
+            Log::event(
+                "DEBUG",
+                "User Management",
+                "Starting password verification",
+                "password_verify_start",
+                "verify_password"
+            );
 
-        // This will now work because:
-        // 1. PasswordHash::new returns Result<_, argon2::password_hash::Error>
-        // 2. You have From<argon2::password_hash::Error> for ValidationError
-        // 3. You have From<ValidationError> for AuthServiceError
-        // 4. The ? operator will use this conversion chain automatically
-        let parsed_hash = PasswordHash::new(&self.password_hash)?;
+            // Parse the stored hash
+            let parsed_hash = match PasswordHash::new(&self.password_hash) {
+                Ok(hash) => hash,
+                Err(e) => {
+                    span.record("result", &"hash_parse_error");
+                    span.record_error(&e);
+                    
+                    Log::event(
+                        "ERROR",
+                        "User Management",
+                        &format!("Failed to parse password hash: {}", e),
+                        "password_hash_parse_error",
+                        "verify_password"
+                    );
+                    
+                    return Err(e.into());
+                }
+            };
 
-        let is_verified = Argon2::default()
-            .verify_password(password.as_bytes(), &parsed_hash)
-            .is_ok();
+            // Verify the password
+            let is_verified = Argon2::default()
+                .verify_password(password.as_bytes(), &parsed_hash)
+                .is_ok();
 
-        if is_verified {
-            log_debug!("User Management", "Password verification successful", "password_verify_success");
-        } else {
-            log_debug!("User Management", "Password verification failed", "password_verify_failure");
-        }
+            if is_verified {
+                span.record("result", &"match");
+                Log::event(
+                    "DEBUG",
+                    "User Management",
+                    "Password verification successful",
+                    "password_verify_success",
+                    "verify_password"
+                );
+            } else {
+                span.record("result", &"mismatch");
+                Log::event(
+                    "DEBUG",
+                    "User Management",
+                    "Password verification failed",
+                    "password_verify_failure",
+                    "verify_password"
+                );
+            }
 
-        Ok(is_verified)
+            Ok(is_verified)
+        })
     }
 
     /// Saves the user to the database with transaction safety.
@@ -148,39 +212,65 @@ impl User {
     /// * `Ok(usize)` - Number of rows affected (should be 1)
     /// * `Err(AuthServiceError)` - Database operation failed
     pub fn save(&self, conn: &mut SqliteConnection) -> Result<usize, AuthServiceError> {
+        // Create span for save operation
+        let span = db_operation_span("save_user", "users");
+        span.record("username", &self.username);
+        span.record("email_domain", &self.email.split('@').nth(1).unwrap_or("invalid"));
+        
         user::record_create_attempt();
         
-        log_debug!(
+        Log::event(
+            "DEBUG",
             "User Management",
             &format!("Saving user to database: {}", self.username),
-            "user_save_start"
+            "user_save_start",
+            "save"
         );
 
-        let result = conn.transaction(|conn| {
-            diesel::insert_into(users::table)
-                .values(self)
-                .execute(conn)
-        }).map_err(|e| {
-            user::record_create_failure("query_error");
-            log_error!(
-                "User Management",
-                &format!("Failed to save user {}: {}", self.username, e),
-                "user_save_error"
-            );
-            DatabaseError::Query {
-                source: e,
-                span: SpanTrace::capture(),
+        // Use the span to wrap the database operation
+        let result = span.in_scope(|| {
+            conn.transaction(|conn| {
+                diesel::insert_into(users::table)
+                    .values(self)
+                    .execute(conn)
+            }).map_err(|e| {
+                user::record_create_failure("query_error");
+                span.record("db.success", &false);
+                span.record_error(&e);
+                
+                Log::event(
+                    "ERROR",
+                    "User Management",
+                    &format!("Failed to save user {}: {}", self.username, e),
+                    "user_save_error",
+                    "save"
+                );
+                
+                // Convert to AuthServiceError explicitly
+                AuthServiceError::Database(DatabaseError::Query {
+                    source: e,
+                    span: SpanTrace::capture(),
+                })
+            })
+        });
+
+        match &result {
+            Ok(_) => {
+                user::record_create_success();
+                span.record("db.success", &true);
+                
+                Log::event(
+                    "INFO",
+                    "User Management",
+                    &format!("User {} saved successfully", self.username),
+                    "user_save_success",
+                    "save"
+                );
             }
-        })?;
+            Err(_) => {} // Already handled in the error mapping
+        }
 
-        user::record_create_success();
-        log_info!(
-            "User Management", 
-            &format!("User {} saved successfully", self.username), 
-            "user_save_success"
-        );
-
-        Ok(result)
+        result
     }
 
     /// Finds a user by username with unified error handling.
@@ -196,52 +286,83 @@ impl User {
         conn: &mut SqliteConnection, 
         username_str: &str
     ) -> Result<Self, AuthServiceError> {
+        // Create span for find_by_username operation
+        let span = db_operation_span("find_user", "users.by_username");
+        span.record("username", &username_str);
+        
         user::record_lookup_username_attempt();
         
-        log_debug!(
-            "User Management", 
-            &format!("Searching for user by username: {}", username_str), 
-            "find_by_username_start"
+        Log::event(
+            "DEBUG",
+            "User Management",
+            &format!("Searching for user by username: {}", username_str),
+            "find_by_username_start",
+            "find_by_username"
         );
 
-        use crate::db::schema::users::dsl::*;
-        
-        let user = users
-            .filter(username.eq(username_str))
-            .first(conn)
-            .map_err(|e| {
-                match e {
-                    diesel::result::Error::NotFound => {
-                        user::record_lookup_username_failure("not_found");
-                        log_debug!(
-                            "User Management",
-                            &format!("User not found by username: {}", username_str),
-                            "find_by_username_not_found"
-                        );
+        // Use the span to wrap the database operation
+        let result = span.in_scope(|| {
+            use crate::db::schema::users::dsl::*;
+            
+            users
+                .filter(username.eq(username_str))
+                .first::<User>(conn) // Explicit type annotation
+                .map_err(|e| {
+                    match e {
+                        diesel::result::Error::NotFound => {
+                            user::record_lookup_username_failure("not_found");
+                            span.record("db.success", &false);
+                            span.record("result", &"not_found");
+                            
+                            Log::event(
+                                "DEBUG",
+                                "User Management",
+                                &format!("User not found by username: {}", username_str),
+                                "find_by_username_not_found",
+                                "find_by_username"
+                            );
+                        }
+                        _ => {
+                            user::record_lookup_username_failure("query_error");
+                            span.record("db.success", &false);
+                            span.record("result", &"error");
+                            span.record_error(&e);
+                            
+                            Log::event(
+                                "ERROR",
+                                "User Management",
+                                &format!("Database error finding user by username {}: {}", username_str, e),
+                                "find_by_username_error",
+                                "find_by_username"
+                            );
+                        }
                     }
-                    _ => {
-                        user::record_lookup_username_failure("query_error");
-                        log_error!(
-                            "User Management",
-                            &format!("Database error finding user by username {}: {}", username_str, e),
-                            "find_by_username_error"
-                        );
-                    }
-                }
-                DatabaseError::Query {
-                    source: e,
-                    span: SpanTrace::capture(),
-                }
-            })?;
+                    // Convert to AuthServiceError explicitly
+                    AuthServiceError::Database(DatabaseError::Query {
+                        source: e,
+                        span: SpanTrace::capture(),
+                    })
+                })
+        });
 
-        user::record_lookup_username_success();
-        log_info!(
-            "User Management", 
-            &format!("User found by username: {}", username_str), 
-            "find_by_username_success"
-        );
+        match &result {
+            Ok(_) => {
+                user::record_lookup_username_success();
+                span.record("db.success", &true);
+                span.record("result", &"success");
+                
+                Log::event(
+                    "INFO",
+                    "User Management",
+                    &format!("User found by username: {}", username_str),
+                    "find_by_username_success",
+                    "find_by_username"
+                );
+            }
+            Err(_) => {} // Already handled in the error mapping
+        }
 
-        Ok(user)
+        result
     }
 
     /// Finds a user by email with unified error handling.
@@ -257,52 +378,83 @@ impl User {
         conn: &mut SqliteConnection, 
         email_str: &str
     ) -> Result<Self, AuthServiceError> {
+        // Create span for find_by_email operation
+        let span = db_operation_span("find_user", "users.by_email");
+        span.record("email_domain", &email_str.split('@').nth(1).unwrap_or("invalid"));
+        
         user::record_lookup_email_attempt();
         
-        log_debug!(
-            "User Management", 
-            &format!("Searching for user by email: {}", email_str), 
-            "find_by_email_start"
+        Log::event(
+            "DEBUG",
+            "User Management",
+            &format!("Searching for user by email: {}", email_str),
+            "find_by_email_start",
+            "find_by_email"
         );
 
-        use crate::db::schema::users::dsl::*;
-        
-        let user = users
-            .filter(email.eq(email_str))
-            .first(conn)
-            .map_err(|e| {
-                match e {
-                    diesel::result::Error::NotFound => {
-                        user::record_lookup_email_failure("not_found");
-                        log_debug!(
-                            "User Management",
-                            &format!("User not found by email: {}", email_str),
-                            "find_by_email_not_found"
-                        );
+        // Use the span to wrap the database operation
+        let result = span.in_scope(|| {
+            use crate::db::schema::users::dsl::*;
+            
+            users
+                .filter(email.eq(email_str))
+                .first::<User>(conn) // Add explicit type annotation here
+                .map_err(|e| {
+                    match e {
+                        diesel::result::Error::NotFound => {
+                            user::record_lookup_email_failure("not_found");
+                            span.record("db.success", &false);
+                            span.record("result", &"not_found");
+                            
+                            Log::event(
+                                "DEBUG",
+                                "User Management",
+                                &format!("User not found by email: {}", email_str),
+                                "find_by_email_not_found",
+                                "find_by_email"
+                            );
+                        }
+                        _ => {
+                            user::record_lookup_email_failure("query_error");
+                            span.record("db.success", &false);
+                            span.record("result", &"error");
+                            span.record_error(&e);
+                            
+                            Log::event(
+                                "ERROR",
+                                "User Management",
+                                &format!("Database error finding user by email {}: {}", email_str, e),
+                                "find_by_email_error",
+                                "find_by_email"
+                            );
+                        }
                     }
-                    _ => {
-                        user::record_lookup_email_failure("query_error");
-                        log_error!(
-                            "User Management",
-                            &format!("Database error finding user by email {}: {}", email_str, e),
-                            "find_by_email_error"
-                        );
-                    }
-                }
-                DatabaseError::Query {
-                    source: e,
-                    span: SpanTrace::capture(),
-                }
-            })?;
+                    // Convert to AuthServiceError explicitly
+                    AuthServiceError::Database(DatabaseError::Query {
+                        source: e,
+                        span: SpanTrace::capture(),
+                    })
+                })
+        });
 
-        user::record_lookup_email_success();
-        log_info!(
-            "User Management", 
-            &format!("User found by email: {}", email_str), 
-            "find_by_email_success"
-        );
+        match &result {
+            Ok(_) => {
+                user::record_lookup_email_success();
+                span.record("db.success", &true);
+                span.record("result", &"success");
+                
+                Log::event(
+                    "INFO",
+                    "User Management",
+                    &format!("User found by email: {}", email_str),
+                    "find_by_email_success",
+                    "find_by_email"
+                );
+            }
+            Err(_) => {} // Already handled in the error mapping
+        }
 
-        Ok(user)
+        result
     }
 
     /// Activates the user's account by setting `is_active` to true.
@@ -314,40 +466,61 @@ impl User {
     /// * `Ok(())` - Account activated successfully
     /// * `Err(AuthServiceError)` - Database operation failed
     pub fn activate(&self, conn: &mut SqliteConnection) -> Result<(), AuthServiceError> {
+        // Create span for account activation
+        let span = db_operation_span("activate_account", "users");
+        span.record("email_domain", &self.email.split('@').nth(1).unwrap_or("invalid"));
+        
         user::record_activate_attempt();
         
-        log_debug!(
-            "User Management", 
-            &format!("Activating account for user: {}", self.email), 
-            "user_activate_start"
+        Log::event(
+            "DEBUG",
+            "User Management",
+            &format!("Activating account for user: {}", self.email),
+            "user_activate_start",
+            "activate"
         );
 
-        use crate::db::schema::users::dsl::*;
-        
-        diesel::update(users.filter(email.eq(&self.email)))
-            .set(is_active.eq(true))
-            .execute(conn)
-            .map_err(|e| {
-                user::record_activate_failure("query_error");
-                log_error!(
-                    "User Management",
-                    &format!("Failed to activate account for {}: {}", self.email, e),
-                    "user_activate_error"
-                );
-                DatabaseError::Query {
-                    source: e,
-                    span: SpanTrace::capture(),
-                }
-            })?;
+        // Use the span to wrap the database operation
+        span.in_scope(|| {
+            use crate::db::schema::users::dsl::*;
+            
+            diesel::update(users.filter(email.eq(&self.email)))
+                .set(is_active.eq(true))
+                .execute(conn)
+                .map_err(|e| {
+                    user::record_activate_failure("query_error");
+                    span.record("db.success", &false);
+                    span.record_error(&e);
+                    
+                    Log::event(
+                        "ERROR",
+                        "User Management",
+                        &format!("Failed to activate account for {}: {}", self.email, e),
+                        "user_activate_error",
+                        "activate"
+                    );
+                    
+                    // Convert to AuthServiceError explicitly
+                    AuthServiceError::Database(DatabaseError::Query {
+                        source: e,
+                        span: SpanTrace::capture(),
+                    })
+                })?;
 
-        user::record_activate_success();
-        log_info!(
-            "User Management", 
-            &format!("Account activated successfully for: {}", self.email), 
-            "user_activate_success"
-        );
+            user::record_activate_success();
+            span.record("db.success", &true);
+            span.record("result", &"success");
+            
+            Log::event(
+                "INFO",
+                "User Management",
+                &format!("Account activated successfully for: {}", self.email),
+                "user_activate_success",
+                "activate"
+            );
 
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Updates an existing user record in the database.
@@ -359,53 +532,81 @@ impl User {
     /// * `Ok(())` - User updated successfully
     /// * `Err(AuthServiceError)` - User has no ID or database error
     pub fn update(&self, conn: &mut SqliteConnection) -> Result<(), AuthServiceError> {
+        // Create span for user update
+        let span = db_operation_span("update_user", "users");
+        span.record("username", &self.username);
+        
         user::record_update_attempt();
         
-        log_debug!(
-            "User Management", 
-            &format!("Updating user record: {}", self.username), 
-            "user_update_start"
+        Log::event(
+            "DEBUG",
+            "User Management",
+            &format!("Updating user record: {}", self.username),
+            "user_update_start",
+            "update"
         );
 
-        use crate::db::schema::users::dsl::*;
-        
+        // Get user ID first with error handling
         let user_id = self.id.ok_or_else(|| {
             user::record_update_failure("no_id");
-            log_warn!(
-                "User Management", 
-                &format!("Attempted to update user {} without ID", self.username), 
-                "user_update_no_id"
+            span.record("db.success", &false);
+            span.record("failure_reason", &"missing_id");
+            
+            Log::event(
+                "WARN",
+                "User Management",
+                &format!("Attempted to update user {} without ID", self.username),
+                "user_update_no_id",
+                "update"
             );
+            
             AuthServiceError::Database(DatabaseError::Query {
                 source: diesel::result::Error::NotFound,
                 span: SpanTrace::capture(),
             })
         })?;
 
-        diesel::update(users.filter(id.eq(user_id)))
-            .set(self)
-            .execute(conn)
-            .map_err(|e| {
-                user::record_update_failure("query_error");
-                log_error!(
-                    "User Management",
-                    &format!("Failed to update user {}: {}", self.username, e),
-                    "user_update_error"
-                );
-                DatabaseError::Query {
-                    source: e,
-                    span: SpanTrace::capture(),
-                }
-            })?;
+        // Use the span to wrap the database operation
+        span.in_scope(|| {
+            use crate::db::schema::users::dsl::*;
+            
+            diesel::update(users.filter(id.eq(user_id)))
+                .set(self)
+                .execute(conn)
+                .map_err(|e| {
+                    user::record_update_failure("query_error");
+                    span.record("db.success", &false);
+                    span.record_error(&e);
+                    
+                    Log::event(
+                        "ERROR",
+                        "User Management",
+                        &format!("Failed to update user {}: {}", self.username, e),
+                        "user_update_error",
+                        "update"
+                    );
+                    
+                    // Convert to AuthServiceError explicitly
+                    AuthServiceError::Database(DatabaseError::Query {
+                        source: e,
+                        span: SpanTrace::capture(),
+                    })
+                })?;
 
-        user::record_update_success();
-        log_info!(
-            "User Management", 
-            &format!("User {} updated successfully", self.username), 
-            "user_update_success"
-        );
+            user::record_update_success();
+            span.record("db.success", &true);
+            span.record("result", &"success");
+            
+            Log::event(
+                "INFO",
+                "User Management",
+                &format!("User {} updated successfully", self.username),
+                "user_update_success",
+                "update"
+            );
 
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Sets a new password (hashes it) and updates the user in the database.
@@ -425,34 +626,85 @@ impl User {
         conn: &mut SqliteConnection,
         new_password: &str,
     ) -> Result<(), AuthServiceError> {
+        // Create span for password update
+        let span = db_operation_span("update_password", "users");
+        span.record("username", &self.username);
+        
         user::record_password_update_attempt();
         
-        log_debug!(
-            "User Management", 
-            &format!("Updating password for user: {}", self.username), 
-            "password_update_start"
+        Log::event(
+            "DEBUG",
+            "User Management",
+            &format!("Updating password for user: {}", self.username),
+            "password_update_start",
+            "set_password_and_update"
         );
 
-        // Hash the new password
-        self.password_hash = User::hash_password(new_password);
+        // Use the span to wrap all operations
+        span.in_scope(|| {
+            // Hash the new password
+            self.password_hash = User::hash_password(new_password);
 
-        // If we don't yet have an id, fetch it from the DB
-        if self.id.is_none() {
-            let persisted = User::find_by_username(conn, &self.username)?;
-            self.id = persisted.id;
-        }
+            // If we don't yet have an id, fetch it from the DB
+            if self.id.is_none() {
+                span.record("needs_id_lookup", &true);
+                match User::find_by_username(conn, &self.username) {
+                    Ok(persisted) => {
+                        self.id = persisted.id;
+                    }
+                    Err(e) => {
+                        span.record("db.success", &false);
+                        span.record("failure_reason", &"id_lookup_failed");
+                        span.record_error(&e);
+                        
+                        Log::event(
+                            "ERROR",
+                            "User Management",
+                            &format!("Failed to lookup user ID for {}: {}", self.username, e),
+                            "password_update_id_lookup_failed",
+                            "set_password_and_update"
+                        );
+                        
+                        return Err(e);
+                    }
+                }
+            }
 
-        // Now safe to call update
-        self.update(conn)?;
-
-        user::record_password_update_success();
-        log_info!(
-            "User Management", 
-            &format!("Password updated successfully for user: {}", self.username), 
-            "password_update_success"
-        );
-
-        Ok(())
+            // Now safe to call update
+            match self.update(conn) {
+                Ok(_) => {
+                    user::record_password_update_success();
+                    span.record("db.success", &true);
+                    span.record("result", &"success");
+                    
+                    Log::event(
+                        "INFO",
+                        "User Management",
+                        &format!("Password updated successfully for user: {}", self.username),
+                        "password_update_success",
+                        "set_password_and_update"
+                    );
+                    
+                    Ok(())
+                }
+                Err(e) => {
+                    user::record_password_update_failure("update_failed");
+                    span.record("db.success", &false);
+                    span.record("failure_reason", &"update_failed");
+                    span.record_error(&e);
+                    
+                    Log::event(
+                        "ERROR",
+                        "User Management",
+                        &format!("Failed to update password for user {}: {}", self.username, e),
+                        "password_update_failed",
+                        "set_password_and_update"
+                    );
+                    
+                    Err(e)
+                }
+            }
+        })
     }
 }
 
