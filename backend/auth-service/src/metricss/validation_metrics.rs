@@ -21,11 +21,11 @@
 //! - Slow validation processing (performance degradation)
 //! - Password weakness patterns (security compliance)
 
-use lazy_static::lazy_static;
-use prometheus::{CounterVec, HistogramVec, HistogramTimer};
-use std::sync::atomic::{AtomicBool, Ordering};
-use crate::utils::error_new::{AuthServiceError, ValidationError};
 use crate::log_info;
+use crate::utils::error_new::{AuthServiceError, ValidationError};
+use lazy_static::lazy_static;
+use prometheus::{CounterVec, HistogramTimer, HistogramVec};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // Import our standardized metrics infrastructure
 use super::core::{
@@ -118,7 +118,11 @@ pub(crate) fn init_validation_metrics() {
     lazy_static::initialize(&VALIDATION_FAILURES);
     lazy_static::initialize(&VALIDATION_DURATION);
 
-    log_info!("Metrics", "Validation metrics initialized (production-ready with full standardization)", "validation_metrics_init");
+    log_info!(
+        "Metrics",
+        "Validation metrics initialized (production-ready with full standardization)",
+        "validation_metrics_init"
+    );
 }
 
 // =============================================================================
@@ -130,7 +134,7 @@ pub fn record_validation_operation(field: &str, result: &str) {
     observe_counter_vec(
         &VALIDATION_OPERATIONS,
         "validation_operations_total",
-        &[field, result]
+        &[field, result],
     );
 }
 
@@ -139,7 +143,7 @@ pub fn record_validation_failure_detailed(field: &str, error_type: &str) {
     observe_counter_vec(
         &VALIDATION_FAILURES,
         "validation_failures_total",
-        &[field, error_type]
+        &[field, error_type],
     );
 }
 
@@ -211,7 +215,7 @@ pub fn record_username_failure(error_type: &str) {
 // =============================================================================
 
 /// Instruments a validation operation with complete metrics tracking (standardized approach)
-/// 
+///
 /// This is the high-level API that combines timing, success/failure tracking, and error categorization.
 /// Perfect for wrapping existing validation functions without changing their logic.
 ///
@@ -227,7 +231,7 @@ where
 {
     // Clean timer using standardized approach - no Option<>, no custom error handling
     let _timer = time_validation(field);
-    
+
     match validation_fn() {
         Ok(()) => {
             // Clean success tracking using business helper
@@ -238,7 +242,7 @@ where
             // Clean failure tracking with error categorization
             let error_type = categorize_error(&validation_err);
             record_validation_failure_with_type(field, error_type);
-            
+
             // Pass the error up the chain
             Err(AuthServiceError::from(validation_err))
         }
@@ -254,12 +258,10 @@ fn categorize_error(err: &ValidationError) -> &'static str {
     match err {
         ValidationError::MissingField { .. } => error_types::MISSING,
         ValidationError::TooLong { .. } => error_types::TOO_LONG,
-        ValidationError::InvalidValue { field, .. } => {
-            match field.as_str() {
-                "password" => error_types::WEAK_PASSWORD,
-                _ => error_types::INVALID_FORMAT,
-            }
-        }
+        ValidationError::InvalidValue { field, .. } => match field.as_str() {
+            "password" => error_types::WEAK_PASSWORD,
+            _ => error_types::INVALID_FORMAT,
+        },
         ValidationError::PasswordHash { .. } => error_types::HASH_ERROR,
     }
 }
@@ -272,50 +274,65 @@ mod tests {
     #[test]
     fn test_validation_metrics_initialization() {
         init_validation_metrics();
-        
+
         // Test that all metrics are properly initialized
-        assert_eq!(VALIDATION_OPERATIONS.with_label_values(&[field_types::USERNAME, results::SUCCESS]).get(), 0.0);
-        assert_eq!(VALIDATION_FAILURES.with_label_values(&[field_types::USERNAME, error_types::MISSING]).get(), 0.0);
-        assert_eq!(VALIDATION_DURATION.with_label_values(&[field_types::USERNAME]).get_sample_count(), 0);
+        assert_eq!(
+            VALIDATION_OPERATIONS
+                .with_label_values(&[field_types::USERNAME, results::SUCCESS])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            VALIDATION_FAILURES
+                .with_label_values(&[field_types::USERNAME, error_types::MISSING])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            VALIDATION_DURATION
+                .with_label_values(&[field_types::USERNAME])
+                .get_sample_count(),
+            0
+        );
     }
 
     #[test]
     fn test_standardized_counter_operations() {
         init_validation_metrics();
-        
+
         let before = VALIDATION_OPERATIONS
             .with_label_values(&[field_types::USERNAME, results::SUCCESS])
             .get();
-        
+
         record_username_success();
-        
+
         let after = VALIDATION_OPERATIONS
             .with_label_values(&[field_types::USERNAME, results::SUCCESS])
             .get();
-        
+
         assert_eq!(after, before + 1.0);
     }
 
     #[test]
     fn test_standardized_failure_tracking() {
         init_validation_metrics();
-        
+
         let before_general = VALIDATION_OPERATIONS
             .with_label_values(&[field_types::EMAIL, results::FAILURE])
             .get();
         let before_detailed = VALIDATION_FAILURES
             .with_label_values(&[field_types::EMAIL, error_types::INVALID_FORMAT])
             .get();
-        
+
         record_validation_failure_with_type(field_types::EMAIL, error_types::INVALID_FORMAT);
-        
+
         let after_general = VALIDATION_OPERATIONS
             .with_label_values(&[field_types::EMAIL, results::FAILURE])
             .get();
         let after_detailed = VALIDATION_FAILURES
             .with_label_values(&[field_types::EMAIL, error_types::INVALID_FORMAT])
             .get();
-        
+
         assert_eq!(after_general, before_general + 1.0);
         assert_eq!(after_detailed, before_detailed + 1.0);
     }
@@ -323,18 +340,18 @@ mod tests {
     #[test]
     fn test_standardized_timer_approach() {
         init_validation_metrics();
-        
+
         let before_count = VALIDATION_DURATION
             .with_label_values(&[field_types::PASSWORD])
             .get_sample_count();
-        
+
         let timer = time_validation(field_types::PASSWORD);
         drop(timer); // Complete the timing
-        
+
         let after_count = VALIDATION_DURATION
             .with_label_values(&[field_types::PASSWORD])
             .get_sample_count();
-        
+
         // Clean assertion - timer should always work with standardized approach
         assert_eq!(after_count, before_count + 1);
     }
@@ -342,25 +359,25 @@ mod tests {
     #[test]
     fn test_high_level_instrument_validation_success() {
         init_validation_metrics();
-        
+
         let before_count = VALIDATION_OPERATIONS
             .with_label_values(&[field_types::USERNAME, results::SUCCESS])
             .get();
         let before_duration = VALIDATION_DURATION
             .with_label_values(&[field_types::USERNAME])
             .get_sample_count();
-        
+
         let result = instrument_validation(field_types::USERNAME, || Ok(()));
-        
+
         assert!(result.is_ok());
-        
+
         let after_count = VALIDATION_OPERATIONS
             .with_label_values(&[field_types::USERNAME, results::SUCCESS])
             .get();
         let after_duration = VALIDATION_DURATION
             .with_label_values(&[field_types::USERNAME])
             .get_sample_count();
-        
+
         assert_eq!(after_count, before_count + 1.0);
         assert_eq!(after_duration, before_duration + 1);
     }
@@ -368,7 +385,7 @@ mod tests {
     #[test]
     fn test_high_level_instrument_validation_failure() {
         init_validation_metrics();
-        
+
         let before_general = VALIDATION_OPERATIONS
             .with_label_values(&[field_types::EMAIL, results::FAILURE])
             .get();
@@ -378,7 +395,7 @@ mod tests {
         let before_duration = VALIDATION_DURATION
             .with_label_values(&[field_types::EMAIL])
             .get_sample_count();
-        
+
         let result = instrument_validation(field_types::EMAIL, || {
             Err(ValidationError::InvalidValue {
                 field: field_types::EMAIL.to_string(),
@@ -386,9 +403,9 @@ mod tests {
                 span: SpanTrace::capture(),
             })
         });
-        
+
         assert!(result.is_err());
-        
+
         let after_general = VALIDATION_OPERATIONS
             .with_label_values(&[field_types::EMAIL, results::FAILURE])
             .get();
@@ -398,7 +415,7 @@ mod tests {
         let after_duration = VALIDATION_DURATION
             .with_label_values(&[field_types::EMAIL])
             .get_sample_count();
-        
+
         assert_eq!(after_general, before_general + 1.0);
         assert_eq!(after_detailed, before_detailed + 1.0);
         assert_eq!(after_duration, before_duration + 1);
@@ -413,7 +430,7 @@ mod tests {
             }),
             error_types::MISSING
         );
-        
+
         assert_eq!(
             categorize_error(&ValidationError::TooLong {
                 field: field_types::EMAIL.to_string(),
@@ -422,7 +439,7 @@ mod tests {
             }),
             error_types::TOO_LONG
         );
-        
+
         assert_eq!(
             categorize_error(&ValidationError::InvalidValue {
                 field: field_types::PASSWORD.to_string(),
@@ -431,7 +448,7 @@ mod tests {
             }),
             error_types::WEAK_PASSWORD
         );
-        
+
         assert_eq!(
             categorize_error(&ValidationError::InvalidValue {
                 field: field_types::EMAIL.to_string(),
@@ -440,7 +457,7 @@ mod tests {
             }),
             error_types::INVALID_FORMAT
         );
-        
+
         assert_eq!(
             categorize_error(&ValidationError::PasswordHash {
                 message: "Hash failed".to_string(),
@@ -453,28 +470,73 @@ mod tests {
     #[test]
     fn test_business_helper_consistency() {
         init_validation_metrics();
-        
+
         // Test used field-specific business helpers
         record_username_success();
         record_username_failure(error_types::TOO_LONG);
-        
-        // Test direct calls with other field types  
+
+        // Test direct calls with other field types
         record_validation_success(field_types::EMAIL);
         record_validation_failure_with_type(field_types::EMAIL, error_types::INVALID_FORMAT);
         record_validation_success(field_types::PASSWORD);
         record_validation_failure_with_type(field_types::PASSWORD, error_types::WEAK_PASSWORD);
-        
+
         // Verify operations were recorded
-        assert_eq!(VALIDATION_OPERATIONS.with_label_values(&[field_types::USERNAME, results::SUCCESS]).get(), 1.0);
-        assert_eq!(VALIDATION_OPERATIONS.with_label_values(&[field_types::USERNAME, results::FAILURE]).get(), 1.0);
-        assert_eq!(VALIDATION_OPERATIONS.with_label_values(&[field_types::EMAIL, results::SUCCESS]).get(), 1.0);
-        assert_eq!(VALIDATION_OPERATIONS.with_label_values(&[field_types::EMAIL, results::FAILURE]).get(), 1.0);
-        assert_eq!(VALIDATION_OPERATIONS.with_label_values(&[field_types::PASSWORD, results::SUCCESS]).get(), 1.0);
-        assert_eq!(VALIDATION_OPERATIONS.with_label_values(&[field_types::PASSWORD, results::FAILURE]).get(), 1.0);
-        
+        assert_eq!(
+            VALIDATION_OPERATIONS
+                .with_label_values(&[field_types::USERNAME, results::SUCCESS])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            VALIDATION_OPERATIONS
+                .with_label_values(&[field_types::USERNAME, results::FAILURE])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            VALIDATION_OPERATIONS
+                .with_label_values(&[field_types::EMAIL, results::SUCCESS])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            VALIDATION_OPERATIONS
+                .with_label_values(&[field_types::EMAIL, results::FAILURE])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            VALIDATION_OPERATIONS
+                .with_label_values(&[field_types::PASSWORD, results::SUCCESS])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            VALIDATION_OPERATIONS
+                .with_label_values(&[field_types::PASSWORD, results::FAILURE])
+                .get(),
+            1.0
+        );
+
         // Verify detailed failures were recorded
-        assert_eq!(VALIDATION_FAILURES.with_label_values(&[field_types::USERNAME, error_types::TOO_LONG]).get(), 1.0);
-        assert_eq!(VALIDATION_FAILURES.with_label_values(&[field_types::EMAIL, error_types::INVALID_FORMAT]).get(), 1.0);
-        assert_eq!(VALIDATION_FAILURES.with_label_values(&[field_types::PASSWORD, error_types::WEAK_PASSWORD]).get(), 1.0);
+        assert_eq!(
+            VALIDATION_FAILURES
+                .with_label_values(&[field_types::USERNAME, error_types::TOO_LONG])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            VALIDATION_FAILURES
+                .with_label_values(&[field_types::EMAIL, error_types::INVALID_FORMAT])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            VALIDATION_FAILURES
+                .with_label_values(&[field_types::PASSWORD, error_types::WEAK_PASSWORD])
+                .get(),
+            1.0
+        );
     }
 }

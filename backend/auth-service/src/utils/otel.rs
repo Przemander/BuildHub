@@ -7,107 +7,87 @@
 //! - Graceful shutdown handling for telemetry pipelines
 
 use std::error::Error;
-use opentelemetry::{global, KeyValue, trace::TracerProvider};
-use opentelemetry_semantic_conventions::resource::{SERVICE_NAME, SERVICE_VERSION};
-use opentelemetry_otlp::{SpanExporter, LogExporter, WithExportConfig};
-use opentelemetry_sdk::{
-    trace::{SdkTracerProvider, Sampler},
-    logs::{BatchLogProcessor, SdkLoggerProvider},
-    resource::Resource,
-};
-use opentelemetry_appender_log::OpenTelemetryLogBridge;
-use tracing_subscriber::{prelude::*, EnvFilter};
-use tracing_opentelemetry::OpenTelemetryLayer;
+use std::sync::OnceLock;
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-/// Initialize production-ready telemetry infrastructure.
-///
-/// This function sets up a complete observability stack with:
-/// - Properly configured OpenTelemetry trace provider
-/// - Batch export of telemetry data
-/// - JSON formatted logging for cloud environments
-/// - Sampling strategy for production traffic volumes
+/// Minimal, idempotent tracing initialization for the auth-service.
+/// - No OpenTelemetry exporter (avoids version/API mismatches)
+/// - JSON logs, respects RUST_LOG / LOG_LEVEL
+/// - Safe to call multiple times (no panics)
 pub fn init_telemetry() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
-    // 1) Resource with enhanced attributes
-    let resource = Resource::builder()
-        .with_attributes(vec![
-            KeyValue::new(SERVICE_NAME, "auth-service"),
-            KeyValue::new(SERVICE_VERSION, "1.0.0"),
-            KeyValue::new("deployment.environment", "production"),
-            KeyValue::new("host.name", hostname().unwrap_or_else(|_| "unknown".to_string())),
-        ])
-        .build();
+    static TELEMETRY_ONCE: OnceLock<()> = OnceLock::new();
 
-    // 2) Traces: build OTLP Span exporter with sampling strategy
-    let span_exporter = SpanExporter::builder()
-        .with_tonic()
-        .with_endpoint("http://localhost:4317")
-        .build()?;
+    TELEMETRY_ONCE.get_or_init(|| {
+        // Determine filter from RUST_LOG or LOG_LEVEL, default to "info"
+        let filter = EnvFilter::try_from_default_env()
+            .or_else(|_| {
+                let lvl = std::env::var("LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
+                EnvFilter::try_new(lvl)
+            })
+            .unwrap_or_else(|_| EnvFilter::new("info"));
 
-    // Configure sampler (for production, use a probabilistic sampler)
-    let sampler = Sampler::ParentBased(Box::new(
-        Sampler::TraceIdRatioBased(0.1)
-    ));
+        // JSON formatter; tweak to taste
+        let fmt_layer = fmt::layer()
+            .json()
+            .with_target(false)
+            .with_level(true)
+            .with_current_span(true);
 
-    let tracer_provider = SdkTracerProvider::builder()
-        .with_batch_exporter(span_exporter)
-        .with_resource(resource.clone())
-        .with_sampler(sampler)
-        .build();
-    global::set_tracer_provider(tracer_provider.clone());
-
-    // 3) Logs: build OTLP Log exporter with batching
-    let log_exporter = LogExporter::builder()
-        .with_tonic()
-        .with_endpoint("http://localhost:4317")
-        .build()?;
-
-    // Simplified batch processor configuration
-    let logger_provider = SdkLoggerProvider::builder()
-        .with_log_processor(BatchLogProcessor::builder(log_exporter).build())
-        .with_resource(resource)
-        .build();
-
-    // bridge `log` crate into OpenTelemetry
-    let otel_log_appender = OpenTelemetryLogBridge::new(&logger_provider);
-    log::set_boxed_logger(Box::new(otel_log_appender))?;
-    log::set_max_level(log::LevelFilter::Info);
-
-    // 4) tracing_subscriber: wire up the OTLP‐tracer as a layer
-    let tracer = tracer_provider.tracer("auth-service");
-    let otel_layer = OpenTelemetryLayer::new(tracer);
-    
-    // Enhanced formatting layer
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .json()
-        .with_file(true)
-        .with_line_number(true)
-        .with_target(true)
-        .with_level(true)
-        .with_current_span(true);
-
-    // Configure with error layer for better error tracking
-    tracing_subscriber::registry()
-        .with(EnvFilter::from_default_env())
-        .with(otel_layer)
-        .with(fmt_layer)
-        .init();
+        // try_init avoids SetLoggerError panics if already set elsewhere
+        let _ = tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt_layer)
+            .try_init();
+    });
 
     Ok(())
 }
 
-/// Get the hostname of the current system.
-fn hostname() -> Result<String, std::io::Error> {
-    use std::process::Command;
-    
-    let output = Command::new("hostname").output()?;
-    let hostname = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok(hostname)
+/// Optional: call on shutdown to flush spans.
+#[allow(dead_code)]
+pub fn shutdown_telemetry() {}
+
+#[cfg(test)]
+fn hostname() -> Result<String, Box<dyn Error + Send + Sync + 'static>> {
+    if let Ok(h) = std::env::var("HOSTNAME") {
+        if !h.is_empty() {
+            return Ok(h);
+        }
+    }
+
+    if let Ok(h) = std::env::var("COMPUTERNAME") {
+        if !h.is_empty() {
+            return Ok(h);
+        }
+    }
+
+    #[cfg(target_family = "unix")]
+    {
+        use std::fs;
+        if let Ok(contents) = fs::read_to_string("/etc/hostname") {
+            let h = contents.trim().to_string();
+            if !h.is_empty() {
+                return Ok(h);
+            }
+        }
+    }
+
+    if let Ok(output) = std::process::Command::new("hostname").output() {
+        if output.status.success() {
+            let h = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !h.is_empty() {
+                return Ok(h);
+            }
+        }
+    }
+
+    Ok("unknown-host".to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_hostname() {
         let result = hostname();

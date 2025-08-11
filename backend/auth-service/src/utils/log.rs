@@ -68,16 +68,16 @@ const FILE_ERROR_RETRY_DELAY_SECS: u64 = 5;
 struct LogMessage {
     /// Log severity level (INFO, WARN, ERROR, DEBUG)
     level: String,
-    
+
     /// Process or module that generated the log
     process: String,
-    
+
     /// Description of the event that occurred
     event: String,
-    
+
     /// Outcome of the event (success, failure, etc.)
     result: String,
-    
+
     /// File or location where the log was generated
     origin: String,
 }
@@ -95,13 +95,13 @@ struct LogMessage {
 struct LogFileWriter {
     /// Path to the log file
     log_path: String,
-    
+
     /// Buffered writer for the log file
     writer: Option<BufWriter<File>>,
-    
+
     /// Most recent error encountered (if any)
     last_error: Option<io::Error>,
-    
+
     /// Time when next retry should be attempted after error
     retry_after: Option<Instant>,
 }
@@ -148,7 +148,8 @@ impl LogFileWriter {
         if let Some(parent) = Path::new(&self.log_path).parent() {
             if let Err(e) = fs::create_dir_all(parent) {
                 self.last_error = Some(e);
-                self.retry_after = Some(Instant::now() + Duration::from_secs(FILE_ERROR_RETRY_DELAY_SECS));
+                self.retry_after =
+                    Some(Instant::now() + Duration::from_secs(FILE_ERROR_RETRY_DELAY_SECS));
                 return false;
             }
         }
@@ -168,7 +169,8 @@ impl LogFileWriter {
             }
             Err(e) => {
                 self.last_error = Some(e);
-                self.retry_after = Some(Instant::now() + Duration::from_secs(FILE_ERROR_RETRY_DELAY_SECS));
+                self.retry_after =
+                    Some(Instant::now() + Duration::from_secs(FILE_ERROR_RETRY_DELAY_SECS));
                 false
             }
         }
@@ -194,7 +196,7 @@ impl LogFileWriter {
             if let Err(e) = writeln!(writer, "{}", entry) {
                 self.last_error = Some(e);
                 self.writer = None;
-                
+
                 // Try to reinitialize immediately
                 return self.initialize() && self.write(entry);
             }
@@ -223,11 +225,11 @@ impl LogFileWriter {
             false
         }
     }
-    
+
     /// Returns the most recent error encountered (if any)
     ///
     /// # Returns
-    /// 
+    ///
     /// An Option containing a reference to the most recent error
     #[inline]
     fn last_error(&self) -> Option<&io::Error> {
@@ -240,7 +242,7 @@ impl LogFileWriter {
 struct LogChannel {
     /// Sender half of the bounded channel
     sender: Sender<LogMessage>,
-    
+
     /// Counter for messages dropped due to backpressure
     dropped_count: AtomicUsize,
 }
@@ -248,7 +250,7 @@ struct LogChannel {
 // Global channel for sending log messages
 static LOG_CHANNEL: Lazy<Option<LogChannel>> = Lazy::new(|| {
     let (sender, receiver) = bounded::<LogMessage>(LOG_CHANNEL_CAPACITY);
-    
+
     // Spawn a background thread for processing logs
     match thread::Builder::new()
         .name("log-processor".to_string())
@@ -294,9 +296,9 @@ static LOG_CHANNEL: Lazy<Option<LogChannel>> = Lazy::new(|| {
         }) {
         Ok(_) => {
             // Thread started successfully
-            Some(LogChannel { 
+            Some(LogChannel {
                 sender,
-                dropped_count: AtomicUsize::new(0) 
+                dropped_count: AtomicUsize::new(0),
             })
         }
         Err(e) => {
@@ -340,10 +342,10 @@ fn create_log_entry(timestamp: &str, message: &LogMessage) -> Value {
 fn log_to_console(level: &str, log_str: &str) {
     match level {
         "DEBUG" => debug!("{}", log_str),
-        "INFO"  => info!("{}", log_str),
-        "WARN"  => warn!("{}", log_str),
+        "INFO" => info!("{}", log_str),
+        "WARN" => warn!("{}", log_str),
         "ERROR" => error!("{}", log_str),
-        _       => warn!("Unknown log level: {}", log_str),
+        _ => warn!("Unknown log level: {}", log_str),
     }
 }
 
@@ -380,7 +382,7 @@ fn fallback_log(level: &str, process: &str, event: &str, result: &str, origin: &
         result: result.to_string(),
         origin: origin.to_string(),
     };
-    
+
     let log_data = create_log_entry(&timestamp, &message);
     let log_str = log_data.to_string();
     log_to_console(level, &log_str);
@@ -393,7 +395,7 @@ pub struct Log;
 impl Log {
     /// Logs an event with ECS-compliant structured format
     ///
-    /// This method is non-blocking - it sends the log to a background thread 
+    /// This method is non-blocking - it sends the log to a background thread
     /// if initialized, falling back to synchronous logging if the channel
     /// is unavailable or at capacity.
     ///
@@ -413,14 +415,14 @@ impl Log {
                 result: result.to_string(),
                 origin: origin.to_string(),
             };
-            
+
             // Try to send, but track dropped messages if channel is full
             if let Err(e) = channel.sender.try_send(message) {
                 if matches!(e, TrySendError::Full(_)) {
                     // Increment the dropped count
                     channel.dropped_count.fetch_add(1, Ordering::Relaxed);
                 }
-                
+
                 // Fallback to direct logging
                 fallback_log(level, process, event, result, origin);
             }
@@ -429,7 +431,7 @@ impl Log {
             fallback_log(level, process, event, result, origin);
         }
     }
-    
+
     /// Returns the count of log messages dropped due to backpressure
     ///
     /// This can be used to monitor the health of the logging system
@@ -445,7 +447,7 @@ impl Log {
         }
         0
     }
-    
+
     /// Determines if the logging system has been properly initialized
     ///
     /// # Returns
@@ -543,40 +545,46 @@ macro_rules! log_error {
 mod tests {
     use super::*;
     use std::sync::Once;
-    
+
     // Initialize logger only once for all tests
     static INIT: Once = Once::new();
-    
+
     fn init_logger() {
         INIT.call_once(|| {
             log::set_max_level(log::LevelFilter::Debug);
         });
     }
-    
+
     #[test]
     fn test_log_file_writer_initialization() {
         // Create a temporary directory for logs
         let temp_dir = format!("/tmp/test_logs_{}", std::process::id());
         let path = format!("{}/test.log", temp_dir);
-        
+
         let mut writer = LogFileWriter::new(path.clone());
-        
+
         // Should initialize successfully
         assert!(writer.initialize(), "Writer should initialize successfully");
-        assert!(writer.writer.is_some(), "Writer should be Some after initialization");
-        
+        assert!(
+            writer.writer.is_some(),
+            "Writer should be Some after initialization"
+        );
+
         // Should write successfully
         assert!(writer.write("Test log entry"), "Write should succeed");
         assert!(writer.flush(), "Flush should succeed");
-        
+
         // Check the file exists and contains our log
         let content = fs::read_to_string(&path).unwrap();
-        assert_eq!(content, "Test log entry\n", "File should contain the written log entry");
-        
+        assert_eq!(
+            content, "Test log entry\n",
+            "File should contain the written log entry"
+        );
+
         // Clean up
         let _ = fs::remove_dir_all(temp_dir);
     }
-    
+
     #[test]
     fn test_log_file_writer_error_handling() {
         // Create an invalid path (directory that doesn't exist and can't be created)
@@ -590,15 +598,24 @@ mod tests {
             // Fallback for other platforms
             "/nonexistent_directory_with_very_long_name_that_should_not_exist/test.log".to_string()
         };
-        
+
         let mut writer = LogFileWriter::new(path);
-        
+
         // Should fail to initialize
-        assert!(!writer.initialize(), "Writer should fail to initialize with invalid path");
-        assert!(writer.writer.is_none(), "Writer should be None after failed initialization");
-        assert!(writer.last_error.is_some(), "Writer should have an error after failed initialization");
+        assert!(
+            !writer.initialize(),
+            "Writer should fail to initialize with invalid path"
+        );
+        assert!(
+            writer.writer.is_none(),
+            "Writer should be None after failed initialization"
+        );
+        assert!(
+            writer.last_error.is_some(),
+            "Writer should have an error after failed initialization"
+        );
     }
-    
+
     #[test]
     fn test_create_log_entry_format() {
         let timestamp = "2023-01-01T00:00:00Z";
@@ -609,79 +626,118 @@ mod tests {
             result: "success".to_string(),
             origin: "test.rs".to_string(),
         };
-        
+
         let entry = create_log_entry(timestamp, &message);
-        
+
         // Verify fields are present and correct
         assert_eq!(entry["@timestamp"], timestamp, "Timestamp should match");
         assert_eq!(entry["log.level"], "INFO", "Log level should match");
         assert_eq!(entry["log.logger"], "TestProcess", "Process should match");
         assert_eq!(entry["message"], "Test event", "Event should match");
         assert_eq!(entry["event.outcome"], "success", "Result should match");
-        assert_eq!(entry["service.name"], SERVICE_NAME, "Service name should match");
+        assert_eq!(
+            entry["service.name"], SERVICE_NAME,
+            "Service name should match"
+        );
         assert_eq!(entry["code.filepath"], "test.rs", "Origin should match");
     }
-    
+
     #[test]
     fn test_should_flush_policy() {
         // Test flush threshold
-        assert!(should_flush(FLUSH_THRESHOLD, Instant::now()), 
-            "Should flush when counter equals threshold");
-        assert!(should_flush(FLUSH_THRESHOLD * 2, Instant::now()),
-            "Should flush when counter is multiple of threshold");
-        assert!(!should_flush(FLUSH_THRESHOLD - 1, Instant::now()),
-            "Should not flush when counter below threshold");
-        
+        assert!(
+            should_flush(FLUSH_THRESHOLD, Instant::now()),
+            "Should flush when counter equals threshold"
+        );
+        assert!(
+            should_flush(FLUSH_THRESHOLD * 2, Instant::now()),
+            "Should flush when counter is multiple of threshold"
+        );
+        assert!(
+            !should_flush(FLUSH_THRESHOLD - 1, Instant::now()),
+            "Should not flush when counter below threshold"
+        );
+
         // Test time interval
         let old_time = Instant::now() - Duration::from_secs(FLUSH_INTERVAL_SECS + 1);
-        assert!(should_flush(1, old_time),
-            "Should flush when time interval exceeded regardless of counter");
-        
+        assert!(
+            should_flush(1, old_time),
+            "Should flush when time interval exceeded regardless of counter"
+        );
+
         let recent_time = Instant::now();
-        assert!(!should_flush(1, recent_time),
-            "Should not flush when time interval not exceeded and counter below threshold");
+        assert!(
+            !should_flush(1, recent_time),
+            "Should not flush when time interval not exceeded and counter below threshold"
+        );
     }
-    
+
     #[test]
     fn test_logger_event() {
         init_logger();
-        
+
         // This just verifies it doesn't panic
         Log::event("INFO", "TestModule", "Test event", "success", "test.rs");
-        
+
         // Test with our macros
         log_debug!("TestDebug", "Debug log", "attempt");
         log_info!("TestInfo", "Info log", "success");
         log_warn!("TestWarn", "Warning log", "warning");
         log_error!("TestError", "Error log", "failure");
     }
-    
+
     #[test]
     fn test_fallback_log() {
         init_logger();
-        
+
         // This just verifies it doesn't panic
         fallback_log("INFO", "TestModule", "Fallback test", "success", "test.rs");
-        
+
         // Test different levels
-        fallback_log("DEBUG", "TestModule", "Debug fallback", "attempt", "test.rs");
-        fallback_log("WARN", "TestModule", "Warning fallback", "warning", "test.rs");
-        fallback_log("ERROR", "TestModule", "Error fallback", "failure", "test.rs");
-        fallback_log("UNKNOWN", "TestModule", "Unknown level", "unknown", "test.rs");
+        fallback_log(
+            "DEBUG",
+            "TestModule",
+            "Debug fallback",
+            "attempt",
+            "test.rs",
+        );
+        fallback_log(
+            "WARN",
+            "TestModule",
+            "Warning fallback",
+            "warning",
+            "test.rs",
+        );
+        fallback_log(
+            "ERROR",
+            "TestModule",
+            "Error fallback",
+            "failure",
+            "test.rs",
+        );
+        fallback_log(
+            "UNKNOWN",
+            "TestModule",
+            "Unknown level",
+            "unknown",
+            "test.rs",
+        );
     }
-    
+
     #[test]
     fn test_dropped_count() {
         // Just ensure it doesn't panic and returns a valid value
         let count = Log::dropped_count();
         assert_eq!(count, count, "Should return a consistent value");
     }
-    
+
     #[test]
     fn test_is_initialized() {
         // This just tests the function exists and returns a boolean
         let initialized = Log::is_initialized();
-        assert!(initialized == true || initialized == false, 
-            "is_initialized should return a boolean value");
+        assert!(
+            initialized == true || initialized == false,
+            "is_initialized should return a boolean value"
+        );
     }
 }

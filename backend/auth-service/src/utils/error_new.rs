@@ -4,7 +4,7 @@
 //!
 //! - **Two-Layer Architecture**:
 //!   1. Internal Layer: Rich context errors for diagnostics (`AuthServiceError`)
-//!   2. Public Layer: Client-facing errors with consistent API responses (`ApiError`) 
+//!   2. Public Layer: Client-facing errors with consistent API responses (`ApiError`)
 //!
 //! - **Observability Integration**: Complete metrics tracking for all error types
 //! - **Context Preservation**: Error chain tracking with source capture
@@ -23,9 +23,15 @@ use tracing_error::SpanTrace;
 
 // Import enhanced error metrics with helper modules
 use crate::metricss::error_metrics::{
-    record_http_response, endpoint_groups,
+    cache,
+    configuration,
     // Import helper modules for cleaner usage
-    database, cache, jwt, rate_limit, validation, configuration,
+    database,
+    endpoint_groups,
+    jwt,
+    rate_limit,
+    record_http_response,
+    validation,
 };
 
 // =============================================================================
@@ -83,7 +89,7 @@ impl ApiError {
     #[inline]
     pub fn new(status: ApiStatus, msg: impl Into<String>) -> Self {
         let msg_str: String = msg.into();
-        
+
         // Log with appropriate severity based on error type
         match status {
             ApiStatus::InternalError | ApiStatus::ConfigurationError => {
@@ -92,7 +98,7 @@ impl ApiError {
                     "API Error",
                     &msg_str,
                     &format!("{:?}", status),
-                    "ApiError::new"
+                    "ApiError::new",
                 );
             }
             ApiStatus::Unauthorized | ApiStatus::ServiceUnavailable => {
@@ -101,7 +107,7 @@ impl ApiError {
                     "API Error",
                     &msg_str,
                     &format!("{:?}", status),
-                    "ApiError::new"
+                    "ApiError::new",
                 );
             }
             ApiStatus::NotFound | ApiStatus::UniqueConstraintError => {
@@ -110,7 +116,7 @@ impl ApiError {
                     "API Error",
                     &msg_str,
                     &format!("{:?}", status),
-                    "ApiError::new"
+                    "ApiError::new",
                 );
             }
             ApiStatus::TooManyRequests => {
@@ -119,7 +125,7 @@ impl ApiError {
                     "API Error",
                     &msg_str,
                     &format!("{:?}", status),
-                    "ApiError::new"
+                    "ApiError::new",
                 );
             }
             _ => {
@@ -128,20 +134,20 @@ impl ApiError {
                     "API Error",
                     &msg_str,
                     &format!("{:?}", status),
-                    "ApiError::new"
+                    "ApiError::new",
                 );
             }
         }
-        
-        ApiError { 
-            status, 
+
+        ApiError {
+            status,
             message: msg_str,
             headers: Vec::new(),
         }
     }
 
     /// Adds a custom HTTP header to the error response.
-    /// 
+    ///
     /// This is useful for rate limiting (Retry-After), CORS, or other
     /// protocol-specific headers.
     ///
@@ -172,45 +178,48 @@ impl ApiError {
     /// Creates a UniqueConstraintError for conflicts like duplicate usernames
     #[inline]
     pub fn unique_constraint(field: &str, msg: &str) -> Self {
-        Self::new(ApiStatus::UniqueConstraintError, format!("{}: {}", field, msg))
+        Self::new(
+            ApiStatus::UniqueConstraintError,
+            format!("{}: {}", field, msg),
+        )
     }
-    
+
     /// Creates an InternalError for unexpected server-side failures
     #[inline]
     pub fn internal<M: Into<String>>(msg: M) -> Self {
         Self::new(ApiStatus::InternalError, msg)
     }
-    
+
     /// Creates a NotFound error for missing resources
     #[inline]
     pub fn not_found(resource: &str) -> Self {
         Self::new(ApiStatus::NotFound, format!("{} not found", resource))
     }
-    
+
     /// Creates a ConfigurationError for service misconfiguration
     #[inline]
     pub fn configuration(msg: &str) -> Self {
         Self::new(ApiStatus::ConfigurationError, msg)
     }
-    
+
     /// Creates a ServiceUnavailable error for temporary outages
     #[inline]
     pub fn service_unavailable(msg: &str) -> Self {
         Self::new(ApiStatus::ServiceUnavailable, msg)
     }
-    
+
     /// Creates a BadRequest error for invalid input formats
     #[inline]
     pub fn bad_request(msg: &str) -> Self {
         Self::new(ApiStatus::BadRequest, msg)
     }
-    
+
     /// Creates an Unauthorized error for authentication failures
     #[inline]
     pub fn unauthorized<M: Into<String>>(msg: M) -> Self {
         Self::new(ApiStatus::Unauthorized, msg)
     }
-    
+
     /// Creates a TooManyRequests error for rate limit enforcement
     #[inline]
     pub fn too_many_requests(msg: &str) -> Self {
@@ -228,21 +237,24 @@ pub enum DatabaseError {
     /// Connection pool failures (e.g., exhausted connections)
     #[error("Database connection pool error")]
     ConnectionPool {
-        #[source] source: r2d2::Error,
+        #[source]
+        source: r2d2::Error,
         span: SpanTrace,
     },
-    
+
     /// Query execution failures (e.g., SQL syntax errors)
     #[error("Database query error")]
     Query {
-        #[source] source: diesel::result::Error,
+        #[source]
+        source: diesel::result::Error,
         span: SpanTrace,
     },
-    
+
     /// Database migration failures
     #[error("Database migration error")]
     Migration {
-        #[source] source: Box<dyn std::error::Error + Send + Sync>,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
         span: SpanTrace,
     },
 }
@@ -253,28 +265,28 @@ pub enum CacheError {
     /// Redis connection failures
     #[error("Redis connection error")]
     Connection {
-        #[source] source: Box<dyn std::error::Error + Send + Sync>,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
         span: SpanTrace,
     },
-    
+
     /// Redis command execution failures
     #[error("Redis operation error")]
     Operation {
-        #[source] source: Box<dyn std::error::Error + Send + Sync>,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
         span: SpanTrace,
     },
-    
+
     /// Cache key not found in Redis
     #[error("Cache key not found")]
-    KeyNotFound {
-        key: String,
-        span: SpanTrace,
-    },
-    
+    KeyNotFound { key: String, span: SpanTrace },
+
     /// JSON serialization/deserialization failures
     #[error("Cache serialization error")]
     Serialization {
-        #[source] source: Box<dyn std::error::Error + Send + Sync>,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
         span: SpanTrace,
     },
 }
@@ -284,47 +296,31 @@ pub enum CacheError {
 pub enum JwtError {
     /// Token has passed its expiration time
     #[error("JWT token has expired")]
-    Expired {
-        span: SpanTrace,
-    },
-    
+    Expired { span: SpanTrace },
+
     /// Token signature verification failed
     #[error("JWT token signature is invalid")]
-    InvalidSignature {
-        span: SpanTrace,
-    },
-    
+    InvalidSignature { span: SpanTrace },
+
     /// Token format or content is invalid
     #[error("JWT token format is invalid")]
-    Invalid {
-        span: SpanTrace,
-    },
-    
+    Invalid { span: SpanTrace },
+
     /// Token has been explicitly revoked
     #[error("JWT token has been revoked")]
-    Revoked {
-        span: SpanTrace,
-    },
-    
+    Revoked { span: SpanTrace },
+
     /// Token has an invalid issued-at time
     #[error("JWT token issued at time is invalid")]
-    InvalidIat {
-        span: SpanTrace,
-    },
-    
+    InvalidIat { span: SpanTrace },
+
     /// JWT configuration problems (e.g., missing keys)
     #[error("JWT configuration error: {message}")]
-    Configuration {
-        message: String,
-        span: SpanTrace,
-    },
-    
+    Configuration { message: String, span: SpanTrace },
+
     /// Other JWT-related internal errors
     #[error("JWT internal error: {message}")]
-    Internal {
-        message: String,
-        span: SpanTrace,
-    },
+    Internal { message: String, span: SpanTrace },
 }
 
 /// Groups all errors related to rate limiting operations.
@@ -339,28 +335,23 @@ pub enum RateLimitError {
         reset_time: Option<usize>,
         span: SpanTrace,
     },
-    
+
     /// Rate limiter configuration problems
     #[error("Rate limit configuration error: {message}")]
-    Configuration {
-        message: String,
-        span: SpanTrace,
-    },
-    
+    Configuration { message: String, span: SpanTrace },
+
     /// Redis operations failed during rate limiting
     #[error("Rate limit cache operation failed: {operation}")]
     CacheOperation {
         operation: String,
-        #[source] source: CacheError,
+        #[source]
+        source: CacheError,
         span: SpanTrace,
     },
-    
+
     /// Rate limit key format is invalid
     #[error("Rate limit key format invalid: {key}")]
-    InvalidKey {
-        key: String,
-        span: SpanTrace,
-    },
+    InvalidKey { key: String, span: SpanTrace },
 }
 
 /// Groups all validation-related errors.
@@ -373,14 +364,11 @@ pub enum ValidationError {
         message: String,
         span: SpanTrace,
     },
-    
+
     /// Required field is missing
     #[error("Missing required field: {field}")]
-    MissingField {
-        field: String,
-        span: SpanTrace,
-    },
-    
+    MissingField { field: String, span: SpanTrace },
+
     /// Field exceeds maximum allowed length
     #[error("Field '{field}' exceeds maximum length of {max_length}")]
     TooLong {
@@ -388,13 +376,10 @@ pub enum ValidationError {
         max_length: usize,
         span: SpanTrace,
     },
-    
+
     /// Password hashing operation failed
     #[error("Password hash operation failed: {message}")]
-    PasswordHash {
-        message: String,
-        span: SpanTrace,
-    },
+    PasswordHash { message: String, span: SpanTrace },
 }
 
 /// The main, unified error type for the entire business logic.
@@ -419,11 +404,11 @@ pub enum AuthServiceError {
     /// JWT authentication errors
     #[error(transparent)]
     Jwt(#[from] JwtError),
-    
+
     /// Rate limiting errors
     #[error(transparent)]
     RateLimit(#[from] RateLimitError),
-    
+
     /// Input validation errors
     #[error(transparent)]
     Validation(#[from] ValidationError),
@@ -435,27 +420,27 @@ pub enum AuthServiceError {
 
 impl From<r2d2::Error> for DatabaseError {
     fn from(err: r2d2::Error) -> Self {
-        DatabaseError::ConnectionPool { 
-            source: err, 
-            span: SpanTrace::capture() 
+        DatabaseError::ConnectionPool {
+            source: err,
+            span: SpanTrace::capture(),
         }
     }
 }
 
 impl From<diesel::result::Error> for DatabaseError {
     fn from(err: diesel::result::Error) -> Self {
-        DatabaseError::Query { 
-            source: err, 
-            span: SpanTrace::capture() 
+        DatabaseError::Query {
+            source: err,
+            span: SpanTrace::capture(),
         }
     }
 }
 
 impl From<redis::RedisError> for CacheError {
     fn from(err: redis::RedisError) -> Self {
-        CacheError::Operation { 
-            source: Box::new(err), 
-            span: SpanTrace::capture() 
+        CacheError::Operation {
+            source: Box::new(err),
+            span: SpanTrace::capture(),
         }
     }
 }
@@ -463,21 +448,15 @@ impl From<redis::RedisError> for CacheError {
 impl From<jsonwebtoken::errors::Error> for JwtError {
     fn from(err: jsonwebtoken::errors::Error) -> Self {
         match err.kind() {
-            jsonwebtoken::errors::ErrorKind::ExpiredSignature => {
-                JwtError::Expired { 
-                    span: SpanTrace::capture() 
-                }
-            }
-            jsonwebtoken::errors::ErrorKind::InvalidSignature => {
-                JwtError::InvalidSignature { 
-                    span: SpanTrace::capture() 
-                }
-            }
-            _ => {
-                JwtError::Invalid { 
-                    span: SpanTrace::capture() 
-                }
-            }
+            jsonwebtoken::errors::ErrorKind::ExpiredSignature => JwtError::Expired {
+                span: SpanTrace::capture(),
+            },
+            jsonwebtoken::errors::ErrorKind::InvalidSignature => JwtError::InvalidSignature {
+                span: SpanTrace::capture(),
+            },
+            _ => JwtError::Invalid {
+                span: SpanTrace::capture(),
+            },
         }
     }
 }
@@ -522,7 +501,7 @@ impl AuthServiceError {
     pub fn configuration(msg: &str) -> Self {
         AuthServiceError::Configuration(msg.to_string())
     }
-    
+
     /// Creates a validation error for a specific field
     pub fn validation(field: &str, message: &str) -> Self {
         AuthServiceError::Validation(ValidationError::InvalidValue {
@@ -531,7 +510,7 @@ impl AuthServiceError {
             span: SpanTrace::capture(),
         })
     }
-    
+
     /// Creates a database error with a custom message
     pub fn database(msg: &str) -> Self {
         AuthServiceError::Database(DatabaseError::Query {
@@ -564,16 +543,16 @@ impl From<AuthServiceError> for ApiError {
             "Error Handler",
             &format!("Service error occurred: {:?}", err),
             "conversion",
-            "AuthServiceError::into_api_error"
+            "AuthServiceError::into_api_error",
         );
-        
+
         match err {
             AuthServiceError::Configuration(msg) => {
                 // Use helper module for cleaner code
                 configuration::record_general_error();
                 ApiError::configuration(&msg)
             }
-            
+
             AuthServiceError::Database(db_err) => match db_err {
                 DatabaseError::ConnectionPool { .. } => {
                     database::record_connection_pool_error();
@@ -653,19 +632,24 @@ impl From<AuthServiceError> for ApiError {
             },
 
             AuthServiceError::RateLimit(rate_err) => match rate_err {
-                RateLimitError::LimitExceeded { current, limit, reset_time, .. } => {
+                RateLimitError::LimitExceeded {
+                    current,
+                    limit,
+                    reset_time,
+                    ..
+                } => {
                     rate_limit::record_limit_exceeded();
                     let message = match reset_time {
                         Some(reset_secs) => format!(
-                            "Rate limit exceeded ({}/{}). Try again in {} seconds.", 
+                            "Rate limit exceeded ({}/{}). Try again in {} seconds.",
                             current, limit, reset_secs
                         ),
                         None => format!(
-                            "Rate limit exceeded ({}/{}). Please try again later.", 
+                            "Rate limit exceeded ({}/{}). Please try again later.",
                             current, limit
                         ),
                     };
-                    
+
                     let mut api_error = ApiError::too_many_requests(&message);
                     if let Some(reset_secs) = reset_time {
                         api_error = api_error.with_header("Retry-After", reset_secs.to_string());
@@ -689,19 +673,30 @@ impl From<AuthServiceError> for ApiError {
             AuthServiceError::Validation(val_err) => match val_err {
                 ValidationError::InvalidValue { field, message, .. } => {
                     validation::record_invalid_value();
-                    ApiError::new(ApiStatus::ValidationError, format!("{}: {}", field, message))
+                    ApiError::new(
+                        ApiStatus::ValidationError,
+                        format!("{}: {}", field, message),
+                    )
                 }
                 ValidationError::MissingField { field, .. } => {
                     validation::record_missing_field();
                     ApiError::new(ApiStatus::ValidationError, format!("{} is required", field))
                 }
-                ValidationError::TooLong { field, max_length, .. } => {
+                ValidationError::TooLong {
+                    field, max_length, ..
+                } => {
                     validation::record_too_long();
-                    ApiError::new(ApiStatus::ValidationError, format!("{} must be no more than {} characters", field, max_length))
+                    ApiError::new(
+                        ApiStatus::ValidationError,
+                        format!("{} must be no more than {} characters", field, max_length),
+                    )
                 }
                 ValidationError::PasswordHash { message, .. } => {
                     validation::record_password_hash_error();
-                    ApiError::new(ApiStatus::InternalError, format!("Password processing failed: {}", message))
+                    ApiError::new(
+                        ApiStatus::InternalError,
+                        format!("Password processing failed: {}", message),
+                    )
                 }
             },
         }
@@ -720,7 +715,7 @@ impl IntoResponse for AuthServiceError {
     fn into_response(self) -> Response {
         // Convert AuthServiceError to ApiError first
         let api_error = ApiError::from(self);
-        
+
         // Map ApiStatus to HTTP status codes
         let status_code = match api_error.status {
             ApiStatus::ValidationError => StatusCode::BAD_REQUEST,
@@ -753,7 +748,9 @@ impl IntoResponse for ApiError {
             ApiStatus::Unauthorized => StatusCode::UNAUTHORIZED,
             ApiStatus::NotFound => StatusCode::NOT_FOUND,
             ApiStatus::UniqueConstraintError => StatusCode::CONFLICT,
-            ApiStatus::ConfigurationError | ApiStatus::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
+            ApiStatus::ConfigurationError | ApiStatus::InternalError => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
             ApiStatus::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             ApiStatus::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
         };
@@ -768,9 +765,10 @@ impl IntoResponse for ApiError {
                 "API Error",
                 &format!("Error serializing error response: {}", e),
                 "serialization_failure",
-                "ApiError::into_response"
+                "ApiError::into_response",
             );
-            "{\"status\":\"internal_error\",\"message\":\"Error serializing the error message.\"}".to_string()
+            "{\"status\":\"internal_error\",\"message\":\"Error serializing the error message.\"}"
+                .to_string()
         });
 
         // Build response with custom headers support

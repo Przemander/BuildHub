@@ -24,10 +24,10 @@
 //! - Infrastructure failures during registration (system health)
 //! - HTTP API health and performance monitoring
 
-use lazy_static::lazy_static;
-use prometheus::{CounterVec, HistogramVec, HistogramTimer};
-use std::sync::atomic::{AtomicBool, Ordering};
 use crate::log_info;
+use lazy_static::lazy_static;
+use prometheus::{CounterVec, HistogramTimer, HistogramVec};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // Import our standardized metrics infrastructure
 use super::core::{
@@ -237,7 +237,11 @@ pub(crate) fn init_registration_metrics() {
     lazy_static::initialize(&REGISTRATION_HTTP_REQUESTS);
     lazy_static::initialize(&REGISTRATION_HTTP_DURATION);
 
-    log_info!("Metrics", "Registration metrics initialized (production-ready with HTTP tracking)", "registration_metrics_init");
+    log_info!(
+        "Metrics",
+        "Registration metrics initialized (production-ready with HTTP tracking)",
+        "registration_metrics_init"
+    );
 }
 
 // =============================================================================
@@ -249,7 +253,7 @@ pub fn record_registration_operation(step: &str, result: &str) {
     observe_counter_vec(
         &REGISTRATION_OPERATIONS,
         "registration_operations_total",
-        &[step, result]
+        &[step, result],
     );
 }
 
@@ -258,7 +262,7 @@ pub fn record_registration_failure_detailed(step: &str, error_type: &str) {
     observe_counter_vec(
         &REGISTRATION_FAILURES,
         "registration_failures_total",
-        &[step, error_type]
+        &[step, error_type],
     );
 }
 
@@ -278,14 +282,14 @@ pub fn record_http_request(method: &str, status_code: u16) {
     observe_counter_vec(
         &REGISTRATION_HTTP_REQUESTS,
         "registration_http_requests_total",
-        &[method, &status_code.to_string()]
+        &[method, &status_code.to_string()],
     );
 }
 
 /// Constants for HTTP methods and status codes (only used ones)
 pub mod http {
     pub const POST: &str = "POST";
-    
+
     // Status codes (only used ones)
     pub const CREATED: u16 = 201;
     pub const BAD_REQUEST: u16 = 400;
@@ -318,17 +322,17 @@ pub mod error_types {
     pub const INVALID_USERNAME: &str = "invalid_username";
     pub const INVALID_EMAIL: &str = "invalid_email";
     pub const WEAK_PASSWORD: &str = "weak_password";
-    
+
     // Uniqueness check errors
     pub const EMAIL_TAKEN: &str = "email_taken";
     pub const USERNAME_TAKEN: &str = "username_taken";
-    
+
     // User creation errors
     pub const DATABASE_ERROR: &str = "database_error";
-    
+
     // Activation setup errors
     pub const REDIS_ERROR: &str = "redis_error";
-    
+
     // Email delivery errors
     pub const SMTP_ERROR: &str = "smtp_error";
     pub const CONFIGURATION_ERROR: &str = "configuration_error";
@@ -419,36 +423,51 @@ mod tests {
     #[test]
     fn test_registration_metrics_initialization() {
         init_registration_metrics();
-        
+
         // Test that all metrics are properly initialized
-        assert_eq!(REGISTRATION_OPERATIONS.with_label_values(&[steps::COMPLETE_FLOW, results::SUCCESS]).get(), 0.0);
-        assert_eq!(REGISTRATION_FAILURES.with_label_values(&[steps::VALIDATION, error_types::INVALID_EMAIL]).get(), 0.0);
-        assert_eq!(REGISTRATION_DURATION.with_label_values(&[steps::COMPLETE_FLOW]).get_sample_count(), 0);
+        assert_eq!(
+            REGISTRATION_OPERATIONS
+                .with_label_values(&[steps::COMPLETE_FLOW, results::SUCCESS])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            REGISTRATION_FAILURES
+                .with_label_values(&[steps::VALIDATION, error_types::INVALID_EMAIL])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            REGISTRATION_DURATION
+                .with_label_values(&[steps::COMPLETE_FLOW])
+                .get_sample_count(),
+            0
+        );
     }
 
     #[test]
     fn test_complete_registration_flow() {
         init_registration_metrics();
-        
+
         let before_count = REGISTRATION_OPERATIONS
             .with_label_values(&[steps::COMPLETE_FLOW, results::SUCCESS])
             .get();
         let before_duration = REGISTRATION_DURATION
             .with_label_values(&[steps::COMPLETE_FLOW])
             .get_sample_count();
-        
+
         // Test complete flow success
         let timer = time_complete_registration_flow();
         record_registration_success();
         drop(timer);
-        
+
         let after_count = REGISTRATION_OPERATIONS
             .with_label_values(&[steps::COMPLETE_FLOW, results::SUCCESS])
             .get();
         let after_duration = REGISTRATION_DURATION
             .with_label_values(&[steps::COMPLETE_FLOW])
             .get_sample_count();
-        
+
         assert_eq!(after_count, before_count + 1.0);
         assert_eq!(after_duration, before_duration + 1);
     }
@@ -456,39 +475,64 @@ mod tests {
     #[test]
     fn test_step_specific_helpers() {
         init_registration_metrics();
-        
+
         // Test all step helpers
         record_validation_success();
         record_validation_failure(error_types::WEAK_PASSWORD);
-        
+
         record_uniqueness_check_success();
         record_uniqueness_check_failure(error_types::EMAIL_TAKEN);
-        
+
         record_user_creation_success();
         record_user_creation_failure(error_types::DATABASE_ERROR);
-        
+
         record_activation_setup_success();
         record_activation_setup_failure(error_types::REDIS_ERROR);
-        
+
         record_email_delivery_success();
         record_email_delivery_failure(error_types::SMTP_ERROR);
-        
+
         // Verify operations were recorded
-        assert_eq!(REGISTRATION_OPERATIONS.with_label_values(&[steps::VALIDATION, results::SUCCESS]).get(), 1.0);
-        assert_eq!(REGISTRATION_OPERATIONS.with_label_values(&[steps::VALIDATION, results::FAILURE]).get(), 1.0);
-        
+        assert_eq!(
+            REGISTRATION_OPERATIONS
+                .with_label_values(&[steps::VALIDATION, results::SUCCESS])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            REGISTRATION_OPERATIONS
+                .with_label_values(&[steps::VALIDATION, results::FAILURE])
+                .get(),
+            1.0
+        );
+
         // Verify detailed failures were recorded
-        assert_eq!(REGISTRATION_FAILURES.with_label_values(&[steps::VALIDATION, error_types::WEAK_PASSWORD]).get(), 1.0);
-        assert_eq!(REGISTRATION_FAILURES.with_label_values(&[steps::UNIQUENESS_CHECK, error_types::EMAIL_TAKEN]).get(), 1.0);
-        assert_eq!(REGISTRATION_FAILURES.with_label_values(&[steps::USER_CREATION, error_types::DATABASE_ERROR]).get(), 1.0);
+        assert_eq!(
+            REGISTRATION_FAILURES
+                .with_label_values(&[steps::VALIDATION, error_types::WEAK_PASSWORD])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            REGISTRATION_FAILURES
+                .with_label_values(&[steps::UNIQUENESS_CHECK, error_types::EMAIL_TAKEN])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            REGISTRATION_FAILURES
+                .with_label_values(&[steps::USER_CREATION, error_types::DATABASE_ERROR])
+                .get(),
+            1.0
+        );
     }
 
     #[test]
     fn test_production_registration_patterns() {
         init_registration_metrics();
-        
+
         // Simulate realistic production registration flow
-        
+
         // Most registrations succeed
         for _ in 0..10 {
             record_validation_success();
@@ -498,29 +542,64 @@ mod tests {
             record_email_delivery_success();
             record_registration_success();
         }
-        
+
         // Some fail at different steps
         record_validation_failure(error_types::WEAK_PASSWORD);
         record_uniqueness_check_failure(error_types::EMAIL_TAKEN);
         record_user_creation_failure(error_types::DATABASE_ERROR);
         record_email_delivery_failure(error_types::SMTP_ERROR);
-        
+
         // Verify realistic success rates
-        assert_eq!(REGISTRATION_OPERATIONS.with_label_values(&[steps::COMPLETE_FLOW, results::SUCCESS]).get(), 10.0);
-        assert_eq!(REGISTRATION_OPERATIONS.with_label_values(&[steps::VALIDATION, results::SUCCESS]).get(), 10.0);
-        assert_eq!(REGISTRATION_OPERATIONS.with_label_values(&[steps::VALIDATION, results::FAILURE]).get(), 1.0);
-        
+        assert_eq!(
+            REGISTRATION_OPERATIONS
+                .with_label_values(&[steps::COMPLETE_FLOW, results::SUCCESS])
+                .get(),
+            10.0
+        );
+        assert_eq!(
+            REGISTRATION_OPERATIONS
+                .with_label_values(&[steps::VALIDATION, results::SUCCESS])
+                .get(),
+            10.0
+        );
+        assert_eq!(
+            REGISTRATION_OPERATIONS
+                .with_label_values(&[steps::VALIDATION, results::FAILURE])
+                .get(),
+            1.0
+        );
+
         // Verify failure categorization
-        assert_eq!(REGISTRATION_FAILURES.with_label_values(&[steps::VALIDATION, error_types::WEAK_PASSWORD]).get(), 1.0);
-        assert_eq!(REGISTRATION_FAILURES.with_label_values(&[steps::UNIQUENESS_CHECK, error_types::EMAIL_TAKEN]).get(), 1.0);
-        assert_eq!(REGISTRATION_FAILURES.with_label_values(&[steps::USER_CREATION, error_types::DATABASE_ERROR]).get(), 1.0);
-        assert_eq!(REGISTRATION_FAILURES.with_label_values(&[steps::EMAIL_DELIVERY, error_types::SMTP_ERROR]).get(), 1.0);
+        assert_eq!(
+            REGISTRATION_FAILURES
+                .with_label_values(&[steps::VALIDATION, error_types::WEAK_PASSWORD])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            REGISTRATION_FAILURES
+                .with_label_values(&[steps::UNIQUENESS_CHECK, error_types::EMAIL_TAKEN])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            REGISTRATION_FAILURES
+                .with_label_values(&[steps::USER_CREATION, error_types::DATABASE_ERROR])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            REGISTRATION_FAILURES
+                .with_label_values(&[steps::EMAIL_DELIVERY, error_types::SMTP_ERROR])
+                .get(),
+            1.0
+        );
     }
 
     #[test]
     fn test_type_safety_constants() {
         init_registration_metrics();
-        
+
         // Verify all constants are valid and type-safe
         assert_eq!(steps::VALIDATION, "validation");
         assert_eq!(steps::UNIQUENESS_CHECK, "uniqueness_check");
@@ -528,27 +607,37 @@ mod tests {
         assert_eq!(steps::ACTIVATION_SETUP, "activation_setup");
         assert_eq!(steps::EMAIL_DELIVERY, "email_delivery");
         assert_eq!(steps::COMPLETE_FLOW, "complete_flow");
-        
+
         assert_eq!(results::SUCCESS, "success");
         assert_eq!(results::FAILURE, "failure");
-        
+
         assert_eq!(error_types::INVALID_EMAIL, "invalid_email");
         assert_eq!(error_types::EMAIL_TAKEN, "email_taken");
         assert_eq!(error_types::DATABASE_ERROR, "database_error");
         assert_eq!(error_types::SMTP_ERROR, "smtp_error");
-        
+
         // Use constants in actual operations
         record_registration_operation(steps::VALIDATION, results::SUCCESS);
         record_registration_failure_detailed(steps::USER_CREATION, error_types::DATABASE_ERROR);
-        
-        assert_eq!(REGISTRATION_OPERATIONS.with_label_values(&[steps::VALIDATION, results::SUCCESS]).get(), 1.0);
-        assert_eq!(REGISTRATION_FAILURES.with_label_values(&[steps::USER_CREATION, error_types::DATABASE_ERROR]).get(), 1.0);
+
+        assert_eq!(
+            REGISTRATION_OPERATIONS
+                .with_label_values(&[steps::VALIDATION, results::SUCCESS])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            REGISTRATION_FAILURES
+                .with_label_values(&[steps::USER_CREATION, error_types::DATABASE_ERROR])
+                .get(),
+            1.0
+        );
     }
 
     #[test]
     fn test_http_metrics_integration() {
         init_registration_metrics();
-        
+
         // Test HTTP request tracking
         let initial_success = REGISTRATION_HTTP_REQUESTS
             .with_label_values(&[http::POST, "201"])
@@ -556,11 +645,11 @@ mod tests {
         let initial_error = REGISTRATION_HTTP_REQUESTS
             .with_label_values(&[http::POST, "400"])
             .get();
-        
+
         // Record requests
         record_http_request(http::POST, http::CREATED);
         record_http_request(http::POST, http::BAD_REQUEST);
-        
+
         // Verify counts
         let final_success = REGISTRATION_HTTP_REQUESTS
             .with_label_values(&[http::POST, "201"])
@@ -568,7 +657,7 @@ mod tests {
         let final_error = REGISTRATION_HTTP_REQUESTS
             .with_label_values(&[http::POST, "400"])
             .get();
-        
+
         assert_eq!(final_success, initial_success + 1.0);
         assert_eq!(final_error, initial_error + 1.0);
     }

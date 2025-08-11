@@ -22,16 +22,14 @@
 //! - Performance SLA breaches (latency targets)
 //! - Unusual activity patterns (login storms, attack patterns)
 
+use crate::log_info;
 use lazy_static::lazy_static;
 use prometheus::{CounterVec, HistogramVec};
 use std::sync::atomic::{AtomicBool, Ordering};
-use crate::log_info;
 
 // Import our standardized metrics infrastructure
 use super::core::{
-    create_counter_vec, create_histogram_vec,
-    observe_counter_vec,
-    LATENCY_BUCKETS_FAST,
+    create_counter_vec, create_histogram_vec, observe_counter_vec, LATENCY_BUCKETS_FAST,
 };
 
 // =============================================================================
@@ -47,7 +45,7 @@ lazy_static! {
     /// # Labels
     /// * `operation`: Core JWT operations
     ///   - `"generate"`: Token creation (login, token refresh)
-    ///   - `"validate"`: Token verification (API authentication)  
+    ///   - `"validate"`: Token verification (API authentication)
     ///   - `"revoke"`: Token invalidation (logout, security revocation)
     /// * `result`: Simple binary outcome
     ///   - `"success"`: Operation completed successfully
@@ -61,7 +59,7 @@ lazy_static! {
     ///   severity: critical
     ///
     /// # Warning: High failure rate
-    /// - alert: AuthHighFailureRate  
+    /// - alert: AuthHighFailureRate
     ///   expr: rate(jwt_operations_total{result="failure"}[5m]) > 5
     ///   severity: warning
     ///
@@ -93,7 +91,7 @@ lazy_static! {
     /// Security-focused metric for detecting attacks, abuse patterns, and debugging
     /// authentication issues. Provides granular failure reasons for incident response.
     ///
-    /// # Labels  
+    /// # Labels
     /// * `failure_type`: Specific failure reason for security analysis
     ///   - `"expired"`: Token past expiration (normal user behavior)
     ///   - `"invalid_signature"`: Signature verification failed (potential attack)
@@ -111,7 +109,7 @@ lazy_static! {
     ///   annotations:
     ///     summary: "JWT signature attack: {{ $value }} failures/sec"
     ///
-    /// # Warning: Compromised tokens in circulation  
+    /// # Warning: Compromised tokens in circulation
     /// - alert: RevokedTokenUsage
     ///   expr: rate(jwt_validation_failures_total{failure_type="revoked"}[5m]) > 1
     ///   severity: warning
@@ -135,7 +133,7 @@ lazy_static! {
     /// sum by (failure_type) (rate(jwt_validation_failures_total{failure_type=~"invalid_signature|revoked|invalid_iat"}[5m]))
     ///
     /// # Normal vs abnormal failures
-    /// rate(jwt_validation_failures_total{failure_type="expired"}[5m]) vs 
+    /// rate(jwt_validation_failures_total{failure_type="expired"}[5m]) vs
     /// rate(jwt_validation_failures_total{failure_type!="expired"}[5m])
     /// ```
     pub static ref JWT_VALIDATION_FAILURES: CounterVec = create_counter_vec(
@@ -186,7 +184,7 @@ lazy_static! {
     /// histogram_quantile(0.95, sum(rate(jwt_operation_duration_seconds_bucket[5m])) by (le, operation))
     ///
     /// # Throughput vs latency correlation
-    /// rate(jwt_operation_duration_seconds_count[5m]) vs 
+    /// rate(jwt_operation_duration_seconds_count[5m]) vs
     /// histogram_quantile(0.95, rate(jwt_operation_duration_seconds_bucket[5m]))
     ///
     /// # Week-over-week performance comparison
@@ -216,7 +214,11 @@ pub(crate) fn init_jwt_metrics() {
     lazy_static::initialize(&JWT_VALIDATION_FAILURES);
     lazy_static::initialize(&JWT_OPERATION_DURATION);
 
-    log_info!("Metrics", "JWT metrics initialized (enhanced production version with core integration)", "jwt_metrics_init");
+    log_info!(
+        "Metrics",
+        "JWT metrics initialized (enhanced production version with core integration)",
+        "jwt_metrics_init"
+    );
 }
 
 // =============================================================================
@@ -228,7 +230,7 @@ pub fn record_operation_success(operation: &str) {
     observe_counter_vec(
         &JWT_OPERATIONS,
         "jwt_operations_total",
-        &[operation, "success"]
+        &[operation, "success"],
     );
 }
 
@@ -237,7 +239,7 @@ pub fn record_operation_failure(operation: &str) {
     observe_counter_vec(
         &JWT_OPERATIONS,
         "jwt_operations_total",
-        &[operation, "failure"]
+        &[operation, "failure"],
     );
 }
 
@@ -246,7 +248,7 @@ pub fn record_validation_failure(failure_type: &str) {
     observe_counter_vec(
         &JWT_VALIDATION_FAILURES,
         "jwt_validation_failures_total",
-        &[failure_type]
+        &[failure_type],
     );
 }
 
@@ -284,15 +286,15 @@ pub mod failure_types {
 /// Generation operation helpers
 pub mod generate {
     use super::*;
-    
+
     pub fn record_success() {
         record_operation_success(operations::GENERATE);
     }
-    
+
     pub fn record_failure() {
         record_operation_failure(operations::GENERATE);
     }
-    
+
     pub fn time() -> prometheus::HistogramTimer {
         time_operation(operations::GENERATE)
     }
@@ -301,45 +303,45 @@ pub mod generate {
 /// Validation operation helpers
 pub mod validate {
     use super::*;
-    
+
     pub fn record_success() {
         record_operation_success(operations::VALIDATE);
     }
-    
+
     pub fn record_failure() {
         record_operation_failure(operations::VALIDATE);
     }
-    
+
     pub fn time() -> prometheus::HistogramTimer {
         time_operation(operations::VALIDATE)
     }
-    
+
     /// Record specific validation failures
     pub fn record_expired() {
         record_validation_failure(failure_types::EXPIRED);
         record_failure();
     }
-    
+
     pub fn record_invalid_signature() {
         record_validation_failure(failure_types::INVALID_SIGNATURE);
         record_failure();
     }
-    
+
     pub fn record_invalid_format() {
         record_validation_failure(failure_types::INVALID_FORMAT);
         record_failure();
     }
-    
+
     pub fn record_revoked() {
         record_validation_failure(failure_types::REVOKED);
         record_failure();
     }
-    
+
     pub fn record_invalid_iat() {
         record_validation_failure(failure_types::INVALID_IAT);
         record_failure();
     }
-    
+
     pub fn record_redis_failure() {
         record_validation_failure(failure_types::REDIS_FAILURE);
         record_failure();
@@ -349,15 +351,15 @@ pub mod validate {
 /// Revocation operation helpers
 pub mod revoke {
     use super::*;
-    
+
     pub fn record_success() {
         record_operation_success(operations::REVOKE);
     }
-    
+
     pub fn record_failure() {
         record_operation_failure(operations::REVOKE);
     }
-    
+
     pub fn time() -> prometheus::HistogramTimer {
         time_operation(operations::REVOKE)
     }
@@ -375,35 +377,54 @@ mod tests {
     #[test]
     fn test_jwt_metrics_initialization() {
         init_jwt_metrics();
-        
+
         // Test that all metrics are properly initialized
-        assert_eq!(JWT_OPERATIONS.with_label_values(&[operations::GENERATE, "success"]).get(), 0.0);
-        assert_eq!(JWT_VALIDATION_FAILURES.with_label_values(&[failure_types::EXPIRED]).get(), 0.0);
-        assert_eq!(JWT_OPERATION_DURATION.with_label_values(&[operations::VALIDATE]).get_sample_count(), 0);
+        assert_eq!(
+            JWT_OPERATIONS
+                .with_label_values(&[operations::GENERATE, "success"])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            JWT_VALIDATION_FAILURES
+                .with_label_values(&[failure_types::EXPIRED])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            JWT_OPERATION_DURATION
+                .with_label_values(&[operations::VALIDATE])
+                .get_sample_count(),
+            0
+        );
     }
 
     #[test]
     fn test_core_operations_with_standardized_functions() {
         init_jwt_metrics();
-        
+
         // Test core operations with enhanced error handling
-        let initial_ops = JWT_OPERATIONS.with_label_values(&[operations::GENERATE, "success"]).get();
+        let initial_ops = JWT_OPERATIONS
+            .with_label_values(&[operations::GENERATE, "success"])
+            .get();
         record_operation_success(operations::GENERATE);
-        let after_ops = JWT_OPERATIONS.with_label_values(&[operations::GENERATE, "success"]).get();
-        
+        let after_ops = JWT_OPERATIONS
+            .with_label_values(&[operations::GENERATE, "success"])
+            .get();
+
         assert_eq!(after_ops, initial_ops + 1.0);
     }
 
     #[test]
     fn test_validation_failure_tracking_with_enhanced_error_handling() {
         init_jwt_metrics();
-        
+
         let initial_failures = JWT_VALIDATION_FAILURES
             .with_label_values(&[failure_types::INVALID_SIGNATURE])
             .get();
-        
+
         record_validation_failure(failure_types::INVALID_SIGNATURE);
-        
+
         assert_eq!(
             JWT_VALIDATION_FAILURES
                 .with_label_values(&[failure_types::INVALID_SIGNATURE])
@@ -415,16 +436,16 @@ mod tests {
     #[test]
     fn test_operation_timing_with_fast_buckets() {
         init_jwt_metrics();
-        
+
         let initial_count = JWT_OPERATION_DURATION
             .with_label_values(&[operations::VALIDATE])
             .get_sample_count();
-        
+
         // Test timing with auto-drop
         let timer = time_operation(operations::VALIDATE);
         std::thread::sleep(Duration::from_millis(1));
         drop(timer); // Timer automatically observed when dropped
-        
+
         assert_eq!(
             JWT_OPERATION_DURATION
                 .with_label_values(&[operations::VALIDATE])
@@ -436,48 +457,88 @@ mod tests {
     #[test]
     fn test_helper_modules() {
         init_jwt_metrics();
-        
+
         // Test generate helpers
         generate::record_success();
-        assert!(JWT_OPERATIONS.with_label_values(&[operations::GENERATE, "success"]).get() >= 1.0);
-        
+        assert!(
+            JWT_OPERATIONS
+                .with_label_values(&[operations::GENERATE, "success"])
+                .get()
+                >= 1.0
+        );
+
         // Test validate helpers with specific failures
         validate::record_expired();
-        assert!(JWT_OPERATIONS.with_label_values(&[operations::VALIDATE, "failure"]).get() >= 1.0);
-        assert!(JWT_VALIDATION_FAILURES.with_label_values(&[failure_types::EXPIRED]).get() >= 1.0);
-        
+        assert!(
+            JWT_OPERATIONS
+                .with_label_values(&[operations::VALIDATE, "failure"])
+                .get()
+                >= 1.0
+        );
+        assert!(
+            JWT_VALIDATION_FAILURES
+                .with_label_values(&[failure_types::EXPIRED])
+                .get()
+                >= 1.0
+        );
+
         validate::record_invalid_signature();
-        assert!(JWT_VALIDATION_FAILURES.with_label_values(&[failure_types::INVALID_SIGNATURE]).get() >= 1.0);
-        
+        assert!(
+            JWT_VALIDATION_FAILURES
+                .with_label_values(&[failure_types::INVALID_SIGNATURE])
+                .get()
+                >= 1.0
+        );
+
         // Test revoke helpers
         revoke::record_success();
-        assert!(JWT_OPERATIONS.with_label_values(&[operations::REVOKE, "success"]).get() >= 1.0);
+        assert!(
+            JWT_OPERATIONS
+                .with_label_values(&[operations::REVOKE, "success"])
+                .get()
+                >= 1.0
+        );
     }
 
     #[test]
     fn test_timer_helpers() {
         init_jwt_metrics();
-        
+
         // Test helper timer functions
         let gen_timer = generate::time();
         drop(gen_timer);
-        
+
         let val_timer = validate::time();
         drop(val_timer);
-        
+
         let rev_timer = revoke::time();
         drop(rev_timer);
-        
+
         // Verify timers were recorded
-        assert!(JWT_OPERATION_DURATION.with_label_values(&[operations::GENERATE]).get_sample_count() >= 1);
-        assert!(JWT_OPERATION_DURATION.with_label_values(&[operations::VALIDATE]).get_sample_count() >= 1);
-        assert!(JWT_OPERATION_DURATION.with_label_values(&[operations::REVOKE]).get_sample_count() >= 1);
+        assert!(
+            JWT_OPERATION_DURATION
+                .with_label_values(&[operations::GENERATE])
+                .get_sample_count()
+                >= 1
+        );
+        assert!(
+            JWT_OPERATION_DURATION
+                .with_label_values(&[operations::VALIDATE])
+                .get_sample_count()
+                >= 1
+        );
+        assert!(
+            JWT_OPERATION_DURATION
+                .with_label_values(&[operations::REVOKE])
+                .get_sample_count()
+                >= 1
+        );
     }
 
     #[test]
     fn test_comprehensive_validation_failures() {
         init_jwt_metrics();
-        
+
         // Test all validation failure types
         validate::record_expired();
         validate::record_invalid_signature();
@@ -485,68 +546,138 @@ mod tests {
         validate::record_revoked();
         validate::record_invalid_iat();
         validate::record_redis_failure();
-        
+
         // Verify all failure types are recorded
-        assert!(JWT_VALIDATION_FAILURES.with_label_values(&[failure_types::EXPIRED]).get() >= 1.0);
-        assert!(JWT_VALIDATION_FAILURES.with_label_values(&[failure_types::INVALID_SIGNATURE]).get() >= 1.0);
-        assert!(JWT_VALIDATION_FAILURES.with_label_values(&[failure_types::INVALID_FORMAT]).get() >= 1.0);
-        assert!(JWT_VALIDATION_FAILURES.with_label_values(&[failure_types::REVOKED]).get() >= 1.0);
-        assert!(JWT_VALIDATION_FAILURES.with_label_values(&[failure_types::INVALID_IAT]).get() >= 1.0);
-        assert!(JWT_VALIDATION_FAILURES.with_label_values(&[failure_types::REDIS_FAILURE]).get() >= 1.0);
-        
+        assert!(
+            JWT_VALIDATION_FAILURES
+                .with_label_values(&[failure_types::EXPIRED])
+                .get()
+                >= 1.0
+        );
+        assert!(
+            JWT_VALIDATION_FAILURES
+                .with_label_values(&[failure_types::INVALID_SIGNATURE])
+                .get()
+                >= 1.0
+        );
+        assert!(
+            JWT_VALIDATION_FAILURES
+                .with_label_values(&[failure_types::INVALID_FORMAT])
+                .get()
+                >= 1.0
+        );
+        assert!(
+            JWT_VALIDATION_FAILURES
+                .with_label_values(&[failure_types::REVOKED])
+                .get()
+                >= 1.0
+        );
+        assert!(
+            JWT_VALIDATION_FAILURES
+                .with_label_values(&[failure_types::INVALID_IAT])
+                .get()
+                >= 1.0
+        );
+        assert!(
+            JWT_VALIDATION_FAILURES
+                .with_label_values(&[failure_types::REDIS_FAILURE])
+                .get()
+                >= 1.0
+        );
+
         // Verify that each validation failure also records general operation failure
-        assert!(JWT_OPERATIONS.with_label_values(&[operations::VALIDATE, "failure"]).get() >= 6.0);
+        assert!(
+            JWT_OPERATIONS
+                .with_label_values(&[operations::VALIDATE, "failure"])
+                .get()
+                >= 6.0
+        );
     }
 
     #[test]
     fn test_production_usage_pattern() {
         init_jwt_metrics();
-        
+
         // Test the actual pattern used in production code
         let timer = validate::time();
-        
+
         // Simulate validation process
         std::thread::sleep(Duration::from_millis(1));
-        
+
         // Different outcomes
         validate::record_success();
         drop(timer);
-        
+
         // Test failure case
         let timer2 = validate::time();
         validate::record_expired();
         drop(timer2);
-        
+
         // Verify both success and failure paths work
-        assert!(JWT_OPERATIONS.with_label_values(&[operations::VALIDATE, "success"]).get() >= 1.0);
-        assert!(JWT_OPERATIONS.with_label_values(&[operations::VALIDATE, "failure"]).get() >= 1.0);
-        assert!(JWT_VALIDATION_FAILURES.with_label_values(&[failure_types::EXPIRED]).get() >= 1.0);
-        assert!(JWT_OPERATION_DURATION.with_label_values(&[operations::VALIDATE]).get_sample_count() >= 2);
+        assert!(
+            JWT_OPERATIONS
+                .with_label_values(&[operations::VALIDATE, "success"])
+                .get()
+                >= 1.0
+        );
+        assert!(
+            JWT_OPERATIONS
+                .with_label_values(&[operations::VALIDATE, "failure"])
+                .get()
+                >= 1.0
+        );
+        assert!(
+            JWT_VALIDATION_FAILURES
+                .with_label_values(&[failure_types::EXPIRED])
+                .get()
+                >= 1.0
+        );
+        assert!(
+            JWT_OPERATION_DURATION
+                .with_label_values(&[operations::VALIDATE])
+                .get_sample_count()
+                >= 2
+        );
     }
 
     #[test]
     fn test_constants_usage() {
         init_jwt_metrics();
-        
+
         // Test using constants for type safety
         record_operation_success(operations::GENERATE);
         record_operation_failure(operations::VALIDATE);
         record_validation_failure(failure_types::INVALID_SIGNATURE);
-        
-        assert!(JWT_OPERATIONS.with_label_values(&[operations::GENERATE, "success"]).get() >= 1.0);
-        assert!(JWT_OPERATIONS.with_label_values(&[operations::VALIDATE, "failure"]).get() >= 1.0);
-        assert!(JWT_VALIDATION_FAILURES.with_label_values(&[failure_types::INVALID_SIGNATURE]).get() >= 1.0);
+
+        assert!(
+            JWT_OPERATIONS
+                .with_label_values(&[operations::GENERATE, "success"])
+                .get()
+                >= 1.0
+        );
+        assert!(
+            JWT_OPERATIONS
+                .with_label_values(&[operations::VALIDATE, "failure"])
+                .get()
+                >= 1.0
+        );
+        assert!(
+            JWT_VALIDATION_FAILURES
+                .with_label_values(&[failure_types::INVALID_SIGNATURE])
+                .get()
+                >= 1.0
+        );
     }
 
     #[test]
     fn test_metric_error_handling() {
         init_jwt_metrics();
-        
+
         // Test that invalid/long label values are handled gracefully
         // (These would be sanitized by the core infrastructure)
         record_operation_success("very_long_operation_name_that_might_cause_issues");
         record_validation_failure("some_invalid_failure_type!");
-        
+
         // These should not panic due to the enhanced error handling in core.rs
         // The metrics should either be recorded with sanitized labels or ignored safely
     }

@@ -1,0 +1,11 @@
+target
+.git
+.gitignore
+**/*.rs.bk
+**/*.swp
+**/*.swo
+**/node_modules
+.env
+.env.*
+/tests
+/.vscode

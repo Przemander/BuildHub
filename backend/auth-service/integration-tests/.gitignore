@@ -1,0 +1,42 @@
+# Python virtual environment
+venv/
+env/
+ENV/
+.venv
+
+# Pytest
+.pytest_cache/
+*.pytest_cache
+
+# Python compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test reports
+reports/
+test-results/
+*.html
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Coverage reports
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+.hypothesis/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

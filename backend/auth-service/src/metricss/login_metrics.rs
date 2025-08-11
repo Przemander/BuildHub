@@ -24,10 +24,10 @@
 //! - Infrastructure failures during login (system health)
 //! - HTTP API health and performance monitoring
 
-use lazy_static::lazy_static;
-use prometheus::{CounterVec, HistogramVec, HistogramTimer};
-use std::sync::atomic::{AtomicBool, Ordering};
 use crate::log_info;
+use lazy_static::lazy_static;
+use prometheus::{CounterVec, HistogramTimer, HistogramVec};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // Import our standardized metrics infrastructure
 use super::core::{
@@ -228,7 +228,11 @@ pub fn init_login_metrics() {
     lazy_static::initialize(&LOGIN_HTTP_REQUESTS);
     lazy_static::initialize(&LOGIN_HTTP_DURATION);
 
-    log_info!("Metrics", "Login metrics initialized (production-ready with HTTP tracking)", "login_metrics_init");
+    log_info!(
+        "Metrics",
+        "Login metrics initialized (production-ready with HTTP tracking)",
+        "login_metrics_init"
+    );
 }
 
 // =============================================================================
@@ -237,27 +241,17 @@ pub fn init_login_metrics() {
 
 /// Records login operation result (standardized approach)
 pub fn record_login_operation(step: &str, result: &str) {
-    observe_counter_vec(
-        &LOGIN_OPERATIONS,
-        "login_operations_total",
-        &[step, result]
-    );
+    observe_counter_vec(&LOGIN_OPERATIONS, "login_operations_total", &[step, result]);
 }
 
 /// Records specific login failure (standardized approach)
 pub fn record_login_failure_detailed(step: &str, error_type: &str) {
-    observe_counter_vec(
-        &LOGIN_FAILURES,
-        "login_failures_total",
-        &[step, error_type]
-    );
+    observe_counter_vec(&LOGIN_FAILURES, "login_failures_total", &[step, error_type]);
 }
 
 /// Times login step with standard prometheus timer
 pub fn time_login_step(step: &str) -> HistogramTimer {
-    LOGIN_DURATION
-        .with_label_values(&[step])
-        .start_timer()
+    LOGIN_DURATION.with_label_values(&[step]).start_timer()
 }
 
 // =============================================================================
@@ -269,18 +263,22 @@ pub fn record_http_request(method: &str, status_code: u16) {
     observe_counter_vec(
         &LOGIN_HTTP_REQUESTS,
         "login_http_requests_total",
-        &[method, &status_code.to_string()]
+        &[method, &status_code.to_string()],
     );
 }
 
 /// Constants for HTTP methods and status codes
 pub mod http {
     pub const POST: &str = "POST";
-    
+
     // Status codes
     pub const OK: u16 = 200;
     pub const BAD_REQUEST: u16 = 400;
+    
+    #[allow(dead_code)]
     pub const INTERNAL_SERVER_ERROR: u16 = 500;
+    
+    #[allow(dead_code)]
     pub const TOO_MANY_REQUESTS: u16 = 429;
 }
 
@@ -407,38 +405,63 @@ mod tests {
     #[test]
     fn test_login_metrics_initialization() {
         init_login_metrics();
-        
+
         // Test that all metrics are properly initialized
-        assert_eq!(LOGIN_OPERATIONS.with_label_values(&[steps::COMPLETE_FLOW, results::SUCCESS]).get(), 0.0);
-        assert_eq!(LOGIN_FAILURES.with_label_values(&[steps::USER_LOOKUP, error_types::USER_NOT_FOUND]).get(), 0.0);
-        assert_eq!(LOGIN_DURATION.with_label_values(&[steps::COMPLETE_FLOW]).get_sample_count(), 0);
-        assert_eq!(LOGIN_HTTP_REQUESTS.with_label_values(&[http::POST, "200"]).get(), 0.0);
-        assert_eq!(LOGIN_HTTP_DURATION.with_label_values(&[http::POST, "200"]).get_sample_count(), 0);
+        assert_eq!(
+            LOGIN_OPERATIONS
+                .with_label_values(&[steps::COMPLETE_FLOW, results::SUCCESS])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            LOGIN_FAILURES
+                .with_label_values(&[steps::USER_LOOKUP, error_types::USER_NOT_FOUND])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            LOGIN_DURATION
+                .with_label_values(&[steps::COMPLETE_FLOW])
+                .get_sample_count(),
+            0
+        );
+        assert_eq!(
+            LOGIN_HTTP_REQUESTS
+                .with_label_values(&[http::POST, "200"])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            LOGIN_HTTP_DURATION
+                .with_label_values(&[http::POST, "200"])
+                .get_sample_count(),
+            0
+        );
     }
 
     #[test]
     fn test_complete_login_flow() {
         init_login_metrics();
-        
+
         let before_count = LOGIN_OPERATIONS
             .with_label_values(&[steps::COMPLETE_FLOW, results::SUCCESS])
             .get();
         let before_duration = LOGIN_DURATION
             .with_label_values(&[steps::COMPLETE_FLOW])
             .get_sample_count();
-        
+
         // Test complete flow success
         let timer = time_complete_login_flow();
         record_login_success();
         drop(timer);
-        
+
         let after_count = LOGIN_OPERATIONS
             .with_label_values(&[steps::COMPLETE_FLOW, results::SUCCESS])
             .get();
         let after_duration = LOGIN_DURATION
             .with_label_values(&[steps::COMPLETE_FLOW])
             .get_sample_count();
-        
+
         assert_eq!(after_count, before_count + 1.0);
         assert_eq!(after_duration, before_duration + 1);
     }
@@ -446,41 +469,71 @@ mod tests {
     #[test]
     fn test_step_specific_helpers() {
         init_login_metrics();
-        
+
         // Test all step helpers
         record_db_connection_success();
         record_db_connection_failure(error_types::DB_UNAVAILABLE);
-        
+
         record_user_lookup_success();
         record_user_lookup_failure(error_types::USER_NOT_FOUND);
-        
+
         record_password_verification_success();
         record_password_verification_failure(error_types::INVALID_PASSWORD);
-        
+
         record_account_check_success();
         record_account_check_failure(error_types::INACTIVE_ACCOUNT);
-        
+
         record_token_generation_access_success();
         record_token_generation_access_failure(error_types::TOKEN_GENERATION_FAILED);
-        
+
         record_token_generation_refresh_success();
         record_token_generation_refresh_failure(error_types::TOKEN_GENERATION_FAILED);
-        
+
         // Verify operations were recorded
-        assert_eq!(LOGIN_OPERATIONS.with_label_values(&[steps::USER_LOOKUP, results::SUCCESS]).get(), 1.0);
-        assert_eq!(LOGIN_OPERATIONS.with_label_values(&[steps::USER_LOOKUP, results::FAILURE]).get(), 1.0);
-        
+        assert_eq!(
+            LOGIN_OPERATIONS
+                .with_label_values(&[steps::USER_LOOKUP, results::SUCCESS])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            LOGIN_OPERATIONS
+                .with_label_values(&[steps::USER_LOOKUP, results::FAILURE])
+                .get(),
+            1.0
+        );
+
         // Verify detailed failures were recorded
-        assert_eq!(LOGIN_FAILURES.with_label_values(&[steps::DB_CONNECTION, error_types::DB_UNAVAILABLE]).get(), 1.0);
-        assert_eq!(LOGIN_FAILURES.with_label_values(&[steps::USER_LOOKUP, error_types::USER_NOT_FOUND]).get(), 1.0);
-        assert_eq!(LOGIN_FAILURES.with_label_values(&[steps::PASSWORD_VERIFICATION, error_types::INVALID_PASSWORD]).get(), 1.0);
-        assert_eq!(LOGIN_FAILURES.with_label_values(&[steps::ACCOUNT_CHECK, error_types::INACTIVE_ACCOUNT]).get(), 1.0);
+        assert_eq!(
+            LOGIN_FAILURES
+                .with_label_values(&[steps::DB_CONNECTION, error_types::DB_UNAVAILABLE])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            LOGIN_FAILURES
+                .with_label_values(&[steps::USER_LOOKUP, error_types::USER_NOT_FOUND])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            LOGIN_FAILURES
+                .with_label_values(&[steps::PASSWORD_VERIFICATION, error_types::INVALID_PASSWORD])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            LOGIN_FAILURES
+                .with_label_values(&[steps::ACCOUNT_CHECK, error_types::INACTIVE_ACCOUNT])
+                .get(),
+            1.0
+        );
     }
 
     #[test]
     fn test_http_metrics_integration() {
         init_login_metrics();
-        
+
         // Test HTTP request tracking
         let initial_success = LOGIN_HTTP_REQUESTS
             .with_label_values(&[http::POST, "200"])
@@ -488,11 +541,15 @@ mod tests {
         let initial_error = LOGIN_HTTP_REQUESTS
             .with_label_values(&[http::POST, "400"])
             .get();
-        
+        let initial_server_error = LOGIN_HTTP_REQUESTS
+            .with_label_values(&[http::POST, "500"])
+            .get();
+
         // Record requests
         record_http_request(http::POST, http::OK);
         record_http_request(http::POST, http::BAD_REQUEST);
-        
+        record_http_request(http::POST, http::INTERNAL_SERVER_ERROR);
+
         // Verify counts
         let final_success = LOGIN_HTTP_REQUESTS
             .with_label_values(&[http::POST, "200"])
@@ -500,17 +557,21 @@ mod tests {
         let final_error = LOGIN_HTTP_REQUESTS
             .with_label_values(&[http::POST, "400"])
             .get();
-        
+        let final_server_error = LOGIN_HTTP_REQUESTS
+            .with_label_values(&[http::POST, "500"])
+            .get();
+
         assert_eq!(final_success, initial_success + 1.0);
         assert_eq!(final_error, initial_error + 1.0);
+        assert_eq!(final_server_error, initial_server_error + 1.0);
     }
 
     #[test]
     fn test_production_login_patterns() {
         init_login_metrics();
-        
+
         // Simulate realistic production patterns
-        
+
         // 10 successful logins
         for _ in 0..10 {
             record_db_connection_success();
@@ -521,7 +582,7 @@ mod tests {
             record_token_generation_refresh_success();
             record_login_success();
         }
-        
+
         // Some failures at different steps
         record_db_connection_failure(error_types::DB_UNAVAILABLE);
         record_user_lookup_failure(error_types::USER_NOT_FOUND);
@@ -529,25 +590,60 @@ mod tests {
         record_account_check_failure(error_types::INACTIVE_ACCOUNT);
         record_token_generation_access_failure(error_types::TOKEN_GENERATION_FAILED);
         record_token_generation_refresh_failure(error_types::TOKEN_GENERATION_FAILED);
-        
+
         // Verify realistic metric patterns
-        assert_eq!(LOGIN_OPERATIONS.with_label_values(&[steps::COMPLETE_FLOW, results::SUCCESS]).get(), 10.0);
-        assert_eq!(LOGIN_OPERATIONS.with_label_values(&[steps::COMPLETE_FLOW, results::FAILURE]).get(), 0.0); // No complete failures in sim
-        
+        assert_eq!(
+            LOGIN_OPERATIONS
+                .with_label_values(&[steps::COMPLETE_FLOW, results::SUCCESS])
+                .get(),
+            10.0
+        );
+        assert_eq!(
+            LOGIN_OPERATIONS
+                .with_label_values(&[steps::COMPLETE_FLOW, results::FAILURE])
+                .get(),
+            0.0
+        ); // No complete failures in sim
+
         // Specific failure types
-        assert_eq!(LOGIN_FAILURES.with_label_values(&[steps::DB_CONNECTION, error_types::DB_UNAVAILABLE]).get(), 1.0);
-        assert_eq!(LOGIN_FAILURES.with_label_values(&[steps::USER_LOOKUP, error_types::USER_NOT_FOUND]).get(), 1.0);
-        assert_eq!(LOGIN_FAILURES.with_label_values(&[steps::PASSWORD_VERIFICATION, error_types::INVALID_PASSWORD]).get(), 1.0);
-        assert_eq!(LOGIN_FAILURES.with_label_values(&[steps::ACCOUNT_CHECK, error_types::INACTIVE_ACCOUNT]).get(), 1.0);
-        
+        assert_eq!(
+            LOGIN_FAILURES
+                .with_label_values(&[steps::DB_CONNECTION, error_types::DB_UNAVAILABLE])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            LOGIN_FAILURES
+                .with_label_values(&[steps::USER_LOOKUP, error_types::USER_NOT_FOUND])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            LOGIN_FAILURES
+                .with_label_values(&[steps::PASSWORD_VERIFICATION, error_types::INVALID_PASSWORD])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            LOGIN_FAILURES
+                .with_label_values(&[steps::ACCOUNT_CHECK, error_types::INACTIVE_ACCOUNT])
+                .get(),
+            1.0
+        );
+
         // Successful steps
-        assert_eq!(LOGIN_OPERATIONS.with_label_values(&[steps::PASSWORD_VERIFICATION, results::SUCCESS]).get(), 10.0);
+        assert_eq!(
+            LOGIN_OPERATIONS
+                .with_label_values(&[steps::PASSWORD_VERIFICATION, results::SUCCESS])
+                .get(),
+            10.0
+        );
     }
 
     #[test]
     fn test_type_safety_constants() {
         init_login_metrics();
-        
+
         // Verify all constants are valid and type-safe
         assert_eq!(steps::DB_CONNECTION, "db_connection");
         assert_eq!(steps::USER_LOOKUP, "user_lookup");
@@ -556,21 +652,34 @@ mod tests {
         assert_eq!(steps::TOKEN_GENERATION_ACCESS, "token_generation_access");
         assert_eq!(steps::TOKEN_GENERATION_REFRESH, "token_generation_refresh");
         assert_eq!(steps::COMPLETE_FLOW, "complete_flow");
-        
+
         assert_eq!(results::SUCCESS, "success");
         assert_eq!(results::FAILURE, "failure");
-        
+
         assert_eq!(error_types::DB_UNAVAILABLE, "db_unavailable");
         assert_eq!(error_types::USER_NOT_FOUND, "user_not_found");
         assert_eq!(error_types::INVALID_PASSWORD, "invalid_password");
         assert_eq!(error_types::INACTIVE_ACCOUNT, "inactive_account");
-        assert_eq!(error_types::TOKEN_GENERATION_FAILED, "token_generation_failed");
-        
+        assert_eq!(
+            error_types::TOKEN_GENERATION_FAILED,
+            "token_generation_failed"
+        );
+
         // Use constants in actual operations
         record_login_operation(steps::PASSWORD_VERIFICATION, results::SUCCESS);
         record_login_failure_detailed(steps::USER_LOOKUP, error_types::USER_NOT_FOUND);
-        
-        assert_eq!(LOGIN_OPERATIONS.with_label_values(&[steps::PASSWORD_VERIFICATION, results::SUCCESS]).get(), 1.0);
-        assert_eq!(LOGIN_FAILURES.with_label_values(&[steps::USER_LOOKUP, error_types::USER_NOT_FOUND]).get(), 1.0);
+
+        assert_eq!(
+            LOGIN_OPERATIONS
+                .with_label_values(&[steps::PASSWORD_VERIFICATION, results::SUCCESS])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            LOGIN_FAILURES
+                .with_label_values(&[steps::USER_LOOKUP, error_types::USER_NOT_FOUND])
+                .get(),
+            1.0
+        );
     }
 }

@@ -13,24 +13,26 @@
 //! 3. System validates the code and activates the account
 //! 4. User sees an HTML page with the result
 
-use std::sync::Arc;
 use axum::{
     extract::{Query, State},
     response::{Html, IntoResponse},
 };
 use serde::Deserialize;
+use std::sync::Arc;
 use tracing::Instrument;
 
 use crate::{
     app::AppState,
     handlers::activation_logic::process_activation,
-    utils::{
-        error_new::AuthServiceError,
-        telemetry::{http_request_span, business_operation_span, SpanExt},
-        log_new::Log,
-    },
     metricss::activation_metrics::{
-        record_http_request, http::{GET, OK, BAD_REQUEST, INTERNAL_SERVER_ERROR},
+        http::{BAD_REQUEST, GET, INTERNAL_SERVER_ERROR, OK},
+        record_http_request,
+        ACTIVATION_HTTP_DURATION,
+    },
+    utils::{
+        error_new::{AuthServiceError, ValidationError},
+        log_new::Log,
+        telemetry::{business_operation_span, http_request_span, SpanExt},
     },
 };
 
@@ -60,13 +62,13 @@ pub async fn activate_account_handler(
 ) -> impl IntoResponse {
     // Create HTTP request span with method and path
     let http_span = http_request_span("GET", "/auth/activate");
-    
+
     // Add business context to the span without exposing the actual code
     http_span.record("code_length", &params.code.len());
-    
+
     // Clone span before moving it into the async block
     let http_span_clone = http_span.clone();
-    
+
     // Wrap the handler logic in the HTTP span for automatic tracing
     async move {
         // Log the activation attempt using structured logging
@@ -101,6 +103,7 @@ pub async fn activate_account_handler(
                     AuthServiceError::Validation(_) => BAD_REQUEST,
                     AuthServiceError::Configuration(_) => INTERNAL_SERVER_ERROR,
                     AuthServiceError::Database(_) => INTERNAL_SERVER_ERROR,
+                    AuthServiceError::RateLimit(_) => BAD_REQUEST,
                     _ => BAD_REQUEST,
                 };
                 http_span.record("http.status_code", &code.to_string());
@@ -109,7 +112,7 @@ pub async fn activate_account_handler(
             },
         };
 
-        crate::metricss::activation_metrics::ACTIVATION_HTTP_DURATION
+        ACTIVATION_HTTP_DURATION
             .with_label_values(&[GET, &status_code.to_string()])
             .observe(duration);
         
@@ -136,13 +139,13 @@ pub async fn activate_account_handler(
             
             Err(AuthServiceError::Validation(validation_err)) => {
                 // Check the specific validation error type for better UX
-                let (title, message) = match validation_err.to_string().as_str() {
-                    msg if msg.contains("Invalid or expired") => (
+                let (title, message) = match &validation_err {
+                    ValidationError::InvalidValue { message, .. } if message.contains("invalid or has expired") => (
                         "Invalid Activation Link",
                         "The activation link is invalid or has expired. Please request a new activation link."
                     ),
-                    msg if msg.contains("No user found") => (
-                        "Account Not Found", 
+                    ValidationError::InvalidValue { message, .. } if message.contains("account no longer exists") => (
+                        "Account Not Found",
                         "We couldn't find an account for this activation link. Please register or contact support."
                     ),
                     _ => (
@@ -254,7 +257,8 @@ fn render_page(title: &str, message: &str, status: &str) -> String {
     };
 
     // Pobierz URL frontendu z konfiguracji
-    let frontend_url = std::env::var("FRONTEND_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
+    let frontend_url =
+        std::env::var("FRONTEND_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
     let login_url = format!("{}/auth", frontend_url);
 
     format!(
@@ -332,20 +336,15 @@ fn render_page(title: &str, message: &str, status: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{
-        body::Body,
-        http::Request,
-        Router,
-        routing::get,
-    };
+    use axum::{body::Body, http::Request, routing::get, Router};
     use tower::ServiceExt;
-    
+
     use crate::utils::test_utils::state_with_redis;
 
     /// Creates a test router with activation handler
     fn app() -> Router {
         let app_state = Arc::new(state_with_redis());
-        
+
         Router::new()
             .route("/auth/activate", get(activate_account_handler))
             .with_state(app_state)
@@ -355,18 +354,18 @@ mod tests {
     async fn missing_code_returns_bad_request() {
         // Arrange
         let app = app();
-        
+
         // Act - request with missing code parameter
         let response = app
             .oneshot(
                 Request::builder()
                     .uri("/auth/activate")
                     .body(Body::empty())
-                    .unwrap()
+                    .unwrap(),
             )
             .await
             .unwrap();
-            
+
         // Assert
         assert_eq!(response.status().as_u16(), 400);
     }
@@ -375,26 +374,24 @@ mod tests {
     async fn invalid_code_returns_proper_html() {
         // Arrange
         let app = app();
-        
+
         // Act - request with invalid activation code
         let response = app
             .oneshot(
                 Request::builder()
                     .uri("/auth/activate?code=invalid-code")
                     .body(Body::empty())
-                    .unwrap()
+                    .unwrap(),
             )
             .await
             .unwrap();
-            
+
         // Assert
         assert_eq!(response.status().as_u16(), 200); // HTML responses are always 200 OK
-        
-        let body = hyper::body::to_bytes(response.into_body())
-            .await
-            .unwrap();
+
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
-        
+
         // Verify it contains error messaging
         assert!(html.contains("Invalid Activation Link"));
         assert!(html.contains("error-message"));
@@ -406,7 +403,7 @@ mod tests {
         let success_html = render_page("Success Title", "Success message", "success");
         let error_html = render_page("Error Title", "Error message", "error");
         let info_html = render_page("Info Title", "Info message", "info");
-        
+
         // Assert
         assert!(success_html.contains("success-message"));
         assert!(error_html.contains("error-message"));
@@ -417,8 +414,6 @@ mod tests {
 
     #[tokio::test]
     async fn successful_activation_returns_success_html() {
-        // Note: This test would require setting up a valid activation code
-        // in Redis, which is more complex. For now, we're testing the error cases.
-        // Integration tests with a real Redis instance would be needed for full coverage.
+        // Integration test for successful activation would go here.
     }
 }

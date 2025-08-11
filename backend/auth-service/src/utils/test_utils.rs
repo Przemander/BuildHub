@@ -34,13 +34,13 @@ use tracing_subscriber::fmt;
 // =============================================================================
 
 /// Counter for generating unique database identifiers.
-/// 
+///
 /// This ensures each test gets its own isolated database instance,
 /// even when tests run in parallel.
 static TEST_DB_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 /// Mutex to synchronize database creation operations.
-/// 
+///
 /// This prevents race conditions when multiple tests try to set
 /// environment variables and run migrations simultaneously.
 static MAKE_POOL_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
@@ -97,21 +97,21 @@ pub fn make_pool() -> DbPool {
     // Generate unique database name for this test
     let id = TEST_DB_COUNTER.fetch_add(1, Ordering::SeqCst);
     let url = format!("file:auth_test_db_{}?mode=memory&cache=shared", id);
-    
+
     // Set environment variable for database connection
     env::set_var("DATABASE_URL", &url);
 
     Log::event(
-        "DEBUG", 
+        "DEBUG",
         "Test Setup",
         &format!("Creating test database: {}", url),
         "test_db_created",
-        "make_pool"
+        "make_pool",
     );
 
     // Initialize pool and run migrations
     let pool = init_pool();
-    
+
     match run_migrations(&pool) {
         Ok(_) => {
             Log::event(
@@ -119,21 +119,21 @@ pub fn make_pool() -> DbPool {
                 "Test Setup",
                 "Test database migrations completed successfully",
                 "test_migrations_success",
-                "make_pool"
+                "make_pool",
             );
-        },
+        }
         Err(e) => {
             Log::event(
                 "ERROR",
                 "Test Setup",
                 &format!("Failed to run migrations: {}", e),
                 "test_migrations_failed",
-                "make_pool"
+                "make_pool",
             );
             panic!("Failed to run database migrations for test: {}", e);
         }
     }
-    
+
     pool
 }
 
@@ -163,13 +163,13 @@ pub fn make_pool() -> DbPool {
 /// ```
 pub fn init_jwt_secret() {
     env::set_var("JWT_SECRET", TEST_JWT_SECRET);
-    
+
     Log::event(
         "DEBUG",
         "Test Setup",
         "JWT secret initialized for testing",
         "jwt_secret_initialized",
-        "init_jwt_secret"
+        "init_jwt_secret",
     );
 }
 
@@ -207,15 +207,15 @@ pub fn init_jwt_secret() {
 pub fn state_with_redis() -> AppState {
     // Initialize JWT secret for token operations
     init_jwt_secret();
-    
+
     Log::event(
         "DEBUG",
         "Test Setup",
         "Creating AppState with Redis enabled",
         "app_state_with_redis",
-        "state_with_redis"
+        "state_with_redis",
     );
-    
+
     // Create the Redis client, with proper error handling
     let redis_client = match RedisClient::open(TEST_REDIS_URL) {
         Ok(client) => {
@@ -224,22 +224,22 @@ pub fn state_with_redis() -> AppState {
                 "Test Setup",
                 "Redis client created successfully",
                 "redis_client_created",
-                "state_with_redis"
+                "state_with_redis",
             );
             Some(client)
-        },
+        }
         Err(e) => {
             Log::event(
                 "ERROR",
                 "Test Setup",
                 &format!("Failed to create Redis client: {}", e),
                 "redis_client_failed",
-                "state_with_redis"
+                "state_with_redis",
             );
             panic!("Failed to create Redis client for tests: {}", e);
         }
     };
-    
+
     // Create the AppState with Redis enabled
     AppState {
         pool: make_pool(),
@@ -274,15 +274,15 @@ pub fn state_with_redis() -> AppState {
 pub fn state_no_redis() -> AppState {
     // Initialize JWT secret for token operations
     init_jwt_secret();
-    
+
     Log::event(
         "DEBUG",
         "Test Setup",
         "Creating AppState without Redis",
         "app_state_no_redis",
-        "state_no_redis"
+        "state_no_redis",
     );
-    
+
     // Create the AppState without Redis
     AppState {
         pool: make_pool(),
@@ -334,16 +334,19 @@ where
                 "Test Assertion",
                 &format!("Value '{}' was valid as expected", value),
                 "assert_valid_passed",
-                "assert_valid"
+                "assert_valid",
             );
-        },
+        }
         Err(e) => {
             Log::event(
                 "ERROR",
                 "Test Assertion",
-                &format!("Value '{}' was expected to be valid but got error: {:?}", value, e),
+                &format!(
+                    "Value '{}' was expected to be valid but got error: {:?}",
+                    value, e
+                ),
                 "assert_valid_failed",
-                "assert_valid"
+                "assert_valid",
             );
             panic!("Expected '{}' to be valid, but got error: {:?}", value, e);
         }
@@ -392,12 +395,15 @@ where
             Log::event(
                 "ERROR",
                 "Test Assertion",
-                &format!("Value '{}' was expected to be invalid but validation passed", value),
+                &format!(
+                    "Value '{}' was expected to be invalid but validation passed",
+                    value
+                ),
                 "assert_invalid_failed",
-                "assert_invalid"
+                "assert_invalid",
             );
             panic!("Expected '{}' to be invalid, but validation passed", value);
-        },
+        }
         Err(AuthServiceError::Validation(validation_err)) => {
             // Handle the new ValidationError structure
             match validation_err {
@@ -407,98 +413,89 @@ where
                             "ERROR",
                             "Test Assertion",
                             &format!(
-                                "Expected field '{}' but got '{}' for value '{}'", 
+                                "Expected field '{}' but got '{}' for value '{}'",
                                 expected_field, field, value
                             ),
                             "assert_invalid_wrong_field",
-                            "assert_invalid"
+                            "assert_invalid",
                         );
-                        panic!(
-                            "Expected field '{}' but got '{}'",
-                            expected_field, field
-                        );
+                        panic!("Expected field '{}' but got '{}'", expected_field, field);
                     }
-                    
+
                     if !message.contains(error_contains) {
                         Log::event(
                             "ERROR",
                             "Test Assertion",
                             &format!(
-                                "Error message '{}' doesn't contain '{}' for value '{}'", 
+                                "Error message '{}' doesn't contain '{}' for value '{}'",
                                 message, error_contains, value
                             ),
                             "assert_invalid_wrong_message",
-                            "assert_invalid"
+                            "assert_invalid",
                         );
                         panic!(
                             "Error message '{}' doesn't contain '{}'",
                             message, error_contains
                         );
                     }
-                    
+
                     // Test passes
                     Log::event(
                         "TRACE",
                         "Test Assertion",
                         &format!("Value '{}' was invalid as expected", value),
                         "assert_invalid_passed",
-                        "assert_invalid"
+                        "assert_invalid",
                     );
-                },
+                }
                 ValidationError::MissingField { field, .. } => {
                     if field != expected_field {
                         Log::event(
                             "ERROR",
                             "Test Assertion",
                             &format!(
-                                "Expected field '{}' but got '{}' for missing field validation", 
+                                "Expected field '{}' but got '{}' for missing field validation",
                                 expected_field, field
                             ),
                             "assert_invalid_wrong_field",
-                            "assert_invalid"
+                            "assert_invalid",
                         );
-                        panic!(
-                            "Expected field '{}' but got '{}'",
-                            expected_field, field
-                        );
+                        panic!("Expected field '{}' but got '{}'", expected_field, field);
                     }
-                    
+
                     // Test passes for missing field errors
                     Log::event(
                         "TRACE",
                         "Test Assertion",
                         &format!("Field '{}' was missing as expected", field),
                         "assert_invalid_passed",
-                        "assert_invalid"
+                        "assert_invalid",
                     );
-                },
+                }
                 ValidationError::TooLong { field, .. } => {
                     if field != expected_field {
                         Log::event(
                             "ERROR",
                             "Test Assertion",
                             &format!(
-                                "Expected field '{}' but got '{}' for too long validation", 
+                                "Expected field '{}' but got '{}' for too long validation",
                                 expected_field, field
                             ),
                             "assert_invalid_wrong_field",
-                            "assert_invalid"
+                            "assert_invalid",
                         );
-                        panic!(
-                            "Expected field '{}' but got '{}'",
-                            expected_field, field
-                        );
+                        panic!("Expected field '{}' but got '{}'", expected_field, field);
                     }
-                    
+
                     // Test passes for too long errors
                     Log::event(
                         "TRACE",
                         "Test Assertion",
                         &format!("Field '{}' was too long as expected", field),
                         "assert_invalid_passed",
-                        "assert_invalid"
+                        "assert_invalid",
                     );
-                },
+                }
                 ValidationError::PasswordHash { message, .. } => {
                     if !message.contains(error_contains) {
                         Log::event(
@@ -516,25 +513,25 @@ where
                             message, error_contains
                         );
                     }
-                    
+
                     // Test passes for password hash errors
                     Log::event(
                         "TRACE",
                         "Test Assertion",
                         "Password hash error was detected as expected",
                         "assert_invalid_passed",
-                        "assert_invalid"
+                        "assert_invalid",
                     );
                 }
             }
-        },
+        }
         Err(other_err) => {
             Log::event(
                 "ERROR",
                 "Test Assertion",
                 &format!("Expected ValidationError, but got: {:?}", other_err),
                 "assert_invalid_wrong_error_type",
-                "assert_invalid"
+                "assert_invalid",
             );
             panic!("Expected ValidationError, but got: {:?}", other_err);
         }
@@ -567,31 +564,31 @@ where
 pub fn reset_test_env() {
     // Database-related
     env::remove_var("DATABASE_URL");
-    
+
     // Authentication-related
     env::remove_var("JWT_SECRET");
     env::remove_var("JWT_EXPIRY");
     env::remove_var("REFRESH_TOKEN_EXPIRY");
-    
+
     // Infrastructure-related
     env::remove_var("REDIS_URL");
     env::remove_var("SMTP_URL");
-    
+
     // Telemetry-related
     env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
     env::remove_var("RUST_LOG");
     env::remove_var("OTEL_TRACE_SAMPLE_RATE");
-    
+
     // Application-related
     env::remove_var("APP_ENV");
     env::remove_var("PORT");
-    
+
     Log::event(
         "DEBUG",
         "Test Setup",
         "Test environment variables have been reset",
         "test_env_reset",
-        "reset_test_env"
+        "reset_test_env",
     );
 }
 
@@ -632,7 +629,7 @@ pub fn init_test_tracing(level: Level) -> DefaultGuard {
         .with_max_level(level)
         .with_test_writer()
         .finish();
-    
+
     tracing::subscriber::set_default(subscriber)
 }
 
@@ -657,15 +654,15 @@ mod tests {
     fn make_pool_creates_unique_databases() {
         // Clear environment before test
         env::remove_var("DATABASE_URL");
-        
+
         // First pool
         let _pool1 = make_pool();
         let url1 = var("DATABASE_URL").unwrap();
-        
+
         // Second pool
         let _pool2 = make_pool();
         let url2 = var("DATABASE_URL").unwrap();
-        
+
         assert_ne!(url1, url2, "Database URLs should be unique");
     }
 
@@ -673,10 +670,10 @@ mod tests {
     fn init_jwt_secret_sets_environment_variable() {
         // Clear environment before test
         env::remove_var("JWT_SECRET");
-        
+
         // Act
         init_jwt_secret();
-        
+
         // Assert
         assert_eq!(var("JWT_SECRET").unwrap(), TEST_JWT_SECRET);
     }
@@ -684,21 +681,24 @@ mod tests {
     #[test]
     fn state_with_redis_creates_valid_app_state() {
         let state = state_with_redis();
-        
+
         // Verify database connection
         assert!(state.pool.get().is_ok(), "Database pool should be working");
-        
+
         // Verify Redis client exists
-        assert!(state.redis_client.is_some(), "Redis client should be present");
+        assert!(
+            state.redis_client.is_some(),
+            "Redis client should be present"
+        );
     }
 
     #[test]
     fn state_no_redis_creates_app_state_without_redis() {
         let state = state_no_redis();
-        
+
         // Verify database connection
         assert!(state.pool.get().is_ok(), "Database pool should be working");
-        
+
         // Verify Redis client is None
         assert!(state.redis_client.is_none(), "Redis client should be None");
     }
@@ -709,7 +709,7 @@ mod tests {
         fn always_valid(_: &str) -> Result<(), AuthServiceError> {
             Ok(())
         }
-        
+
         // This should not panic
         assert_valid("any input", always_valid);
     }
@@ -719,13 +719,15 @@ mod tests {
     fn assert_valid_panics_for_invalid_input() {
         // Define a validation function that always fails
         fn always_invalid(_: &str) -> Result<(), AuthServiceError> {
-            Err(AuthServiceError::Validation(ValidationError::InvalidValue {
-                field: "field".to_string(),
-                message: "error".to_string(),
-                span: SpanTrace::capture(),
-            }))
+            Err(AuthServiceError::Validation(
+                ValidationError::InvalidValue {
+                    field: "field".to_string(),
+                    message: "error".to_string(),
+                    span: SpanTrace::capture(),
+                },
+            ))
         }
-        
+
         // This should panic
         assert_valid("test", always_invalid);
     }
@@ -734,15 +736,22 @@ mod tests {
     fn assert_invalid_passes_for_invalid_input() {
         // Define a validation function that fails with the expected error
         fn fails_with_expected_error(_: &str) -> Result<(), AuthServiceError> {
-            Err(AuthServiceError::Validation(ValidationError::InvalidValue {
-                field: "test_field".to_string(),
-                message: "contains expected text".to_string(),
-                span: SpanTrace::capture(),
-            }))
+            Err(AuthServiceError::Validation(
+                ValidationError::InvalidValue {
+                    field: "test_field".to_string(),
+                    message: "contains expected text".to_string(),
+                    span: SpanTrace::capture(),
+                },
+            ))
         }
-        
+
         // This should not panic
-        assert_invalid("test_field", "bad input", "expected text", fails_with_expected_error);
+        assert_invalid(
+            "test_field",
+            "bad input",
+            "expected text",
+            fails_with_expected_error,
+        );
     }
 
     #[test]
@@ -752,7 +761,7 @@ mod tests {
         fn always_valid(_: &str) -> Result<(), AuthServiceError> {
             Ok(())
         }
-        
+
         // This should panic
         assert_invalid("field", "test", "error", always_valid);
     }
@@ -762,13 +771,15 @@ mod tests {
     fn assert_invalid_checks_field_name() {
         // Define a validation function with wrong field name
         fn wrong_field(_: &str) -> Result<(), AuthServiceError> {
-            Err(AuthServiceError::Validation(ValidationError::InvalidValue {
-                field: "actual".to_string(),
-                message: "error message".to_string(),
-                span: SpanTrace::capture(),
-            }))
+            Err(AuthServiceError::Validation(
+                ValidationError::InvalidValue {
+                    field: "actual".to_string(),
+                    message: "error message".to_string(),
+                    span: SpanTrace::capture(),
+                },
+            ))
         }
-        
+
         // This should panic due to field name mismatch
         assert_invalid("expected", "test", "error", wrong_field);
     }
@@ -778,43 +789,48 @@ mod tests {
     fn assert_invalid_checks_error_message() {
         // Define a validation function with message not containing expected text
         fn wrong_message(_: &str) -> Result<(), AuthServiceError> {
-            Err(AuthServiceError::Validation(ValidationError::InvalidValue {
-                field: "field".to_string(),
-                message: "actual message".to_string(),
-                span: SpanTrace::capture(),
-            }))
+            Err(AuthServiceError::Validation(
+                ValidationError::InvalidValue {
+                    field: "field".to_string(),
+                    message: "actual message".to_string(),
+                    span: SpanTrace::capture(),
+                },
+            ))
         }
-        
+
         // This should panic due to message content mismatch
         assert_invalid("field", "test", "expected text", wrong_message);
     }
-    
+
     #[test]
     fn reset_test_env_clears_environment_variables() {
         // Setup test environment
         env::set_var("DATABASE_URL", "test_value");
         env::set_var("JWT_SECRET", "test_value");
-        
+
         // Act
         reset_test_env();
-        
+
         // Verify variables are cleared
-        assert!(var("DATABASE_URL").is_err(), "DATABASE_URL should be removed");
+        assert!(
+            var("DATABASE_URL").is_err(),
+            "DATABASE_URL should be removed"
+        );
         assert!(var("JWT_SECRET").is_err(), "JWT_SECRET should be removed");
     }
-    
+
     #[test]
     fn init_test_tracing_sets_up_logging() {
         // Set up test tracing
         let guard = init_test_tracing(Level::TRACE);
-        
+
         // Log a test message
         tracing::trace!("Test trace message");
         tracing::debug!("Test debug message");
-        
+
         // Drop the guard explicitly
         drop(guard);
-        
+
         // No assertions needed - we're just verifying it doesn't panic
     }
 }

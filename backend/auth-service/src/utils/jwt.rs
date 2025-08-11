@@ -11,19 +11,17 @@
 //! The implementation follows OWASP security guidelines with defense-in-depth
 //! principles to protect against common JWT vulnerabilities.
 
+use crate::metricss::jwt_metrics::{generate, revoke, validate};
 use crate::utils::error_new::{AuthServiceError, JwtError};
 use crate::utils::log_new::Log;
 use crate::utils::telemetry::{business_operation_span, SpanExt};
-use crate::metricss::jwt_metrics::{
-    generate, validate, revoke,
-};
 use chrono::{Duration, Utc};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use redis::Client as RedisClient;
 use serde::{Deserialize, Serialize};
 use std::env;
 use tracing::Instrument;
 use tracing_error::SpanTrace;
-use redis::Client as RedisClient;
 
 // =============================================================================
 // TYPE DEFINITIONS AND CONSTANTS
@@ -65,7 +63,7 @@ pub const TOKEN_TYPE_ACCESS: &str = "access";
 pub const TOKEN_TYPE_REFRESH: &str = "refresh";
 
 /// Default token expiration times in seconds when not configured via environment.
-const DEFAULT_ACCESS_TOKEN_EXPIRY_SECS: i64 = 3600;    // 1 hour
+const DEFAULT_ACCESS_TOKEN_EXPIRY_SECS: i64 = 3600; // 1 hour
 const DEFAULT_REFRESH_TOKEN_EXPIRY_SECS: i64 = 604800; // 7 days
 
 /// Clock skew tolerance in seconds for distributed systems.
@@ -107,74 +105,72 @@ const JWT_REFRESH_EXPIRY_ENV: &str = "JWT_REFRESH_TOKEN_EXPIRES_IN";
 fn get_jwt_secret() -> Result<String, AuthServiceError> {
     // Create span for JWT secret retrieval
     let span = business_operation_span("get_jwt_secret");
-    
+
     // Use the span to wrap the secret retrieval logic
-    span.in_scope(|| {
-        match env::var(JWT_SECRET_ENV) {
-            Ok(secret) => {
-                let trimmed_secret = secret.trim();
-                
-                if trimmed_secret.is_empty() {
-                    Log::event(
-                        "ERROR",
-                        "JWT Configuration",
-                        "JWT secret is empty or contains only whitespace",
-                        "failure",
-                        "get_jwt_secret"
-                    );
-                    span.record("result", &"failure");
-                    span.record("failure_reason", &"empty_secret");
-                    return Err(AuthServiceError::Jwt(JwtError::Configuration {
-                        message: "JWT secret cannot be empty".to_string(),
-                        span: SpanTrace::capture(),
-                    }));
-                }
-                
-                if trimmed_secret.len() < MIN_SECRET_LENGTH {
-                    Log::event(
-                        "ERROR",
-                        "JWT Configuration",
-                        &format!(
-                            "JWT secret is too short ({} chars), minimum {} required", 
-                            trimmed_secret.len(), 
-                            MIN_SECRET_LENGTH
-                        ),
-                        "failure",
-                        "get_jwt_secret"
-                    );
-                    span.record("result", &"failure");
-                    span.record("failure_reason", &"weak_secret");
-                    span.record("secret_length", &trimmed_secret.len());
-                    span.record("min_required_length", &MIN_SECRET_LENGTH);
-                    return Err(AuthServiceError::Jwt(JwtError::Configuration {
-                        message: format!(
-                            "JWT secret must be at least {} characters for security", 
-                            MIN_SECRET_LENGTH
-                        ),
-                        span: SpanTrace::capture(),
-                    }));
-                }
-                
-                span.record("result", &"success");
-                span.record("secret_length", &trimmed_secret.len());
-                Ok(trimmed_secret.to_string())
-            }
-            Err(e) => {
+    span.in_scope(|| match env::var(JWT_SECRET_ENV) {
+        Ok(secret) => {
+            let trimmed_secret = secret.trim();
+
+            if trimmed_secret.is_empty() {
                 Log::event(
                     "ERROR",
                     "JWT Configuration",
-                    &format!("JWT_SECRET environment variable not found: {}", e),
+                    "JWT secret is empty or contains only whitespace",
                     "failure",
-                    "get_jwt_secret"
+                    "get_jwt_secret",
                 );
                 span.record("result", &"failure");
-                span.record("failure_reason", &"missing_env_var");
-                span.record_error(&e);
-                Err(AuthServiceError::Jwt(JwtError::Configuration {
-                    message: "JWT_SECRET environment variable is required".to_string(),
+                span.record("failure_reason", &"empty_secret");
+                return Err(AuthServiceError::Jwt(JwtError::Configuration {
+                    message: "JWT secret cannot be empty".to_string(),
                     span: SpanTrace::capture(),
-                }))
+                }));
             }
+
+            if trimmed_secret.len() < MIN_SECRET_LENGTH {
+                Log::event(
+                    "ERROR",
+                    "JWT Configuration",
+                    &format!(
+                        "JWT secret is too short ({} chars), minimum {} required",
+                        trimmed_secret.len(),
+                        MIN_SECRET_LENGTH
+                    ),
+                    "failure",
+                    "get_jwt_secret",
+                );
+                span.record("result", &"failure");
+                span.record("failure_reason", &"weak_secret");
+                span.record("secret_length", &trimmed_secret.len());
+                span.record("min_required_length", &MIN_SECRET_LENGTH);
+                return Err(AuthServiceError::Jwt(JwtError::Configuration {
+                    message: format!(
+                        "JWT secret must be at least {} characters for security",
+                        MIN_SECRET_LENGTH
+                    ),
+                    span: SpanTrace::capture(),
+                }));
+            }
+
+            span.record("result", &"success");
+            span.record("secret_length", &trimmed_secret.len());
+            Ok(trimmed_secret.to_string())
+        }
+        Err(e) => {
+            Log::event(
+                "ERROR",
+                "JWT Configuration",
+                &format!("JWT_SECRET environment variable not found: {}", e),
+                "failure",
+                "get_jwt_secret",
+            );
+            span.record("result", &"failure");
+            span.record("failure_reason", &"missing_env_var");
+            span.record_error(&e);
+            Err(AuthServiceError::Jwt(JwtError::Configuration {
+                message: "JWT_SECRET environment variable is required".to_string(),
+                span: SpanTrace::capture(),
+            }))
         }
     })
 }
@@ -221,10 +217,10 @@ pub fn generate_token(
     let span = business_operation_span("generate_token");
     span.record("username", &username);
     span.record("token_type", &token_type);
-    
+
     // Use timer API to measure operation time
     let _timer = generate::time();
-    
+
     // Use the span to wrap the token generation logic
     span.in_scope(|| {
         // Calculate token expiration based on type and configuration
@@ -236,36 +232,32 @@ pub fn generate_token(
             }
             None => {
                 let seconds = match token_type {
-                    TOKEN_TYPE_ACCESS => {
-                        env::var(JWT_ACCESS_EXPIRY_ENV)
-                            .ok()
-                            .and_then(|val| val.parse::<i64>().ok())
-                            .unwrap_or(DEFAULT_ACCESS_TOKEN_EXPIRY_SECS)
-                    }
-                    TOKEN_TYPE_REFRESH => {
-                        env::var(JWT_REFRESH_EXPIRY_ENV)
-                            .ok()
-                            .and_then(|val| val.parse::<i64>().ok())
-                            .unwrap_or(DEFAULT_REFRESH_TOKEN_EXPIRY_SECS)
-                    }
+                    TOKEN_TYPE_ACCESS => env::var(JWT_ACCESS_EXPIRY_ENV)
+                        .ok()
+                        .and_then(|val| val.parse::<i64>().ok())
+                        .unwrap_or(DEFAULT_ACCESS_TOKEN_EXPIRY_SECS),
+                    TOKEN_TYPE_REFRESH => env::var(JWT_REFRESH_EXPIRY_ENV)
+                        .ok()
+                        .and_then(|val| val.parse::<i64>().ok())
+                        .unwrap_or(DEFAULT_REFRESH_TOKEN_EXPIRY_SECS),
                     _ => {
                         Log::event(
                             "WARN",
                             "JWT Generation",
                             &format!("Unknown token type '{}'", token_type),
                             "warning",
-                            "generate_token"
+                            "generate_token",
                         );
                         span.record("warning", &"unknown_token_type");
                         DEFAULT_ACCESS_TOKEN_EXPIRY_SECS
                     }
                 };
-                
+
                 span.record("expiry_seconds", &seconds);
                 now + Duration::seconds(seconds)
             }
         };
-        
+
         // Record expiration timestamp in span
         span.record("expiry_timestamp", &(expiration.timestamp() as usize));
 
@@ -294,13 +286,13 @@ pub fn generate_token(
                             "JWT Generation",
                             &format!("Token encoding failed: {}", e),
                             "failure",
-                            "generate_token"
+                            "generate_token",
                         );
                         generate::record_failure();
                         span.record("result", &"failure");
                         span.record("failure_reason", &"encoding_failed");
                         span.record_error(&e);
-                        
+
                         AuthServiceError::Jwt(JwtError::Internal {
                             message: "Failed to encode JWT token".to_string(),
                             span: SpanTrace::capture(),
@@ -356,10 +348,10 @@ pub fn decode_token(token: &str) -> Result<TokenClaims, AuthServiceError> {
     // Create span for token decoding
     let span = business_operation_span("decode_token");
     span.record("token_length", &token.len());
-    
+
     // Use timer API to measure operation time
     let _timer = validate::time();
-    
+
     // Use the span to wrap the token decoding logic
     span.in_scope(|| {
         // Retrieve verification secret
@@ -370,49 +362,53 @@ pub fn decode_token(token: &str) -> Result<TokenClaims, AuthServiceError> {
                 validation.validate_exp = true;
                 validation.leeway = LEEWAY_SECONDS;
                 validation.set_required_spec_claims(&["exp", "iat", "sub"]);
-                
+
                 span.record("validate_expiration", &true);
                 span.record("leeway_seconds", &LEEWAY_SECONDS);
 
                 // Decode and validate token
-                decode::<TokenClaims>(token, &DecodingKey::from_secret(secret.as_bytes()), &validation)
-                    .map_err(|e| {
-                        match e.kind() {
-                            jsonwebtoken::errors::ErrorKind::ExpiredSignature => {
-                                validate::record_expired();
-                                span.record("result", &"failure");
-                                span.record("failure_reason", &"expired");
-                            }
-                            jsonwebtoken::errors::ErrorKind::InvalidSignature => {
-                                validate::record_invalid_signature();
-                                span.record("result", &"failure");
-                                span.record("failure_reason", &"invalid_signature");
-                            }
-                            jsonwebtoken::errors::ErrorKind::InvalidToken | 
-                            jsonwebtoken::errors::ErrorKind::Json(_) |
-                            jsonwebtoken::errors::ErrorKind::Base64(_) => {
-                                validate::record_invalid_format();
-                                span.record("result", &"failure");
-                                span.record("failure_reason", &"invalid_format");
-                            }
-                            _ => {
-                                validate::record_invalid_format();
-                                span.record("result", &"failure");
-                                span.record("failure_reason", &"other_error");
-                            }
+                decode::<TokenClaims>(
+                    token,
+                    &DecodingKey::from_secret(secret.as_bytes()),
+                    &validation,
+                )
+                .map_err(|e| {
+                    match e.kind() {
+                        jsonwebtoken::errors::ErrorKind::ExpiredSignature => {
+                            validate::record_expired();
+                            span.record("result", &"failure");
+                            span.record("failure_reason", &"expired");
                         }
-                        
-                        span.record_error(&e);
-                        let jwt_error: JwtError = e.into();
-                        AuthServiceError::Jwt(jwt_error)
-                    })
-                    .map(|data| {
-                        validate::record_success();
-                        span.record("result", &"success");
-                        span.record("user.id", &data.claims.sub);
-                        span.record("token_type", &data.claims.token_type);
-                        data.claims
-                    })
+                        jsonwebtoken::errors::ErrorKind::InvalidSignature => {
+                            validate::record_invalid_signature();
+                            span.record("result", &"failure");
+                            span.record("failure_reason", &"invalid_signature");
+                        }
+                        jsonwebtoken::errors::ErrorKind::InvalidToken
+                        | jsonwebtoken::errors::ErrorKind::Json(_)
+                        | jsonwebtoken::errors::ErrorKind::Base64(_) => {
+                            validate::record_invalid_format();
+                            span.record("result", &"failure");
+                            span.record("failure_reason", &"invalid_format");
+                        }
+                        _ => {
+                            validate::record_invalid_format();
+                            span.record("result", &"failure");
+                            span.record("failure_reason", &"other_error");
+                        }
+                    }
+
+                    span.record_error(&e);
+                    let jwt_error: JwtError = e.into();
+                    AuthServiceError::Jwt(jwt_error)
+                })
+                .map(|data| {
+                    validate::record_success();
+                    span.record("result", &"success");
+                    span.record("user.id", &data.claims.sub);
+                    span.record("token_type", &data.claims.token_type);
+                    data.claims
+                })
             }
             Err(e) => {
                 validate::record_failure();
@@ -459,13 +455,13 @@ pub async fn validate_token(
     // Create span for token validation
     let span = business_operation_span("validate_token");
     span.record("token_length", &token.len());
-    
+
     // Clone span before moving it into async operation
     let span_clone = span.clone();
-    
+
     // Use timer API to measure operation time
     let _timer = validate::time();
-    
+
     // Wrap the token validation in the span
     async move {
         // First decode the token
@@ -488,13 +484,13 @@ pub async fn validate_token(
             Ok(is_blocked) => {
                 span.record("revocation_check.success", &true);
                 span.record("token_revoked", &is_blocked);
-                
+
                 if is_blocked {
                     validate::record_revoked();
                     span.record("result", &"failure");
                     span.record("failure_reason", &"revoked");
-                    return Err(AuthServiceError::Jwt(JwtError::Revoked { 
-                        span: SpanTrace::capture() 
+                    return Err(AuthServiceError::Jwt(JwtError::Revoked {
+                        span: SpanTrace::capture(),
                     }));
                 }
             }
@@ -511,39 +507,38 @@ pub async fn validate_token(
         span.record("current_time", &now);
         span.record("token_exp", &claims.exp);
         span.record("token_iat", &claims.iat);
-        
+
         // Double-check expiration (decoder should have caught this, but be defensive)
         if claims.exp <= now {
             validate::record_expired();
             span.record("result", &"failure");
             span.record("failure_reason", &"expired");
-            
-            return Err(AuthServiceError::Jwt(JwtError::Expired { 
-                span: SpanTrace::capture() 
+
+            return Err(AuthServiceError::Jwt(JwtError::Expired {
+                span: SpanTrace::capture(),
             }));
         }
 
         // Check for tokens issued in the future (clock skew or tampering)
-        if claims.iat > now + 60 {  // Allow up to 1 minute of clock skew
+        if claims.iat > now + 60 {
+            // Allow up to 1 minute of clock skew
             Log::event(
                 "WARN",
                 "JWT Validation",
                 &format!(
-                    "Token for {} has future issue time (iat: {}, now: {}) - possible tampering", 
-                    claims.sub, 
-                    claims.iat, 
-                    now
+                    "Token for {} has future issue time (iat: {}, now: {}) - possible tampering",
+                    claims.sub, claims.iat, now
                 ),
                 "security_alert",
-                "validate_token"
+                "validate_token",
             );
             validate::record_invalid_iat();
             span.record("result", &"failure");
             span.record("failure_reason", &"future_iat");
             span.record("clock_skew_seconds", &(claims.iat as i64 - now as i64));
-            
-            return Err(AuthServiceError::Jwt(JwtError::InvalidIat { 
-                span: SpanTrace::capture() 
+
+            return Err(AuthServiceError::Jwt(JwtError::InvalidIat {
+                span: SpanTrace::capture(),
             }));
         }
 
@@ -586,20 +581,17 @@ pub async fn validate_token(
 ///     Ok(())
 /// }
 /// ```
-pub async fn revoke_token(
-    token: &str, 
-    redis_client: &RedisClient
-) -> Result<(), AuthServiceError> {
+pub async fn revoke_token(token: &str, redis_client: &RedisClient) -> Result<(), AuthServiceError> {
     // Create span for token revocation
     let span = business_operation_span("revoke_token");
     span.record("token_length", &token.len());
-    
+
     // Clone span before moving it into async operation
     let span_clone = span.clone();
-    
+
     // Use timer API to measure operation time
     let _timer = revoke::time();
-    
+
     // Wrap the token revocation in the span
     async move {
         let claims = match decode_token(token) {
@@ -639,7 +631,7 @@ pub async fn revoke_token(
         let now = Utc::now().timestamp() as usize;
         span.record("current_time", &now);
         span.record("token_exp", &claims.exp);
-        
+
         if claims.exp <= now {
             span.record("result", &"success");
             span.record("reason", &"already_expired");
@@ -659,7 +651,7 @@ pub async fn revoke_token(
                     "JWT Revocation",
                     &format!("Successfully revoked token for user: {}", claims.sub),
                     "success",
-                    "revoke_token"
+                    "revoke_token",
                 );
                 revoke::record_success();
                 span.record("result", &"success");
@@ -672,13 +664,13 @@ pub async fn revoke_token(
                     "JWT Revocation",
                     &format!("Failed to revoke token for {}: {}", claims.sub, cache_error),
                     "failure",
-                    "revoke_token"
+                    "revoke_token",
                 );
                 revoke::record_failure();
                 span.record("result", &"failure");
                 span.record("failure_reason", &"redis_error");
                 span.record_error(&cache_error);
-                
+
                 Err(AuthServiceError::Jwt(JwtError::Internal {
                     message: format!("Failed to revoke token: {}", cache_error),
                     span: SpanTrace::capture(),
@@ -702,7 +694,10 @@ mod tests {
 
     /// Sets up test environment with a secure test JWT secret.
     fn setup_test_environment() {
-        env::set_var(JWT_SECRET_ENV, "test-secret-key-minimum-32-characters-for-security-compliance");
+        env::set_var(
+            JWT_SECRET_ENV,
+            "test-secret-key-minimum-32-characters-for-security-compliance",
+        );
     }
 
     /// Creates a Redis client for integration testing.
@@ -729,29 +724,37 @@ mod tests {
     #[test]
     fn test_token_generation_and_decoding_roundtrip() {
         setup_test_environment();
-        
+
         let username = "test_user";
         let token_type = TOKEN_TYPE_ACCESS;
         let custom_duration = Duration::hours(2);
-        
+
         // Generate token with custom expiration
         let token = generate_token(username, token_type, Some(custom_duration))
             .expect("Token generation should succeed");
-        
+
         // Decode and validate the generated token
-        let claims = decode_token(&token)
-            .expect("Token decoding should succeed");
-        
+        let claims = decode_token(&token).expect("Token decoding should succeed");
+
         // Verify claim contents
         assert_eq!(claims.sub, username, "Subject should match input username");
-        assert_eq!(claims.token_type, token_type, "Token type should match input");
-        assert!(claims.jti.is_some(), "JWT ID should be present for revocation");
-        
+        assert_eq!(
+            claims.token_type, token_type,
+            "Token type should match input"
+        );
+        assert!(
+            claims.jti.is_some(),
+            "JWT ID should be present for revocation"
+        );
+
         // Verify timing constraints
         let now = Utc::now().timestamp() as usize;
-        assert!(claims.iat <= now, "Issue time should be in the past or present");
+        assert!(
+            claims.iat <= now,
+            "Issue time should be in the past or present"
+        );
         assert!(claims.exp > now, "Expiration should be in the future");
-        
+
         // Verify custom expiration is approximately correct (within 5 seconds)
         let expected_exp = now + custom_duration.num_seconds() as usize;
         let exp_diff = if claims.exp > expected_exp {
@@ -759,55 +762,70 @@ mod tests {
         } else {
             expected_exp - claims.exp
         };
-        assert!(exp_diff <= 5, "Expiration should match custom duration within timing tolerance");
+        assert!(
+            exp_diff <= 5,
+            "Expiration should match custom duration within timing tolerance"
+        );
     }
 
     #[test]
     fn test_token_generation_with_different_types() {
         setup_test_environment();
-        
+
         let username = "multi_type_user";
-        
+
         // Test access token generation
         let access_token = generate_token(username, TOKEN_TYPE_ACCESS, None)
             .expect("Access token generation should succeed");
-        let access_claims = decode_token(&access_token)
-            .expect("Access token decoding should succeed");
+        let access_claims =
+            decode_token(&access_token).expect("Access token decoding should succeed");
         assert_eq!(access_claims.token_type, TOKEN_TYPE_ACCESS);
-        
+
         // Test refresh token generation
         let refresh_token = generate_token(username, TOKEN_TYPE_REFRESH, None)
             .expect("Refresh token generation should succeed");
-        let refresh_claims = decode_token(&refresh_token)
-            .expect("Refresh token decoding should succeed");
+        let refresh_claims =
+            decode_token(&refresh_token).expect("Refresh token decoding should succeed");
         assert_eq!(refresh_claims.token_type, TOKEN_TYPE_REFRESH);
-        
+
         // Test custom token type
         let custom_token = generate_token(username, "custom_type", Some(Duration::minutes(30)))
             .expect("Custom token generation should succeed");
-        let custom_claims = decode_token(&custom_token)
-            .expect("Custom token decoding should succeed");
+        let custom_claims =
+            decode_token(&custom_token).expect("Custom token decoding should succeed");
         assert_eq!(custom_claims.token_type, "custom_type");
-        
+
         // Verify all tokens have unique JTIs
-        assert_ne!(access_claims.jti, refresh_claims.jti, "Tokens should have unique JTIs");
-        assert_ne!(access_claims.jti, custom_claims.jti, "Tokens should have unique JTIs");
-        assert_ne!(refresh_claims.jti, custom_claims.jti, "Tokens should have unique JTIs");
+        assert_ne!(
+            access_claims.jti, refresh_claims.jti,
+            "Tokens should have unique JTIs"
+        );
+        assert_ne!(
+            access_claims.jti, custom_claims.jti,
+            "Tokens should have unique JTIs"
+        );
+        assert_ne!(
+            refresh_claims.jti, custom_claims.jti,
+            "Tokens should have unique JTIs"
+        );
     }
 
     #[test]
     fn test_token_generation_fails_without_secret() {
         // Remove JWT secret to test error handling
         env::remove_var(JWT_SECRET_ENV);
-        
+
         let result = generate_token("user", TOKEN_TYPE_ACCESS, Some(Duration::hours(1)));
-        assert!(result.is_err(), "Token generation should fail without JWT secret");
-        
+        assert!(
+            result.is_err(),
+            "Token generation should fail without JWT secret"
+        );
+
         // Verify correct error type
         match result.unwrap_err() {
             AuthServiceError::Jwt(JwtError::Configuration { message, .. }) => {
                 assert!(
-                    message.contains("JWT_SECRET"), 
+                    message.contains("JWT_SECRET"),
                     "Error message should mention JWT_SECRET requirement"
                 );
             }
@@ -819,15 +837,18 @@ mod tests {
     fn test_token_generation_fails_with_weak_secret() {
         // Set secret that's too short (insecure)
         env::set_var(JWT_SECRET_ENV, "short"); // Only 5 characters
-        
+
         let result = generate_token("user", TOKEN_TYPE_ACCESS, Some(Duration::hours(1)));
-        assert!(result.is_err(), "Token generation should fail with weak secret");
-        
+        assert!(
+            result.is_err(),
+            "Token generation should fail with weak secret"
+        );
+
         // Verify correct error type and message
         match result.unwrap_err() {
             AuthServiceError::Jwt(JwtError::Configuration { message, .. }) => {
                 assert!(
-                    message.contains("32 characters"), 
+                    message.contains("32 characters"),
                     "Error should mention minimum length requirement"
                 );
             }
@@ -843,24 +864,26 @@ mod tests {
     async fn test_validate_token_with_redis() {
         setup_test_environment();
         let redis_client = create_test_redis_client();
-        
+
         let username = "redis_test_user";
         let token = generate_token(username, TOKEN_TYPE_ACCESS, Some(Duration::hours(1)))
             .expect("Token generation should succeed");
-        
+
         // Token should be valid initially
-        let claims = validate_token(&token, &redis_client).await
+        let claims = validate_token(&token, &redis_client)
+            .await
             .expect("Token validation should succeed");
         assert_eq!(claims.sub, username);
-        
+
         // Revoke token
-        revoke_token(&token, &redis_client).await
+        revoke_token(&token, &redis_client)
+            .await
             .expect("Token revocation should succeed");
-        
+
         // Token should now be invalid
         let result = validate_token(&token, &redis_client).await;
         assert!(result.is_err(), "Revoked token should be invalid");
-        
+
         // Verify correct error type
         match result.unwrap_err() {
             AuthServiceError::Jwt(JwtError::Revoked { .. }) => {
@@ -873,21 +896,21 @@ mod tests {
     #[test]
     fn test_decode_token_with_tampered_signature() {
         setup_test_environment();
-        
+
         let username = "security_test_user";
         let token = generate_token(username, TOKEN_TYPE_ACCESS, None)
             .expect("Token generation should succeed");
-        
+
         // Tamper with the signature (last part after the second dot)
         let parts: Vec<&str> = token.split('.').collect();
         assert_eq!(parts.len(), 3, "JWT should have three parts");
-        
+
         let tampered_token = format!("{}.{}.invalid_signature", parts[0], parts[1]);
-        
+
         // Decoding should fail with invalid signature
         let result = decode_token(&tampered_token);
         assert!(result.is_err(), "Tampered token should be rejected");
-        
+
         // Verify correct error type
         match result.unwrap_err() {
             AuthServiceError::Jwt(JwtError::InvalidSignature { .. }) => {

@@ -24,10 +24,10 @@
 //! - Infrastructure failures during logout (system health)
 //! - HTTP API health and performance monitoring
 
-use lazy_static::lazy_static;
-use prometheus::{CounterVec, HistogramVec, HistogramTimer};
-use std::sync::atomic::{AtomicBool, Ordering};
 use crate::log_info;
+use lazy_static::lazy_static;
+use prometheus::{CounterVec, HistogramTimer, HistogramVec};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // Import our standardized metrics infrastructure
 use super::core::{
@@ -222,7 +222,11 @@ pub fn init_logout_metrics() {
     lazy_static::initialize(&LOGOUT_HTTP_REQUESTS);
     lazy_static::initialize(&LOGOUT_HTTP_DURATION);
 
-    log_info!("Metrics", "Logout metrics initialized (production-ready with HTTP tracking)", "logout_metrics_init");
+    log_info!(
+        "Metrics",
+        "Logout metrics initialized (production-ready with HTTP tracking)",
+        "logout_metrics_init"
+    );
 }
 
 // =============================================================================
@@ -234,7 +238,7 @@ pub fn record_logout_operation(step: &str, result: &str) {
     observe_counter_vec(
         &LOGOUT_OPERATIONS,
         "logout_operations_total",
-        &[step, result]
+        &[step, result],
     );
 }
 
@@ -243,15 +247,13 @@ pub fn record_logout_failure_detailed(step: &str, error_type: &str) {
     observe_counter_vec(
         &LOGOUT_FAILURES,
         "logout_failures_total",
-        &[step, error_type]
+        &[step, error_type],
     );
 }
 
 /// Times logout step with standard prometheus timer
 pub fn time_logout_step(step: &str) -> HistogramTimer {
-    LOGOUT_DURATION
-        .with_label_values(&[step])
-        .start_timer()
+    LOGOUT_DURATION.with_label_values(&[step]).start_timer()
 }
 
 // =============================================================================
@@ -263,14 +265,14 @@ pub fn record_http_request(method: &str, status_code: u16) {
     observe_counter_vec(
         &LOGOUT_HTTP_REQUESTS,
         "logout_http_requests_total",
-        &[method, &status_code.to_string()]
+        &[method, &status_code.to_string()],
     );
 }
 
 /// Constants for HTTP methods and status codes
 pub mod http {
     pub const POST: &str = "POST";
-    
+
     // Status codes
     pub const OK: u16 = 200;
     pub const BAD_REQUEST: u16 = 400;
@@ -372,38 +374,63 @@ mod tests {
     #[test]
     fn test_logout_metrics_initialization() {
         init_logout_metrics();
-        
+
         // Test that all metrics are properly initialized
-        assert_eq!(LOGOUT_OPERATIONS.with_label_values(&[steps::COMPLETE_FLOW, results::SUCCESS]).get(), 0.0);
-        assert_eq!(LOGOUT_FAILURES.with_label_values(&[steps::TOKEN_REVOCATION, error_types::REVOCATION_FAILED]).get(), 0.0);
-        assert_eq!(LOGOUT_DURATION.with_label_values(&[steps::COMPLETE_FLOW]).get_sample_count(), 0);
-        assert_eq!(LOGOUT_HTTP_REQUESTS.with_label_values(&[http::POST, "200"]).get(), 0.0);
-        assert_eq!(LOGOUT_HTTP_DURATION.with_label_values(&[http::POST, "200"]).get_sample_count(), 0);
+        assert_eq!(
+            LOGOUT_OPERATIONS
+                .with_label_values(&[steps::COMPLETE_FLOW, results::SUCCESS])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            LOGOUT_FAILURES
+                .with_label_values(&[steps::TOKEN_REVOCATION, error_types::REVOCATION_FAILED])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            LOGOUT_DURATION
+                .with_label_values(&[steps::COMPLETE_FLOW])
+                .get_sample_count(),
+            0
+        );
+        assert_eq!(
+            LOGOUT_HTTP_REQUESTS
+                .with_label_values(&[http::POST, "200"])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            LOGOUT_HTTP_DURATION
+                .with_label_values(&[http::POST, "200"])
+                .get_sample_count(),
+            0
+        );
     }
 
     #[test]
     fn test_complete_logout_flow() {
         init_logout_metrics();
-        
+
         let before_count = LOGOUT_OPERATIONS
             .with_label_values(&[steps::COMPLETE_FLOW, results::SUCCESS])
             .get();
         let before_duration = LOGOUT_DURATION
             .with_label_values(&[steps::COMPLETE_FLOW])
             .get_sample_count();
-        
+
         // Test complete flow success
         let timer = time_complete_logout_flow();
         record_logout_success();
         drop(timer);
-        
+
         let after_count = LOGOUT_OPERATIONS
             .with_label_values(&[steps::COMPLETE_FLOW, results::SUCCESS])
             .get();
         let after_duration = LOGOUT_DURATION
             .with_label_values(&[steps::COMPLETE_FLOW])
             .get_sample_count();
-        
+
         assert_eq!(after_count, before_count + 1.0);
         assert_eq!(after_duration, before_duration + 1);
     }
@@ -411,31 +438,56 @@ mod tests {
     #[test]
     fn test_step_specific_helpers() {
         init_logout_metrics();
-        
+
         // Test all step helpers
         record_redis_check_success();
         record_redis_check_failure(error_types::REDIS_UNAVAILABLE);
-        
+
         record_token_validation_success();
         record_token_validation_failure(error_types::INVALID_TOKEN);
-        
+
         record_token_revocation_success();
         record_token_revocation_failure(error_types::REVOCATION_FAILED);
-        
+
         // Verify operations were recorded
-        assert_eq!(LOGOUT_OPERATIONS.with_label_values(&[steps::REDIS_CHECK, results::SUCCESS]).get(), 1.0);
-        assert_eq!(LOGOUT_OPERATIONS.with_label_values(&[steps::REDIS_CHECK, results::FAILURE]).get(), 1.0);
-        
+        assert_eq!(
+            LOGOUT_OPERATIONS
+                .with_label_values(&[steps::REDIS_CHECK, results::SUCCESS])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            LOGOUT_OPERATIONS
+                .with_label_values(&[steps::REDIS_CHECK, results::FAILURE])
+                .get(),
+            1.0
+        );
+
         // Verify detailed failures were recorded
-        assert_eq!(LOGOUT_FAILURES.with_label_values(&[steps::REDIS_CHECK, error_types::REDIS_UNAVAILABLE]).get(), 1.0);
-        assert_eq!(LOGOUT_FAILURES.with_label_values(&[steps::TOKEN_VALIDATION, error_types::INVALID_TOKEN]).get(), 1.0);
-        assert_eq!(LOGOUT_FAILURES.with_label_values(&[steps::TOKEN_REVOCATION, error_types::REVOCATION_FAILED]).get(), 1.0);
+        assert_eq!(
+            LOGOUT_FAILURES
+                .with_label_values(&[steps::REDIS_CHECK, error_types::REDIS_UNAVAILABLE])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            LOGOUT_FAILURES
+                .with_label_values(&[steps::TOKEN_VALIDATION, error_types::INVALID_TOKEN])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            LOGOUT_FAILURES
+                .with_label_values(&[steps::TOKEN_REVOCATION, error_types::REVOCATION_FAILED])
+                .get(),
+            1.0
+        );
     }
 
     #[test]
     fn test_http_metrics_integration() {
         init_logout_metrics();
-        
+
         // Test HTTP request tracking
         let initial_success = LOGOUT_HTTP_REQUESTS
             .with_label_values(&[http::POST, "200"])
@@ -443,11 +495,11 @@ mod tests {
         let initial_error = LOGOUT_HTTP_REQUESTS
             .with_label_values(&[http::POST, "400"])
             .get();
-        
+
         // Record requests
         record_http_request(http::POST, http::OK);
         record_http_request(http::POST, http::BAD_REQUEST);
-        
+
         // Verify counts
         let final_success = LOGOUT_HTTP_REQUESTS
             .with_label_values(&[http::POST, "200"])
@@ -455,7 +507,7 @@ mod tests {
         let final_error = LOGOUT_HTTP_REQUESTS
             .with_label_values(&[http::POST, "400"])
             .get();
-        
+
         assert_eq!(final_success, initial_success + 1.0);
         assert_eq!(final_error, initial_error + 1.0);
     }
@@ -463,9 +515,9 @@ mod tests {
     #[test]
     fn test_production_logout_patterns() {
         init_logout_metrics();
-        
+
         // Simulate realistic production patterns
-        
+
         // 10 successful logouts
         for _ in 0..10 {
             record_redis_check_success();
@@ -473,47 +525,87 @@ mod tests {
             record_token_revocation_success();
             record_logout_success();
         }
-        
+
         // Some failures at different steps
         record_redis_check_failure(error_types::REDIS_UNAVAILABLE);
         record_token_validation_failure(error_types::INVALID_TOKEN);
         record_token_revocation_failure(error_types::REVOCATION_FAILED);
-        
+
         // Verify realistic metric patterns
-        assert_eq!(LOGOUT_OPERATIONS.with_label_values(&[steps::COMPLETE_FLOW, results::SUCCESS]).get(), 10.0);
-        assert_eq!(LOGOUT_OPERATIONS.with_label_values(&[steps::COMPLETE_FLOW, results::FAILURE]).get(), 0.0); // No complete failures in sim
-        
+        assert_eq!(
+            LOGOUT_OPERATIONS
+                .with_label_values(&[steps::COMPLETE_FLOW, results::SUCCESS])
+                .get(),
+            10.0
+        );
+        assert_eq!(
+            LOGOUT_OPERATIONS
+                .with_label_values(&[steps::COMPLETE_FLOW, results::FAILURE])
+                .get(),
+            0.0
+        ); // No complete failures in sim
+
         // Specific failure types
-        assert_eq!(LOGOUT_FAILURES.with_label_values(&[steps::REDIS_CHECK, error_types::REDIS_UNAVAILABLE]).get(), 1.0);
-        assert_eq!(LOGOUT_FAILURES.with_label_values(&[steps::TOKEN_VALIDATION, error_types::INVALID_TOKEN]).get(), 1.0);
-        assert_eq!(LOGOUT_FAILURES.with_label_values(&[steps::TOKEN_REVOCATION, error_types::REVOCATION_FAILED]).get(), 1.0);
-        
+        assert_eq!(
+            LOGOUT_FAILURES
+                .with_label_values(&[steps::REDIS_CHECK, error_types::REDIS_UNAVAILABLE])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            LOGOUT_FAILURES
+                .with_label_values(&[steps::TOKEN_VALIDATION, error_types::INVALID_TOKEN])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            LOGOUT_FAILURES
+                .with_label_values(&[steps::TOKEN_REVOCATION, error_types::REVOCATION_FAILED])
+                .get(),
+            1.0
+        );
+
         // Successful steps
-        assert_eq!(LOGOUT_OPERATIONS.with_label_values(&[steps::TOKEN_REVOCATION, results::SUCCESS]).get(), 10.0);
+        assert_eq!(
+            LOGOUT_OPERATIONS
+                .with_label_values(&[steps::TOKEN_REVOCATION, results::SUCCESS])
+                .get(),
+            10.0
+        );
     }
 
     #[test]
     fn test_type_safety_constants() {
         init_logout_metrics();
-        
+
         // Verify all constants are valid and type-safe
         assert_eq!(steps::REDIS_CHECK, "redis_check");
         assert_eq!(steps::TOKEN_VALIDATION, "token_validation");
         assert_eq!(steps::TOKEN_REVOCATION, "token_revocation");
         assert_eq!(steps::COMPLETE_FLOW, "complete_flow");
-        
+
         assert_eq!(results::SUCCESS, "success");
         assert_eq!(results::FAILURE, "failure");
-        
+
         assert_eq!(error_types::REDIS_UNAVAILABLE, "redis_unavailable");
         assert_eq!(error_types::INVALID_TOKEN, "invalid_token");
         assert_eq!(error_types::REVOCATION_FAILED, "revocation_failed");
-        
+
         // Use constants in actual operations
         record_logout_operation(steps::TOKEN_REVOCATION, results::SUCCESS);
         record_logout_failure_detailed(steps::REDIS_CHECK, error_types::REDIS_UNAVAILABLE);
-        
-        assert_eq!(LOGOUT_OPERATIONS.with_label_values(&[steps::TOKEN_REVOCATION, results::SUCCESS]).get(), 1.0);
-        assert_eq!(LOGOUT_FAILURES.with_label_values(&[steps::REDIS_CHECK, error_types::REDIS_UNAVAILABLE]).get(), 1.0);
+
+        assert_eq!(
+            LOGOUT_OPERATIONS
+                .with_label_values(&[steps::TOKEN_REVOCATION, results::SUCCESS])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            LOGOUT_FAILURES
+                .with_label_values(&[steps::REDIS_CHECK, error_types::REDIS_UNAVAILABLE])
+                .get(),
+            1.0
+        );
     }
 }

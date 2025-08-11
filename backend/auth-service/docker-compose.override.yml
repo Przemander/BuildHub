@@ -1,0 +1,19 @@
+# Development overrides
+version: "3.9"
+
+services:
+  auth-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      APP_ENV: development
+      RUST_LOG: debug
+      RUST_BACKTRACE: 1
+    volumes:
+      # Mount source for hot reload (if using cargo-watch)
+      - ./src:/app/src:ro
+      - ./Cargo.toml:/app/Cargo.toml:ro
+    ports:
+      - "3000:3000"
+      - "9229:9229"  # Debug port if needed

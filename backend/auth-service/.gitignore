@@ -1,98 +1,82 @@
 # Build artifacts
-**/target/
-**/*.rs.bk
+target/
+*.rs.bk
 *.pdb
-**/dist/
-**/build/
+dist/
+build/
 
-# Environment variables & secrets
-**/.env
-**/.env.*
-!**/.env.example
+# Environment files (IMPORTANT: Never commit these!)
+.env
+.env.*
+!.env.example
+!.env.docker.example
 
 # Database files
-**/*.db
-**/*.db-*
-**/*.sqlite
-**/*.sqlite3
-**/*.db-journal
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.db-journal
 
-# IDE/Editor directories
+# IDE/Editor
 .idea/
 .vscode/
-**/*.swp
-**/*.swo
-**/*~
-**/.DS_Store
-**/Thumbs.db
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
 
-# Log files
-**/*.log
-**/logs/
+# Logs
+*.log
+logs/
 
 # Temporary files
-**/tmp/
-**/.tmp/
-**/temp/
+tmp/
+.tmp/
+temp/
 
-# Node.js dependencies (for any frontend components)
-**/node_modules/
-**/npm-debug.log*
-**/yarn-debug.log*
-**/yarn-error.log*
-**/.pnpm-debug.log*
-
-# Rust specific
-**/Cargo.lock
-# Exception for workspace Cargo.lock if using a workspace
-!/Cargo.lock
-
-# Generated content
-**/generated/
-**/__generated__/
-
-# Frontend build artifacts (if applicable)
-**/dist/
-**/.cache/
-
-# OS specific files
+# OS files
 .DS_Store
 Thumbs.db
 .directory
 
-# Development tools
-**/.direnv/
-**/.envrc
-**/.coverage/
+# Docker volumes (local data)
+postgres_data/
+redis_data/
+prometheus_data/
+grafana_data/
 
 # Backup files
-**/*~
-**/*.bak
-**/*.backup
+*.bak
+*.backup
 
-# Deployment related
-**/.vercel
-**/.netlify
-**/.serverless
+# Python specific (for integration tests)
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+*.egg-info/
+.eggs/
+pip-log.txt
+pip-delete-this-directory.txt
 
-# Integration tests
-integration-tests/__pycache__/
-integration-tests/.pytest_cache/
+# Integration test specific
 integration-tests/venv/
-integration-tests/*.pyc
+integration-tests/.pytest_cache/
+integration-tests/__pycache__/
 integration-tests/**/__pycache__/
-integration-tests/**/*.pyc
+integration-tests/*.pyc
 integration-tests/.env
-integration-tests/report.html
-integration-tests/.coverage
-integration-tests/htmlcov/
-
-# Editor files
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# Environment files
-.env
-.env.local
+integration-tests/test-results/
+integration-tests/reports/

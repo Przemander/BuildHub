@@ -1,5 +1,6 @@
 pub mod activation;
 pub mod activation_logic;
+pub mod debug;
 pub mod login;
 pub mod login_logic;
 pub mod logout;
@@ -10,4 +11,3 @@ pub mod refresh;
 pub mod refresh_logic;
 pub mod register;
 pub mod register_logic;
-pub mod debug;

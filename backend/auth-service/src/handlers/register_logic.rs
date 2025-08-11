@@ -13,24 +13,31 @@ use crate::{
     app::AppState,
     config::redis::store_activation_code,
     db::users::{RegisterData, User},
+    metricss::register_metrics::{
+        // Type-safe constants
+        error_types,
+        record_activation_setup_failure,
+        record_activation_setup_success,
+        record_email_delivery_failure,
+        record_email_delivery_success,
+        record_registration_failure,
+        record_registration_success,
+        record_uniqueness_check_failure,
+        record_uniqueness_check_success,
+        record_user_creation_failure,
+        record_user_creation_success,
+        record_validation_failure,
+        // Step-by-step tracking with business helpers
+        record_validation_success,
+        // High-level complete flow tracking
+        time_complete_registration_flow,
+    },
     utils::{
         email::generate_activation_code,
         error_new::AuthServiceError,
-        validators::{validate_email, validate_password, validate_username},
         log_new::Log,
-        telemetry::{db_operation_span, business_operation_span, SpanExt},
-    },
-    metricss::register_metrics::{
-        // High-level complete flow tracking
-        time_complete_registration_flow, record_registration_success, record_registration_failure,
-        // Step-by-step tracking with business helpers
-        record_validation_success, record_validation_failure,
-        record_uniqueness_check_success, record_uniqueness_check_failure,
-        record_user_creation_success, record_user_creation_failure,
-        record_activation_setup_success, record_activation_setup_failure,
-        record_email_delivery_success, record_email_delivery_failure,
-        // Type-safe constants
-        error_types,
+        telemetry::{business_operation_span, db_operation_span, SpanExt},
+        validators::{validate_email, validate_password, validate_username},
     },
 };
 use axum::{http::StatusCode, response::IntoResponse, Json};
@@ -49,17 +56,23 @@ pub async fn process_registration(
     // Create span for the entire registration processing flow
     let process_span = business_operation_span("process_registration");
     process_span.record("username", &data.username);
-    process_span.record("email_domain", &data.email.split('@').nth(1).unwrap_or("invalid"));
-    
+    process_span.record(
+        "email_domain",
+        &data.email.split('@').nth(1).unwrap_or("invalid"),
+    );
+
     // Clone span before moving it into the async block
     let process_span_clone = process_span.clone();
-    
+
     Log::event(
         "INFO",
-        "Registration", 
-        &format!("Starting registration for username: {}, email: {}", data.username, data.email), 
+        "Registration",
+        &format!(
+            "Starting registration for username: {}, email: {}",
+            data.username, data.email
+        ),
         "registration_start",
-        "process_registration"
+        "process_registration",
     );
 
     // Wrap registration logic in the process_span
@@ -261,22 +274,12 @@ pub async fn process_registration(
         );
         
         let user_result = async {
-            match create_inactive_user(&mut conn, &data.username, &data.email, &data.password) {
-                Ok(user) => {
-                    record_user_creation_success();
-                    user_creation_span.record("db.success", &true);
-                    user_creation_span.record("business.result", &"success");
-                    
-                    Log::event(
-                        "INFO",
-                        "Registration", 
-                        &format!("User created successfully: {}", data.username), 
-                        "user_created",
-                        "process_registration"
-                    );
-                    
-                    Ok(user)
-                }
+            // Instead of creating and saving a User, use the new approach:
+            let new_user = User::new_for_insert(&data.username, &data.email, &data.password);
+            
+            // Save and get the user with ID
+            let saved_user = match User::save_new(new_user, &mut conn) {
+                Ok(user) => user,
                 Err(e) => {
                     record_user_creation_failure(error_types::DATABASE_ERROR);
                     record_registration_failure();
@@ -292,9 +295,23 @@ pub async fn process_registration(
                         "process_registration"
                     );
                     
-                    Err(e)
+                    return Err(e);
                 }
-            }
+            };
+
+            record_user_creation_success();
+            user_creation_span.record("db.success", &true);
+            user_creation_span.record("business.result", &"success");
+            
+            Log::event(
+                "INFO",
+                "Registration", 
+                &format!("User created successfully: {}", data.username), 
+                "user_created",
+                "process_registration"
+            );
+            
+            Ok(saved_user)
         }.instrument(user_creation_span_clone).await?;
         
         let user = user_result;
@@ -429,7 +446,11 @@ pub async fn process_registration(
 
 // Pozostałe funkcje pomocnicze - bez większych zmian, poza usunięciem log_info! i log_warn!
 /// Helper function to validate all inputs (grouped for cleaner metrics)
-fn validate_all_inputs(username: &str, email: &str, password: &str) -> Result<(), AuthServiceError> {
+fn validate_all_inputs(
+    username: &str,
+    email: &str,
+    password: &str,
+) -> Result<(), AuthServiceError> {
     validate_username(username)?;
     validate_email(email)?;
     validate_password(password)?;
@@ -437,41 +458,42 @@ fn validate_all_inputs(username: &str, email: &str, password: &str) -> Result<()
 }
 
 /// Helper function to check uniqueness constraints with error categorization
-fn check_uniqueness(conn: &mut diesel::r2d2::PooledConnection<diesel::r2d2::ConnectionManager<diesel::SqliteConnection>>, email: &str, username: &str) -> Result<(), AuthServiceError> {
+fn check_uniqueness(
+    conn: &mut diesel::PgConnection,
+    email: &str,
+    username: &str,
+) -> Result<(), AuthServiceError> {
     // Check email uniqueness
     if User::find_by_email(conn, email).is_ok() {
-        return Err(AuthServiceError::validation("email", "Email address is already registered"));
+        return Err(AuthServiceError::validation(
+            "email",
+            "Email address is already registered",
+        ));
     }
 
     // Check username uniqueness
     if User::find_by_username(conn, username).is_ok() {
-        return Err(AuthServiceError::validation("username", "Username is already taken"));
+        return Err(AuthServiceError::validation(
+            "username",
+            "Username is already taken",
+        ));
     }
 
     Ok(())
 }
 
-/// Helper function to create inactive user with error handling
-fn create_inactive_user(
-    conn: &mut diesel::r2d2::PooledConnection<diesel::r2d2::ConnectionManager<diesel::SqliteConnection>>, 
-    username: &str, 
-    email: &str, 
-    password: &str
-) -> Result<User, AuthServiceError> {
-    let mut user = User::new(username, email, password);
-    user.is_active = Some(false);
-    user.save(conn)?;
-    Ok(user)
-}
 
 /// Helper to setup activation code with Redis storage
-async fn setup_user_activation(user: &User, redis_client: &RedisClient) -> Result<String, AuthServiceError> {
+async fn setup_user_activation(
+    user: &User,
+    redis_client: &RedisClient,
+) -> Result<String, AuthServiceError> {
     // Generate activation code
     let code = generate_activation_code();
-    
+
     // Store activation code in Redis
     store_activation_code(redis_client, &user.email, &code).await?;
-    
+
     Ok(code)
 }
 
@@ -490,7 +512,7 @@ fn categorize_validation_error(error: &AuthServiceError) -> &'static str {
                 error_types::INVALID_USERNAME // Default
             }
         }
-        _ => error_types::INVALID_USERNAME // Default for non-validation errors
+        _ => error_types::INVALID_USERNAME, // Default for non-validation errors
     }
 }
 
@@ -503,15 +525,19 @@ mod tests {
     use crate::utils::test_utils::state_with_redis;
     // ✅ FIXED: Import metrics for testing integration INCLUDING steps and error_types
     use crate::metricss::register_metrics::{
-        init_registration_metrics, REGISTRATION_OPERATIONS, REGISTRATION_DURATION, REGISTRATION_FAILURES,
-        steps, error_types // ✅ FIXED: Import steps and error_types here where they're actually used
+        error_types, // ✅ FIXED: Import steps and error_types here where they're actually used
+        init_registration_metrics,
+        steps,
+        REGISTRATION_DURATION,
+        REGISTRATION_FAILURES,
+        REGISTRATION_OPERATIONS,
     };
 
     /// Build a state with in-memory DB + Redis + dummy EmailConfig + initialized metrics
     fn make_state() -> AppState {
         // Initialize registration metrics
         init_registration_metrics();
-        
+
         let mut state = state_with_redis();
         state.email_config = Some(EmailConfig::dummy());
         state
@@ -526,10 +552,10 @@ mod tests {
             email: "user@ex.com".into(),
             password: "Valid1!".into(),
         };
-        
+
         let result = process_registration(&state, data).await;
         assert!(result.is_err());
-        
+
         if let Err(AuthServiceError::Configuration(msg)) = result {
             assert!(msg.contains("Email configuration"));
         } else {
@@ -546,10 +572,10 @@ mod tests {
             email: "user@ex.com".into(),
             password: "Valid1!".into(),
         };
-        
+
         let result = process_registration(&state, data).await;
         assert!(result.is_err());
-        
+
         if let Err(AuthServiceError::Configuration(msg)) = result {
             assert!(msg.contains("Redis client"));
         } else {
@@ -560,7 +586,7 @@ mod tests {
     #[tokio::test]
     async fn missing_username_returns_validation_error_with_metrics() {
         let state = make_state();
-        
+
         // Record initial metrics state
         let initial_validation_failure = REGISTRATION_OPERATIONS
             .with_label_values(&[steps::VALIDATION, "failure"])
@@ -568,16 +594,16 @@ mod tests {
         let initial_complete_failure = REGISTRATION_OPERATIONS
             .with_label_values(&[steps::COMPLETE_FLOW, "failure"])
             .get();
-        
+
         let data = RegisterData {
             username: "".into(),
             email: "user@example.com".into(),
             password: "Valid1!".into(),
         };
-        
+
         let result = process_registration(&state, data).await;
         assert!(result.is_err());
-        
+
         // Check that it's a validation error
         match result.err().unwrap() {
             AuthServiceError::Validation(_) => {
@@ -588,7 +614,7 @@ mod tests {
                 let final_complete_failure = REGISTRATION_OPERATIONS
                     .with_label_values(&[steps::COMPLETE_FLOW, "failure"])
                     .get();
-                
+
                 assert_eq!(final_validation_failure, initial_validation_failure + 1.0);
                 assert_eq!(final_complete_failure, initial_complete_failure + 1.0);
             }
@@ -604,10 +630,10 @@ mod tests {
             email: "not-an-email".into(),
             password: "Valid1!".into(),
         };
-        
+
         let result = process_registration(&state, data).await;
         assert!(result.is_err());
-        
+
         // Check that it's a validation error
         match result.err().unwrap() {
             AuthServiceError::Validation(_) => {
@@ -625,10 +651,10 @@ mod tests {
             email: "user@example.com".into(),
             password: "short".into(),
         };
-        
+
         let result = process_registration(&state, data).await;
         assert!(result.is_err());
-        
+
         // Check that it's a validation error
         match result.err().unwrap() {
             AuthServiceError::Validation(_) => {
@@ -641,7 +667,7 @@ mod tests {
     #[tokio::test]
     async fn duplicate_email_returns_validation_error_with_metrics() {
         let state = make_state();
-        
+
         // Create first user
         let data1 = RegisterData {
             username: "first".into(),
@@ -667,7 +693,7 @@ mod tests {
         };
         let result2 = process_registration(&state, data2).await;
         assert!(result2.is_err());
-        
+
         // Check that it's a validation error with correct metrics
         match result2.err().unwrap() {
             AuthServiceError::Validation(_) => {
@@ -677,9 +703,12 @@ mod tests {
                 let final_email_taken_failures = REGISTRATION_FAILURES
                     .with_label_values(&[steps::UNIQUENESS_CHECK, error_types::EMAIL_TAKEN])
                     .get();
-                
+
                 assert_eq!(final_uniqueness_failure, initial_uniqueness_failure + 1.0);
-                assert_eq!(final_email_taken_failures, initial_email_taken_failures + 1.0);
+                assert_eq!(
+                    final_email_taken_failures,
+                    initial_email_taken_failures + 1.0
+                );
             }
             other => panic!("Expected validation error, got: {:?}", other),
         }
@@ -688,7 +717,7 @@ mod tests {
     #[tokio::test]
     async fn successful_registration_generates_complete_metrics() {
         let state = make_state();
-        
+
         // Record initial metrics state for all steps
         let initial_validation_success = REGISTRATION_OPERATIONS
             .with_label_values(&[steps::VALIDATION, "success"])
@@ -705,7 +734,7 @@ mod tests {
         let initial_complete_success = REGISTRATION_OPERATIONS
             .with_label_values(&[steps::COMPLETE_FLOW, "success"])
             .get();
-        
+
         let initial_complete_duration = REGISTRATION_DURATION
             .with_label_values(&[steps::COMPLETE_FLOW])
             .get_sample_count();
@@ -715,7 +744,7 @@ mod tests {
             email: "metrics@test.com".into(),
             password: "Strong123!".into(),
         };
-        
+
         let result = process_registration(&state, data.clone()).await;
         assert!(result.is_ok());
 
@@ -735,18 +764,24 @@ mod tests {
         let final_complete_success = REGISTRATION_OPERATIONS
             .with_label_values(&[steps::COMPLETE_FLOW, "success"])
             .get();
-        
+
         let final_complete_duration = REGISTRATION_DURATION
             .with_label_values(&[steps::COMPLETE_FLOW])
             .get_sample_count();
-        
+
         // All steps should have recorded success
         assert_eq!(final_validation_success, initial_validation_success + 1.0);
         assert_eq!(final_uniqueness_success, initial_uniqueness_success + 1.0);
-        assert_eq!(final_user_creation_success, initial_user_creation_success + 1.0);
-        assert_eq!(final_activation_setup_success, initial_activation_setup_success + 1.0);
+        assert_eq!(
+            final_user_creation_success,
+            initial_user_creation_success + 1.0
+        );
+        assert_eq!(
+            final_activation_setup_success,
+            initial_activation_setup_success + 1.0
+        );
         assert_eq!(final_complete_success, initial_complete_success + 1.0);
-        
+
         // Duration should be recorded
         assert_eq!(final_complete_duration, initial_complete_duration + 1);
 
@@ -754,15 +789,15 @@ mod tests {
         let mut conn = state.pool.get().unwrap();
         let user = User::find_by_username(&mut conn, &data.username).unwrap();
         assert_eq!(user.email, data.email);
-        assert_eq!(user.is_active, Some(false)); // Should be inactive by default
+        assert_eq!(user.is_active, false); // Should be inactive by default
     }
 
     #[tokio::test]
     async fn production_registration_patterns() {
         let state = make_state();
-        
+
         // Simulate realistic production patterns
-        
+
         // 10 successful registrations
         for i in 0..10 {
             let data = RegisterData {
@@ -773,9 +808,9 @@ mod tests {
             let result = process_registration(&state, data).await;
             assert!(result.is_ok());
         }
-        
+
         // Some failures at different steps
-        
+
         // Validation failure
         let weak_password_data = RegisterData {
             username: "weak_user".into(),
@@ -784,7 +819,7 @@ mod tests {
         };
         let result = process_registration(&state, weak_password_data).await;
         assert!(result.is_err());
-        
+
         // Uniqueness failure (duplicate email)
         let duplicate_data = RegisterData {
             username: "duplicate_user".into(),
@@ -793,38 +828,38 @@ mod tests {
         };
         let result = process_registration(&state, duplicate_data).await;
         assert!(result.is_err());
-        
+
         // ✅ Verify realistic metric patterns
-        
+
         // 10 successful complete flows
         let complete_success = REGISTRATION_OPERATIONS
             .with_label_values(&[steps::COMPLETE_FLOW, "success"])
             .get();
         assert_eq!(complete_success, 10.0);
-        
-        // 2 failed complete flows (weak password + duplicate email)  
+
+        // 2 failed complete flows (weak password + duplicate email)
         let complete_failure = REGISTRATION_OPERATIONS
             .with_label_values(&[steps::COMPLETE_FLOW, "failure"])
             .get();
         assert_eq!(complete_failure, 2.0);
-        
+
         // Specific failure types
         let validation_failures = REGISTRATION_FAILURES
             .with_label_values(&[steps::VALIDATION, error_types::WEAK_PASSWORD])
             .get();
         assert_eq!(validation_failures, 1.0);
-        
+
         let uniqueness_failures = REGISTRATION_FAILURES
             .with_label_values(&[steps::UNIQUENESS_CHECK, error_types::EMAIL_TAKEN])
             .get();
         assert_eq!(uniqueness_failures, 1.0);
-        
+
         // All successful registrations went through all steps
         let validation_success = REGISTRATION_OPERATIONS
             .with_label_values(&[steps::VALIDATION, "success"])
             .get();
         assert_eq!(validation_success, 10.0); // Only successful ones passed validation
-        
+
         let user_creation_success = REGISTRATION_OPERATIONS
             .with_label_values(&[steps::USER_CREATION, "success"])
             .get();

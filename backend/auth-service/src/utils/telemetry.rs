@@ -50,22 +50,22 @@ use uuid::Uuid;
 pub mod spans {
     /// HTTP request handling span
     pub const HTTP_REQUEST: &str = "http.request";
-    
+
     /// HTTP middleware execution span
     pub const HTTP_MIDDLEWARE: &str = "http.middleware";
-    
+
     /// Database query execution span
     pub const DB_QUERY: &str = "db.query";
-    
+
     /// Redis cache operation span
     pub const REDIS_OPERATION: &str = "redis.operation";
-    
+
     /// JWT token validation span
     pub const JWT_VALIDATION: &str = "jwt.validation";
-    
+
     /// Email sending operation span
     pub const EMAIL_SEND: &str = "email.send";
-    
+
     /// Business logic operation span
     pub const BUSINESS_OPERATION: &str = "business.operation";
 }
@@ -233,8 +233,10 @@ pub trait SpanExt {
     ///
     /// # Parameters
     /// * `error` - The error to record
-    fn record_error<E>(&self, error: &E) where E: Display;
-    
+    fn record_error<E>(&self, error: &E)
+    where
+        E: Display;
+
     /// Records user context in the span.
     ///
     /// This method adds user identification to spans for tracking
@@ -244,7 +246,7 @@ pub trait SpanExt {
     /// * `user_id` - User identifier
     #[allow(dead_code)]
     fn record_user(&self, user_id: &str);
-    
+
     /// Records request ID for linking related spans.
     ///
     /// This method adds request context to spans for distributed tracing.
@@ -257,7 +259,10 @@ pub trait SpanExt {
 
 /// Implementation of SpanExt for tracing::Span.
 impl SpanExt for TracingSpan {
-    fn record_error<E>(&self, error: &E) where E: Display {
+    fn record_error<E>(&self, error: &E)
+    where
+        E: Display,
+    {
         self.record("error", &true);
         self.record("error.message", &format!("{}", error));
     }
@@ -278,25 +283,25 @@ impl SpanExt for TracingSpan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_http_request_span() {
         let span = http_request_span("GET", "/test");
         assert!(span.is_none()); // Span is disabled in test mode, which is expected
     }
-    
+
     #[test]
     fn test_business_operation_span() {
         let span = business_operation_span("test_operation");
         assert!(span.is_none()); // Span is disabled in test mode, which is expected
     }
-    
+
     #[test]
     fn test_db_operation_span() {
         let span = db_operation_span("select", "users");
         assert!(span.is_none()); // Span is disabled in test mode, which is expected
     }
-    
+
     #[test]
     fn test_redis_operation_span() {
         let span = redis_operation_span("get", "session:*");

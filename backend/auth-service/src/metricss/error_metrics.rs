@@ -21,16 +21,13 @@
 //! - High error rates (SLA breaches)
 //! - Performance degradation patterns
 
+use crate::log_info;
 use lazy_static::lazy_static;
 use prometheus::CounterVec;
 use std::sync::atomic::{AtomicBool, Ordering};
-use crate::log_info;
 
 // Import our standardized metrics infrastructure
-use super::core::{
-    create_counter_vec,
-    observe_counter_vec,
-};
+use super::core::{create_counter_vec, observe_counter_vec};
 
 // =============================================================================
 // METRIC DEFINITIONS (Using standardized infrastructure)
@@ -45,7 +42,7 @@ lazy_static! {
     /// # Labels
     /// * `error_category`: High-level error classification
     ///   - `"database"`: Database connection, query, migration issues
-    ///   - `"cache"`: Redis/cache connection and operation failures  
+    ///   - `"cache"`: Redis/cache connection and operation failures
     ///   - `"jwt"`: Authentication token validation issues
     ///   - `"rate_limit"`: Rate limiting configuration and operation errors
     ///   - `"validation"`: Input validation and data integrity errors
@@ -65,7 +62,7 @@ lazy_static! {
     ///   expr: rate(auth_service_errors_total{error_category="database", error_type="connection_pool"}[5m]) > 0
     ///   severity: critical
     ///
-    /// - alert: CacheDown  
+    /// - alert: CacheDown
     ///   expr: rate(auth_service_errors_total{error_category="cache", error_type="connection"}[5m]) > 0
     ///   severity: critical
     ///
@@ -102,11 +99,11 @@ lazy_static! {
     /// Essential for monitoring client experience, API health, and endpoint performance.
     /// Provides comprehensive HTTP traffic analysis for SLA monitoring and capacity planning.
     ///
-    /// # Labels  
+    /// # Labels
     /// * `status_code`: HTTP status code for response classification
     ///   - `"200"`, `"201"`, `"204"`: Success responses
     ///   - `"400"`, `"401"`, `"403"`, `"404"`: Client errors
-    ///   - `"429"`: Rate limiting responses  
+    ///   - `"429"`: Rate limiting responses
     ///   - `"500"`, `"502"`, `"503"`: Server errors
     /// * `endpoint_group`: Logical grouping of endpoints for analysis
     ///   - `"unknown"`: Default group when context is unavailable
@@ -168,7 +165,11 @@ pub(crate) fn init_error_metrics() {
     lazy_static::initialize(&AUTH_SERVICE_ERRORS);
     lazy_static::initialize(&HTTP_RESPONSES);
 
-    log_info!("Metrics", "Error metrics initialized (enhanced production version with core integration)", "error_metrics_init");
+    log_info!(
+        "Metrics",
+        "Error metrics initialized (enhanced production version with core integration)",
+        "error_metrics_init"
+    );
 }
 
 // =============================================================================
@@ -180,7 +181,7 @@ pub fn record_error(error_category: &str, error_type: &str) {
     observe_counter_vec(
         &AUTH_SERVICE_ERRORS,
         "auth_service_errors_total",
-        &[error_category, error_type]
+        &[error_category, error_type],
     );
 }
 
@@ -189,7 +190,7 @@ pub fn record_http_response(status_code: u16, endpoint_group: &str) {
     observe_counter_vec(
         &HTTP_RESPONSES,
         "http_responses_total",
-        &[&status_code.to_string(), endpoint_group]
+        &[&status_code.to_string(), endpoint_group],
     );
 }
 
@@ -259,15 +260,15 @@ pub mod endpoint_groups {
 /// Database error helpers
 pub mod database {
     use super::*;
-    
+
     pub fn record_connection_pool_error() {
         record_error(categories::DATABASE, database_types::CONNECTION_POOL);
     }
-    
+
     pub fn record_query_error() {
         record_error(categories::DATABASE, database_types::QUERY);
     }
-    
+
     pub fn record_migration_error() {
         record_error(categories::DATABASE, database_types::MIGRATION);
     }
@@ -276,19 +277,19 @@ pub mod database {
 /// Cache error helpers
 pub mod cache {
     use super::*;
-    
+
     pub fn record_connection_error() {
         record_error(categories::CACHE, cache_types::CONNECTION);
     }
-    
+
     pub fn record_operation_error() {
         record_error(categories::CACHE, cache_types::OPERATION);
     }
-    
+
     pub fn record_key_not_found() {
         record_error(categories::CACHE, cache_types::KEY_NOT_FOUND);
     }
-    
+
     pub fn record_serialization_error() {
         record_error(categories::CACHE, cache_types::SERIALIZATION);
     }
@@ -297,31 +298,31 @@ pub mod cache {
 /// JWT error helpers
 pub mod jwt {
     use super::*;
-    
+
     pub fn record_expired() {
         record_error(categories::JWT, jwt_types::EXPIRED);
     }
-    
+
     pub fn record_invalid_signature() {
         record_error(categories::JWT, jwt_types::INVALID_SIGNATURE);
     }
-    
+
     pub fn record_invalid() {
         record_error(categories::JWT, jwt_types::INVALID);
     }
-    
+
     pub fn record_revoked() {
         record_error(categories::JWT, jwt_types::REVOKED);
     }
-    
+
     pub fn record_invalid_iat() {
         record_error(categories::JWT, jwt_types::INVALID_IAT);
     }
-    
+
     pub fn record_configuration_error() {
         record_error(categories::JWT, jwt_types::CONFIGURATION);
     }
-    
+
     pub fn record_internal_error() {
         record_error(categories::JWT, jwt_types::INTERNAL);
     }
@@ -330,19 +331,19 @@ pub mod jwt {
 /// Rate limiting error helpers
 pub mod rate_limit {
     use super::*;
-    
+
     pub fn record_limit_exceeded() {
         record_error(categories::RATE_LIMIT, rate_limit_types::LIMIT_EXCEEDED);
     }
-    
+
     pub fn record_configuration_error() {
         record_error(categories::RATE_LIMIT, rate_limit_types::CONFIGURATION);
     }
-    
+
     pub fn record_cache_operation_error() {
         record_error(categories::RATE_LIMIT, rate_limit_types::CACHE_OPERATION);
     }
-    
+
     pub fn record_invalid_key_error() {
         record_error(categories::RATE_LIMIT, rate_limit_types::INVALID_KEY);
     }
@@ -351,19 +352,19 @@ pub mod rate_limit {
 /// Validation error helpers
 pub mod validation {
     use super::*;
-    
+
     pub fn record_invalid_value() {
         record_error(categories::VALIDATION, validation_types::INVALID_VALUE);
     }
-    
+
     pub fn record_missing_field() {
         record_error(categories::VALIDATION, validation_types::MISSING_FIELD);
     }
-    
+
     pub fn record_too_long() {
         record_error(categories::VALIDATION, validation_types::TOO_LONG);
     }
-    
+
     pub fn record_password_hash_error() {
         record_error(categories::VALIDATION, validation_types::PASSWORD_HASH);
     }
@@ -372,7 +373,7 @@ pub mod validation {
 /// Configuration error helpers
 pub mod configuration {
     use super::*;
-    
+
     pub fn record_general_error() {
         record_error(categories::CONFIGURATION, configuration_types::GENERAL);
     }
@@ -389,98 +390,153 @@ mod tests {
     #[test]
     fn test_error_metrics_initialization() {
         init_error_metrics();
-        
+
         // Test that all metrics are properly initialized
-        assert_eq!(AUTH_SERVICE_ERRORS.with_label_values(&[categories::DATABASE, database_types::CONNECTION_POOL]).get(), 0.0);
-        assert_eq!(HTTP_RESPONSES.with_label_values(&["200", endpoint_groups::UNKNOWN]).get(), 0.0);
+        assert_eq!(
+            AUTH_SERVICE_ERRORS
+                .with_label_values(&[categories::DATABASE, database_types::CONNECTION_POOL])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            HTTP_RESPONSES
+                .with_label_values(&["200", endpoint_groups::UNKNOWN])
+                .get(),
+            0.0
+        );
     }
 
     #[test]
     fn test_core_error_recording_with_standardized_functions() {
         init_error_metrics();
-        
+
         let before = AUTH_SERVICE_ERRORS
             .with_label_values(&[categories::DATABASE, database_types::CONNECTION_POOL])
             .get();
-        
+
         record_error(categories::DATABASE, database_types::CONNECTION_POOL);
-        
+
         let after = AUTH_SERVICE_ERRORS
             .with_label_values(&[categories::DATABASE, database_types::CONNECTION_POOL])
             .get();
-        
+
         assert_eq!(after, before + 1.0);
     }
 
     #[test]
     fn test_http_response_recording_with_enhanced_error_handling() {
         init_error_metrics();
-        
+
         let before = HTTP_RESPONSES
             .with_label_values(&["500", endpoint_groups::UNKNOWN])
             .get();
-        
+
         record_http_response(500, endpoint_groups::UNKNOWN);
-        
+
         let after = HTTP_RESPONSES
             .with_label_values(&["500", endpoint_groups::UNKNOWN])
             .get();
-        
+
         assert_eq!(after, before + 1.0);
     }
 
     #[test]
     fn test_helper_modules() {
         init_error_metrics();
-        
+
         // Test database helpers
         database::record_connection_pool_error();
-        assert!(AUTH_SERVICE_ERRORS.with_label_values(&[categories::DATABASE, database_types::CONNECTION_POOL]).get() >= 1.0);
-        
+        assert!(
+            AUTH_SERVICE_ERRORS
+                .with_label_values(&[categories::DATABASE, database_types::CONNECTION_POOL])
+                .get()
+                >= 1.0
+        );
+
         database::record_query_error();
-        assert!(AUTH_SERVICE_ERRORS.with_label_values(&[categories::DATABASE, database_types::QUERY]).get() >= 1.0);
-        
+        assert!(
+            AUTH_SERVICE_ERRORS
+                .with_label_values(&[categories::DATABASE, database_types::QUERY])
+                .get()
+                >= 1.0
+        );
+
         // Test cache helpers
         cache::record_connection_error();
-        assert!(AUTH_SERVICE_ERRORS.with_label_values(&[categories::CACHE, cache_types::CONNECTION]).get() >= 1.0);
-        
+        assert!(
+            AUTH_SERVICE_ERRORS
+                .with_label_values(&[categories::CACHE, cache_types::CONNECTION])
+                .get()
+                >= 1.0
+        );
+
         cache::record_operation_error();
-        assert!(AUTH_SERVICE_ERRORS.with_label_values(&[categories::CACHE, cache_types::OPERATION]).get() >= 1.0);
-        
+        assert!(
+            AUTH_SERVICE_ERRORS
+                .with_label_values(&[categories::CACHE, cache_types::OPERATION])
+                .get()
+                >= 1.0
+        );
+
         // Test JWT helpers
         jwt::record_expired();
-        assert!(AUTH_SERVICE_ERRORS.with_label_values(&[categories::JWT, jwt_types::EXPIRED]).get() >= 1.0);
-        
+        assert!(
+            AUTH_SERVICE_ERRORS
+                .with_label_values(&[categories::JWT, jwt_types::EXPIRED])
+                .get()
+                >= 1.0
+        );
+
         jwt::record_invalid_signature();
-        assert!(AUTH_SERVICE_ERRORS.with_label_values(&[categories::JWT, jwt_types::INVALID_SIGNATURE]).get() >= 1.0);
-        
+        assert!(
+            AUTH_SERVICE_ERRORS
+                .with_label_values(&[categories::JWT, jwt_types::INVALID_SIGNATURE])
+                .get()
+                >= 1.0
+        );
+
         // Test rate limit helpers
         rate_limit::record_limit_exceeded();
-        assert!(AUTH_SERVICE_ERRORS.with_label_values(&[categories::RATE_LIMIT, rate_limit_types::LIMIT_EXCEEDED]).get() >= 1.0);
-        
+        assert!(
+            AUTH_SERVICE_ERRORS
+                .with_label_values(&[categories::RATE_LIMIT, rate_limit_types::LIMIT_EXCEEDED])
+                .get()
+                >= 1.0
+        );
+
         // Test validation helpers
         validation::record_invalid_value();
-        assert!(AUTH_SERVICE_ERRORS.with_label_values(&[categories::VALIDATION, validation_types::INVALID_VALUE]).get() >= 1.0);
-        
+        assert!(
+            AUTH_SERVICE_ERRORS
+                .with_label_values(&[categories::VALIDATION, validation_types::INVALID_VALUE])
+                .get()
+                >= 1.0
+        );
+
         // Test configuration helpers
         configuration::record_general_error();
-        assert!(AUTH_SERVICE_ERRORS.with_label_values(&[categories::CONFIGURATION, configuration_types::GENERAL]).get() >= 1.0);
+        assert!(
+            AUTH_SERVICE_ERRORS
+                .with_label_values(&[categories::CONFIGURATION, configuration_types::GENERAL])
+                .get()
+                >= 1.0
+        );
     }
 
     #[test]
     fn test_comprehensive_error_categories() {
         init_error_metrics();
-        
+
         // Test all error categories and types
         record_error(categories::DATABASE, database_types::CONNECTION_POOL);
         record_error(categories::DATABASE, database_types::QUERY);
         record_error(categories::DATABASE, database_types::MIGRATION);
-        
+
         record_error(categories::CACHE, cache_types::CONNECTION);
         record_error(categories::CACHE, cache_types::OPERATION);
         record_error(categories::CACHE, cache_types::KEY_NOT_FOUND);
         record_error(categories::CACHE, cache_types::SERIALIZATION);
-        
+
         record_error(categories::JWT, jwt_types::EXPIRED);
         record_error(categories::JWT, jwt_types::INVALID_SIGNATURE);
         record_error(categories::JWT, jwt_types::INVALID);
@@ -488,19 +544,19 @@ mod tests {
         record_error(categories::JWT, jwt_types::INVALID_IAT);
         record_error(categories::JWT, jwt_types::CONFIGURATION);
         record_error(categories::JWT, jwt_types::INTERNAL);
-        
+
         record_error(categories::RATE_LIMIT, rate_limit_types::LIMIT_EXCEEDED);
         record_error(categories::RATE_LIMIT, rate_limit_types::CONFIGURATION);
         record_error(categories::RATE_LIMIT, rate_limit_types::CACHE_OPERATION);
         record_error(categories::RATE_LIMIT, rate_limit_types::INVALID_KEY);
-        
+
         record_error(categories::VALIDATION, validation_types::INVALID_VALUE);
         record_error(categories::VALIDATION, validation_types::MISSING_FIELD);
         record_error(categories::VALIDATION, validation_types::TOO_LONG);
         record_error(categories::VALIDATION, validation_types::PASSWORD_HASH);
-        
+
         record_error(categories::CONFIGURATION, configuration_types::GENERAL);
-        
+
         // If we get here, all constants are valid and recording works
         assert!(true);
     }
@@ -508,58 +564,96 @@ mod tests {
     #[test]
     fn test_endpoint_groups() {
         init_error_metrics();
-        
+
         // Test endpoint group
         record_http_response(500, endpoint_groups::UNKNOWN);
-        
+
         // Verify group works
-        assert!(HTTP_RESPONSES.with_label_values(&["500", endpoint_groups::UNKNOWN]).get() >= 1.0);
+        assert!(
+            HTTP_RESPONSES
+                .with_label_values(&["500", endpoint_groups::UNKNOWN])
+                .get()
+                >= 1.0
+        );
     }
 
     #[test]
     fn test_production_usage_patterns() {
         init_error_metrics();
-        
+
         // Simulate production error patterns
-        
+
         // Database connection issues (infrastructure failure)
         database::record_connection_pool_error();
         database::record_connection_pool_error();
-        
+
         // JWT security events (potential attack)
         jwt::record_invalid_signature();
         jwt::record_invalid_signature();
         jwt::record_invalid_signature();
-        
+
         // Rate limiting (normal protection)
         rate_limit::record_limit_exceeded();
-        
+
         // HTTP responses (normal traffic)
         record_http_response(200, endpoint_groups::UNKNOWN);
         record_http_response(200, endpoint_groups::UNKNOWN);
         record_http_response(200, endpoint_groups::UNKNOWN);
         record_http_response(401, endpoint_groups::UNKNOWN);
         record_http_response(500, endpoint_groups::UNKNOWN);
-        
+
         // Verify patterns are recorded correctly
-        assert_eq!(AUTH_SERVICE_ERRORS.with_label_values(&[categories::DATABASE, database_types::CONNECTION_POOL]).get(), 2.0);
-        assert_eq!(AUTH_SERVICE_ERRORS.with_label_values(&[categories::JWT, jwt_types::INVALID_SIGNATURE]).get(), 3.0);
-        assert_eq!(AUTH_SERVICE_ERRORS.with_label_values(&[categories::RATE_LIMIT, rate_limit_types::LIMIT_EXCEEDED]).get(), 1.0);
-        
-        assert_eq!(HTTP_RESPONSES.with_label_values(&["200", endpoint_groups::UNKNOWN]).get(), 3.0);
-        assert_eq!(HTTP_RESPONSES.with_label_values(&["401", endpoint_groups::UNKNOWN]).get(), 1.0);
-        assert_eq!(HTTP_RESPONSES.with_label_values(&["500", endpoint_groups::UNKNOWN]).get(), 1.0);
+        assert_eq!(
+            AUTH_SERVICE_ERRORS
+                .with_label_values(&[categories::DATABASE, database_types::CONNECTION_POOL])
+                .get(),
+            2.0
+        );
+        assert_eq!(
+            AUTH_SERVICE_ERRORS
+                .with_label_values(&[categories::JWT, jwt_types::INVALID_SIGNATURE])
+                .get(),
+            3.0
+        );
+        assert_eq!(
+            AUTH_SERVICE_ERRORS
+                .with_label_values(&[categories::RATE_LIMIT, rate_limit_types::LIMIT_EXCEEDED])
+                .get(),
+            1.0
+        );
+
+        assert_eq!(
+            HTTP_RESPONSES
+                .with_label_values(&["200", endpoint_groups::UNKNOWN])
+                .get(),
+            3.0
+        );
+        assert_eq!(
+            HTTP_RESPONSES
+                .with_label_values(&["401", endpoint_groups::UNKNOWN])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            HTTP_RESPONSES
+                .with_label_values(&["500", endpoint_groups::UNKNOWN])
+                .get(),
+            1.0
+        );
     }
 
     #[test]
     fn test_metric_error_handling() {
         init_error_metrics();
-        
+
         // Test that invalid/long label values are handled gracefully
         // (These would be sanitized by the core infrastructure)
-        record_error("very_long_category_name_that_might_cause_issues", "very_long_error_type");
+        record_error(
+            "very_long_category_name_that_might_cause_issues",
+            "very_long_error_type",
+        );
         record_http_response(999, "invalid_endpoint_group!");
-        
+
         // These should not panic due to the enhanced error handling in core.rs
         // The metrics should either be recorded with sanitized labels or ignored safely
     }
@@ -567,13 +661,23 @@ mod tests {
     #[test]
     fn test_constants_usage() {
         init_error_metrics();
-        
+
         // Test using constants for type safety
         record_error(categories::JWT, jwt_types::EXPIRED);
         record_http_response(401, endpoint_groups::UNKNOWN);
-        
+
         // Verify constants work correctly
-        assert!(AUTH_SERVICE_ERRORS.with_label_values(&[categories::JWT, jwt_types::EXPIRED]).get() >= 1.0);
-        assert!(HTTP_RESPONSES.with_label_values(&["401", endpoint_groups::UNKNOWN]).get() >= 1.0);
+        assert!(
+            AUTH_SERVICE_ERRORS
+                .with_label_values(&[categories::JWT, jwt_types::EXPIRED])
+                .get()
+                >= 1.0
+        );
+        assert!(
+            HTTP_RESPONSES
+                .with_label_values(&["401", endpoint_groups::UNKNOWN])
+                .get()
+                >= 1.0
+        );
     }
 }

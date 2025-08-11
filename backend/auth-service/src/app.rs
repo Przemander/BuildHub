@@ -1,4 +1,4 @@
-//! Application router and state configuration for BuildHub Auth Service.
+//! # Application Router and State Configuration
 //!
 //! This module provides the core application structure and routing configuration:
 //!
@@ -9,51 +9,50 @@
 //! - **Monitoring**: Prometheus metrics endpoint for observability
 //! - **Maintainability**: Explicit routes with clear structure for easy maintenance
 //!
-//! # Architecture
-//!
-//! The application follows a layered architecture with:
-//!
-//! 1. Router-level concerns (CORS, shared state, etc.)
-//! 2. Route-specific middleware (auth, rate limiting)
-//! 3. Handler functions for business logic
-//! 4. Shared application state for services
-//!
-//! # Key Components
-//!
-//! - **`AppState`**: Shared state container for databases and services
-//! - **`build_app`**: Main function to construct the application with all routes
-//! - **Rate Limiting**: Per-route protection based on client IP
-//! - **CORS Configuration**: Safe defaults with explicit allowed origins
+//! The module follows a layered architecture with:
+//! - Router-level concerns (CORS, shared state)
+//! - Route-specific middleware (auth, rate limiting)
+//! - Handler functions for business logic
+//! - Shared application state for service dependencies
 
-use std::sync::Arc;
 use axum::{
-    http::{header::HeaderName, Method, StatusCode},
+    extract::State,
+    http::{header, HeaderName, HeaderValue, Method, StatusCode},
     middleware::from_fn_with_state,
+    response::IntoResponse,
     routing::{get, post},
-    Json, Router, response::IntoResponse,
+    Json, Router,
 };
 use redis::Client as RedisClient;
 use serde_json::json;
+use std::{env, sync::Arc, time::Duration};
+use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
-use tracing::Instrument; // ✅ ASYNC INSTRUMENTATION
+use tracing::Instrument;
 
 use crate::{
     config::database::DbPool,
     handlers::{
         activation::activate_account_handler,
+        debug::debug_routes,
         login::login_handler,
         logout::logout_handler,
         password_reset::{password_reset_confirm_handler, password_reset_request_handler},
         refresh::refresh_token_handler,
         register::register_handler,
-        debug::debug_routes,
     },
-    middleware::{jwt_auth, rate_limiter::{RateLimiterLayer, RateLimitConfig}},
-    middleware::login_checks::login_guard_middleware,
+    metricss::app_metrics::{
+        record_app_build_attempt, record_app_build_success, record_app_build_duration,
+    },
+    middleware::{
+        jwt_auth::jwt_auth_middleware,
+        login_checks::login_guard_middleware,
+        rate_limiter::{RateLimitConfig, RateLimiterLayer},
+        telemetry::telemetry_middleware,
+    },
     utils::email::EmailConfig,
-    utils::log_new::Log, // ✅ NOWY SYSTEM LOGOWANIA
-    utils::telemetry::business_operation_span, // ✅ OPENTELEMETRY SPANS
-    metricss::app_metrics::{record_app_build_attempt, record_app_build_success}, // ✅ METRICS
+    utils::log_new::Log,
+    utils::telemetry::business_operation_span,
 };
 
 /// Default rate limit window in seconds
@@ -85,10 +84,10 @@ const DEFAULT_DEV_ORIGINS: &[&str] = &[
 pub struct AppState {
     /// Database connection pool
     pub pool: DbPool,
-    
+
     /// Redis client for caching and rate limiting (optional)
     pub redis_client: Option<RedisClient>,
-    
+
     /// Email service configuration (optional)
     pub email_config: Option<EmailConfig>,
 }
@@ -106,66 +105,44 @@ pub struct AppState {
 async fn metrics_handler() -> impl IntoResponse {
     // Create span for metrics gathering
     let span = business_operation_span("gather_prometheus_metrics");
-    
+
     // Clone span for async instrumentation
     let span_clone = span.clone();
-    
+
     async move {
         Log::event(
             "DEBUG",
-            "Metrics Handler",
-            "Gathering Prometheus metrics for export",
-            "metrics_gather_start",
-            "metrics_handler"
+            "Metrics",
+            "Gathering Prometheus metrics",
+            "metrics_request",
+            "metrics_handler",
         );
-        
-        // Gather metrics with proper error handling
-        let metrics_result = std::panic::catch_unwind(|| {
-            crate::metricss::init_all_metrics();
-            // Return the actual metrics as a string
-            prometheus::TextEncoder::new()
-                .encode_to_string(&prometheus::gather())
-                .unwrap_or_else(|_| "# Metrics encoding failed\n".to_string())
-        });
-        
-        match metrics_result {
-            Ok(metrics) => {
-                span.record("metrics_size_bytes", &metrics.len());
-                span.record("result", &"success");
-                
-                Log::event(
-                    "DEBUG",
-                    "Metrics Handler",
-                    &format!("Successfully gathered {} bytes of metrics data", metrics.len()),
-                    "metrics_gather_success",
-                    "metrics_handler"
-                );
-                
-                (
-                    StatusCode::OK,
-                    [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
-                    metrics,
-                )
-            }
-            Err(e) => {
-                span.record("result", &"failure");
-                span.record("failure_reason", &"metrics_gather_panic");
-                
+
+        let metrics = prometheus::TextEncoder::new()
+            .encode_to_string(&prometheus::default_registry().gather())
+            .unwrap_or_else(|e| {
                 Log::event(
                     "ERROR",
-                    "Metrics Handler",
-                    &format!("Failed to gather metrics due to panic: {:?}", e),
-                    "metrics_gather_error",
-                    "metrics_handler"
+                    "Metrics",
+                    &format!("Failed to encode metrics: {}", e),
+                    "metrics_encoding_error",
+                    "metrics_handler",
                 );
-                
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    [(axum::http::header::CONTENT_TYPE, "text/plain")],
-                    "# Metrics temporarily unavailable\n".to_string(),
-                )
-            }
-        }
+                "# Error collecting metrics".to_string()
+            });
+
+        span.record("metrics_size", &metrics.len());
+        span.record("result", &"success");
+
+        // Return metrics with proper content type
+        (
+            StatusCode::OK,
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; version=0.0.4"),
+            )],
+            metrics,
+        )
     }
     .instrument(span_clone)
     .await
@@ -178,30 +155,22 @@ async fn metrics_handler() -> impl IntoResponse {
 async fn health_handler() -> impl IntoResponse {
     // Create span for health check
     let span = business_operation_span("health_check");
-    
+
     // Clone span for async instrumentation
     let span_clone = span.clone();
-    
+
     async move {
         Log::event(
             "DEBUG",
-            "Health Handler",
+            "Health",
             "Processing health check request",
-            "health_check_request",
-            "health_handler"
+            "health_check",
+            "health_handler",
         );
-        
+
         span.record("result", &"healthy");
-        
-        Log::event(
-            "DEBUG",
-            "Health Handler",
-            "Health check completed successfully",
-            "health_check_success",
-            "health_handler"
-        );
-        
-        "ok"
+
+        (StatusCode::OK, "ok")
     }
     .instrument(span_clone)
     .await
@@ -211,169 +180,74 @@ async fn health_handler() -> impl IntoResponse {
 ///
 /// This handler checks all service dependencies and returns detailed status
 /// information suitable for Kubernetes readiness probes.
-async fn readiness_handler(state: Arc<AppState>) -> impl IntoResponse {
+async fn readiness_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // Create span for readiness check
     let span = business_operation_span("readiness_check");
-    
-    // Clone span for async instrumentation
     let span_clone = span.clone();
-    
+
     async move {
         Log::event(
             "DEBUG",
-            "Readiness Handler",
-            "Starting comprehensive readiness check",
-            "readiness_check_start",
-            "readiness_handler"
+            "Readiness",
+            "Processing readiness check request",
+            "readiness_check",
+            "readiness_handler",
         );
-        
-        // Check database connectivity
-        let db_span = business_operation_span("check_database_readiness");
-        let db_ok = db_span.in_scope(|| {
-            match state.pool.get() {
-                Ok(_) => {
-                    Log::event(
-                        "DEBUG",
-                        "Readiness Handler",
-                        "Database connection check passed",
-                        "db_check_success",
-                        "readiness_handler"
-                    );
-                    true
-                }
-                Err(e) => {
-                    Log::event(
-                        "WARN",
-                        "Readiness Handler",
-                        &format!("Database connection check failed: {}", e),
-                        "db_check_failure",
-                        "readiness_handler"
-                    );
-                    false
-                }
-            }
-        });
-        
-        // Check Redis connectivity if configured
-        let redis_span = business_operation_span("check_redis_readiness");
-        let redis_ok = redis_span.in_scope(|| {
-            match state.redis_client.as_ref() {
-                Some(client) => {
-                    match client.get_connection() {
-                        Ok(_) => {
-                            Log::event(
-                                "DEBUG",
-                                "Readiness Handler",
-                                "Redis connection check passed",
-                                "redis_check_success",
-                                "readiness_handler"
-                            );
-                            true
-                        }
-                        Err(e) => {
-                            Log::event(
-                                "WARN",
-                                "Readiness Handler",
-                                &format!("Redis connection check failed: {}", e),
-                                "redis_check_failure",
-                                "readiness_handler"
-                            );
-                            false
-                        }
-                    }
-                }
-                None => {
-                    Log::event(
-                        "DEBUG",
-                        "Readiness Handler",
-                        "Redis not configured, skipping check",
-                        "redis_check_skipped",
-                        "readiness_handler"
-                    );
-                    true // Redis is optional
-                }
-            }
-        });
-        
+
+        // Check database connection
+        let db_status = crate::config::database::check_database_health(&state.pool).await;
+        let db_healthy = db_status.unwrap_or(false);
+
+        // Check Redis if available
+        let redis_healthy = match &state.redis_client {
+            Some(client) => crate::config::redis::check_redis_connection(client).await,
+            None => false,
+        };
+
         // Check email configuration
-        let email_span = business_operation_span("check_email_readiness");
-        let email_ok = email_span.in_scope(|| {
-            let configured = state.email_config.is_some();
-            
-            if configured {
-                Log::event(
-                    "DEBUG",
-                    "Readiness Handler",
-                    "Email configuration check passed",
-                    "email_check_success",
-                    "readiness_handler"
-                );
-            } else {
-                Log::event(
-                    "WARN",
-                    "Readiness Handler",
-                    "Email service not configured",
-                    "email_check_not_configured",
-                    "readiness_handler"
-                );
-            }
-            
-            configured
-        });
-        
+        let email_configured = state.email_config.is_some();
+
         // Calculate overall readiness
-        let ready = db_ok && redis_ok && email_ok;
-        let status_code = if ready { 200 } else { 503 };
-        
-        // Record span data
-        span.record("database_ready", &db_ok);
-        span.record("redis_ready", &redis_ok);
-        span.record("email_ready", &email_ok);
+        let ready = db_healthy && (redis_healthy || state.redis_client.is_none()) && email_configured;
+        let status_code = if ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        };
+
+        span.record("database_healthy", &db_healthy);
+        span.record("redis_healthy", &redis_healthy);
+        span.record("email_configured", &email_configured);
         span.record("overall_ready", &ready);
-        span.record("status_code", &status_code);
-        
+        span.record("status_code", &status_code.as_u16());
+
         if ready {
-            Log::event(
-                "INFO",
-                "Readiness Handler",
-                "All service dependencies are ready",
-                "readiness_check_success",
-                "readiness_handler"
-            );
             span.record("result", &"ready");
         } else {
-            Log::event(
-                "WARN",
-                "Readiness Handler",
-                "One or more service dependencies are not ready",
-                "readiness_check_failure",
-                "readiness_handler"
-            );
             span.record("result", &"not_ready");
         }
-        
-        // Return detailed status
-        (
-            StatusCode::from_u16(status_code).unwrap(),
-            Json(json!({
-                "status": if ready { "ready" } else { "not ready" },
-                "components": {
-                    "database": {
-                        "status": if db_ok { "ready" } else { "not ready" },
-                        "required": true
-                    },
-                    "redis": {
-                        "status": if redis_ok { "ready" } else { "not ready" },
-                        "required": false
-                    },
-                    "email": {
-                        "status": if email_ok { "ready" } else { "not ready" },
-                        "required": true
-                    }
+
+        // Build status response
+        let status = json!({
+            "status": if ready { "ready" } else { "not_ready" },
+            "components": {
+                "database": {
+                    "status": if db_healthy { "ready" } else { "not_ready" },
+                    "required": true
                 },
-                "timestamp": chrono::Utc::now().to_rfc3339()
-            })),
-        )
+                "redis": {
+                    "status": if redis_healthy { "ready" } else { "not_ready" },
+                    "required": false
+                },
+                "email": {
+                    "status": if email_configured { "ready" } else { "not_ready" },
+                    "required": true
+                }
+            },
+            "timestamp": chrono::Utc::now().to_rfc3339()
+        });
+
+        (status_code, Json(status))
     }
     .instrument(span_clone)
     .await
@@ -386,50 +260,38 @@ async fn readiness_handler(state: Arc<AppState>) -> impl IntoResponse {
 async fn service_info_handler() -> impl IntoResponse {
     // Create span for service info
     let span = business_operation_span("service_info");
-    
-    // Clone span for async instrumentation  
+
+    // Clone span for async instrumentation
     let span_clone = span.clone();
-    
+
     async move {
         Log::event(
             "DEBUG",
-            "Service Info Handler",
+            "Service Info",
             "Providing service information",
             "service_info_request",
-            "service_info_handler"
+            "service_info_handler",
         );
-        
+
         let info = json!({
-            "service": "BuildHub Authentication Service",
+            "service": "auth-service",
             "version": env!("CARGO_PKG_VERSION"),
-            "status": "running",
             "features": {
-                "authentication": true,
-                "rate_limiting": true,
-                "email_notifications": true,
+                "jwt": true,
+                "redis": true,
+                "email": true,
                 "metrics": true,
-                "health_checks": true
+                "rate_limiting": true
             },
-            "endpoints": {
-                "health": "/health",
-                "readiness": "/ready", 
-                "metrics": "/metrics",
-                "auth": "/auth/*"
-            }
+            "documentation": "/docs",
+            "git_commit": option_env!("GIT_COMMIT_HASH").unwrap_or("unknown"),
+            "build_time": option_env!("BUILD_TIME").unwrap_or("unknown")
         });
-        
+
         span.record("service_version", &env!("CARGO_PKG_VERSION"));
         span.record("result", &"success");
-        
-        Log::event(
-            "DEBUG",
-            "Service Info Handler",
-            &format!("Served service info for version {}", env!("CARGO_PKG_VERSION")),
-            "service_info_success",
-            "service_info_handler"
-        );
-        
-        Json(info)
+
+        (StatusCode::OK, Json(info))
     }
     .instrument(span_clone)
     .await
@@ -439,57 +301,82 @@ async fn service_info_handler() -> impl IntoResponse {
 ///
 /// Creates a rate limiter layer that uses Redis for distributed rate limiting
 /// across multiple service instances.
+///
+/// # Arguments
+///
+/// * `redis_client` - Optional Redis client for rate limiting storage
+///
+/// # Returns
+///
+/// * `Some(RateLimiterLayer)` - If Redis is available
+/// * `None` - If Redis is unavailable (disabling rate limiting)
 fn configure_rate_limiter(redis_client: Option<&RedisClient>) -> Option<RateLimiterLayer> {
     // Create span for rate limiter configuration
     let span = business_operation_span("configure_rate_limiter");
-    
+
     span.in_scope(|| {
-        match redis_client {
-            Some(client) => {
-                Log::event(
-                    "INFO",
-                    "Rate Limiter",
-                    &format!("Configuring Redis-backed rate limiter (max: {}, window: {}s)", 
-                        DEFAULT_RATE_LIMIT_MAX_ATTEMPTS, DEFAULT_RATE_LIMIT_WINDOW_SECS),
-                    "rate_limiter_redis_config",
-                    "configure_rate_limiter"
-                );
-                
-                span.record("rate_limiter_type", &"redis");
-                span.record("max_attempts", &DEFAULT_RATE_LIMIT_MAX_ATTEMPTS);
-                span.record("window_seconds", &DEFAULT_RATE_LIMIT_WINDOW_SECS);
-                
-                Some(RateLimiterLayer {
-                    redis: Arc::new(client.clone()),
-                    max_attempts: DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-                    window_secs: DEFAULT_RATE_LIMIT_WINDOW_SECS,
-                    key_fn: Arc::new(|req: &axum::http::Request<axum::body::Body>| {
-                        // Extract client IP from forwarded header or use "unknown"
-                        let ip = req
-                            .headers()
-                            .get("x-forwarded-for")
-                            .and_then(|v| v.to_str().ok())
-                            .unwrap_or("unknown");
-                        
-                        // Create route+IP specific rate limit key
-                        format!("rate:{}:ip:{}", req.uri().path(), ip)
-                    }),
-                    config: RateLimitConfig::default(),
-                })
-            }
+        let redis_client = match redis_client {
+            Some(client) => client,
             None => {
                 Log::event(
                     "WARN",
                     "Rate Limiter",
-                    "Redis not available, rate limiting will be disabled",
-                    "rate_limiter_disabled",
-                    "configure_rate_limiter"
+                    "Redis unavailable; rate limiting disabled",
+                    "redis_unavailable",
+                    "configure_rate_limiter",
                 );
-                
-                span.record("rate_limiter_type", &"disabled");
-                None
+                span.record("rate_limiter_enabled", &false);
+                return None;
             }
-        }
+        };
+
+        // Read rate limit settings from environment or use defaults
+        let window_secs = env::var("RATE_LIMIT_WINDOW_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_RATE_LIMIT_WINDOW_SECS);
+
+        let max_attempts = env::var("RATE_LIMIT_MAX_ATTEMPTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_RATE_LIMIT_MAX_ATTEMPTS);
+
+        span.record("rate_limiter_enabled", &true);
+        span.record("window_secs", &window_secs);
+        span.record("max_attempts", &max_attempts);
+
+        Log::event(
+            "INFO",
+            "Rate Limiter",
+            &format!("Configuring rate limiter: {} attempts per {}s", max_attempts, window_secs),
+            "rate_limiter_configured",
+            "configure_rate_limiter",
+        );
+
+        // Configure rate limiter with Redis backend
+        Some(RateLimiterLayer {
+            redis: Arc::new(redis_client.clone()),
+            max_attempts,
+            window_secs,
+            key_fn: Arc::new(move |req| {
+                // Create key from IP address and path
+                let ip = req
+                    .headers()
+                    .get("X-Forwarded-For")
+                    .and_then(|h| h.to_str().ok())
+                    .unwrap_or("unknown")
+                    .split(',')
+                    .next()
+                    .unwrap_or("unknown");
+
+                let path = req.uri().path();
+                format!("ratelimit:{}:{}", ip, path)
+            }),
+            config: RateLimitConfig {
+                message: Some("Rate limit exceeded. Please try again later.".to_string()),
+                retry_after: Some(window_secs as u64),
+            },
+        })
     })
 }
 
@@ -497,92 +384,99 @@ fn configure_rate_limiter(redis_client: Option<&RedisClient>) -> Option<RateLimi
 ///
 /// Sets up Cross-Origin Resource Sharing with appropriate headers and origins
 /// based on the deployment environment.
+///
+/// # Returns
+///
+/// A configured CorsLayer ready to be applied to the router
 fn configure_cors() -> CorsLayer {
     // Create span for CORS configuration
     let span = business_operation_span("configure_cors");
-    
+
     span.in_scope(|| {
-        let app_env = std::env::var("APP_ENV").unwrap_or_else(|_| "development".to_string());
-        
-        Log::event(
-            "INFO",
-            "CORS Configuration",
-            &format!("Configuring CORS for environment: {}", app_env),
-            "cors_config_start",
-            "configure_cors"
-        );
-        
-        // Define allowed CORS headers
-        let allowed_headers = vec![
-            HeaderName::from_static("content-type"),
-            HeaderName::from_static("authorization"),
-            HeaderName::from_static("accept"),
-            HeaderName::from_static("x-requested-with"),
-            HeaderName::from_static("x-forwarded-for"),
-        ];
-        
-        // Define allowed CORS methods
-        let allowed_methods = vec![
-            Method::GET,
-            Method::POST,
-            Method::PUT,
-            Method::DELETE,
-            Method::OPTIONS,
-        ];
-        
-        // Configure origins based on environment
-        let cors_layer = if app_env == "production" {
-            // In production, use environment variable for allowed origins
-            let origins_env = std::env::var("CORS_ALLOWED_ORIGINS")
-                .unwrap_or_else(|_| "https://app.buildhub.com".to_string());
-            
-            let origins: Vec<_> = origins_env
-                .split(',')
-                .filter_map(|origin| origin.trim().parse().ok())
-                .collect();
-            
-            span.record("cors_mode", &"production");
-            span.record("origins_count", &origins.len());
-            
+        // Determine if we're in production or development
+        let app_env = env::var("APP_ENV").unwrap_or_else(|_| "development".to_string());
+        let is_production = app_env == "production";
+
+        let cors_layer = if is_production {
+            // Production: Use explicit origins from environment
+            let allowed_origins = env::var("CORS_ALLOWED_ORIGINS")
+                .map(|origins| origins.split(',').map(String::from).collect::<Vec<_>>())
+                .unwrap_or_else(|_| vec!["https://buildhub.example.com".to_string()]);
+
+            span.record("environment", &"production");
+            span.record("origins_count", &allowed_origins.len());
+
             Log::event(
                 "INFO",
-                "CORS Configuration",
-                &format!("Production CORS configured with {} origins", origins.len()),
-                "cors_production_config",
-                "configure_cors"
+                "CORS",
+                &format!("Configuring CORS for production with {} origins", allowed_origins.len()),
+                "cors_production",
+                "configure_cors",
             );
-            
+
+            // Create production CORS with explicit origins and restricted methods
             CorsLayer::new()
-                .allow_origin(origins)
-                .allow_methods(allowed_methods)
-                .allow_headers(allowed_headers)
+                .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+                .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
                 .allow_credentials(true)
+                .expose_headers([
+                    HeaderName::from_static("x-rate-limit-remaining"),
+                    HeaderName::from_static("x-rate-limit-reset"),
+                ])
+                .max_age(Duration::from_secs(3600))
+                .allow_origin(
+                    allowed_origins
+                        .into_iter()
+                        .filter_map(|origin| {
+                            origin.parse::<HeaderValue>().ok().or_else(|| {
+                                Log::event(
+                                    "WARN",
+                                    "CORS",
+                                    &format!("Invalid origin: {}", origin),
+                                    "invalid_origin",
+                                    "configure_cors",
+                                );
+                                None
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                )
         } else {
-            // Development mode with permissive defaults
-            let origins: Vec<_> = DEFAULT_DEV_ORIGINS
-                .iter()
-                .filter_map(|&origin| origin.parse().ok())
-                .collect();
-            
-            span.record("cors_mode", &"development");
-            span.record("origins_count", &origins.len());
-            
+            // Development: Allow default development origins
+            span.record("environment", &"development");
+            span.record("origins_count", &DEFAULT_DEV_ORIGINS.len());
+
             Log::event(
                 "INFO",
-                "CORS Configuration",
-                &format!("Development CORS configured with {} default origins", origins.len()),
-                "cors_development_config",
-                "configure_cors"
+                "CORS",
+                "Configuring CORS for development (permissive)",
+                "cors_development",
+                "configure_cors",
             );
-            
+
+            // Create development CORS with permissive settings, but enumerate headers when using credentials
             CorsLayer::new()
-                .allow_origin(origins)
-                .allow_methods(allowed_methods)
-                .allow_headers(allowed_headers)
+                .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
+                .allow_headers([
+                    header::AUTHORIZATION,
+                    header::CONTENT_TYPE,
+                    HeaderName::from_static("x-requested-with"),
+                    HeaderName::from_static("x-csrf-token"),
+                ])
                 .allow_credentials(true)
+                .expose_headers([
+                    HeaderName::from_static("x-rate-limit-remaining"),
+                    HeaderName::from_static("x-rate-limit-reset"),
+                ])
+                .max_age(Duration::from_secs(3600))
+                .allow_origin(
+                    DEFAULT_DEV_ORIGINS
+                        .iter()
+                        .filter_map(|&origin| origin.parse::<HeaderValue>().ok())
+                        .collect::<Vec<_>>(),
+                )
         };
-        
-        span.record("result", &"success");
+
         cors_layer
     })
 }
@@ -612,174 +506,145 @@ pub async fn build_app(
 ) -> Router {
     // Create main build span
     let span = business_operation_span("build_axum_application");
-    
+
     // Clone span for async instrumentation
     let span_clone = span.clone();
-    
+
     // Record build attempt
     record_app_build_attempt();
-    
+    let start_time = std::time::Instant::now();
+
     async move {
-        Log::event(
-            "INFO",
-            "Application Builder",
-            "Starting Axum application construction",
-            "app_build_start",
-            "build_app"
-        );
-        
         // Create shared application state
-        let state_span = business_operation_span("create_app_state");
-        let state = state_span.in_scope(|| {
-            Log::event(
-                "DEBUG",
-                "Application Builder",
-                "Creating shared application state",
-                "app_state_create",
-                "build_app"
-            );
-            
-            Arc::new(AppState {
-                pool,
-                redis_client: redis_client.clone(),
-                email_config,
-            })
+        let state = Arc::new(AppState {
+            pool,
+            redis_client: redis_client.clone(),
+            email_config,
         });
-        
-        span.record("redis_enabled", &redis_client.is_some());
-        span.record("email_enabled", &state.email_config.is_some());
-        
-        // Configure rate limiter
-        let rate_limiter_span = business_operation_span("configure_rate_limiter");
-        let rate_limiter = rate_limiter_span.in_scope(|| {
-            configure_rate_limiter(redis_client.as_ref())
-        });
-        
+
+        // Configure rate limiter if Redis is available
+        let rate_limiter = configure_rate_limiter(redis_client.as_ref());
+
         // Configure CORS
-        let cors_span = business_operation_span("configure_cors");
-        let cors_layer = cors_span.in_scope(|| {
-            configure_cors()
-        });
-        
-        // Build routes with instrumentation
-        let routes_span = business_operation_span("build_routes");
-        let app = routes_span.in_scope(|| {
-            Log::event(
-                "DEBUG",
-                "Application Builder",
-                "Building route definitions",
-                "routes_build_start",
-                "build_app"
-            );
+        let cors_layer = configure_cors();
+
+        // Configure telemetry middleware
+        let telemetry_layer = from_fn_with_state(state.clone(), telemetry_middleware);
+
+        // Build routes
+        let mut app = Router::new()
+            // Public health routes (no authentication or rate limiting)
+            .route("/health", get(health_handler))
+            .route("/readiness", get(readiness_handler))
+            .route("/metrics", get(metrics_handler))
+            .route("/info", get(service_info_handler));
             
-            let mut router = Router::new()
-                // Root route - service information
-                .route("/", get(service_info_handler))
-                
-                // Registration endpoint with rate limiting
+        // Authentication routes with appropriate middleware
+        if let Some(limiter) = rate_limiter.clone() {
+            app = app
+                .route(
+                    "/auth/login",
+                    post(login_handler)
+                        .layer(ServiceBuilder::new().layer(limiter.clone()).into_inner())
+                        .layer(from_fn_with_state(state.clone(), login_guard_middleware)),
+                )
                 .route(
                     "/auth/register",
                     post(register_handler)
-                        .layer(rate_limiter.clone().unwrap_or_default()),
+                        .layer(ServiceBuilder::new().layer(limiter.clone()).into_inner()),
                 )
-                
-                // Login endpoint with login check middleware
+                .route(
+                    "/auth/password-reset/request",
+                    post(password_reset_request_handler)
+                        .layer(ServiceBuilder::new().layer(limiter.clone()).into_inner()),
+                )
+                .route(
+                    "/auth/password-reset/confirm",
+                    post(password_reset_confirm_handler)
+                        .layer(ServiceBuilder::new().layer(limiter.clone()).into_inner()),
+                )
+                .route(
+                    "/auth/refresh",
+                    post(refresh_token_handler)
+                        .layer(ServiceBuilder::new().layer(limiter.clone()).into_inner()),
+                )
+                .route(
+                    "/auth/logout",
+                    post(logout_handler)
+                        .layer(ServiceBuilder::new().layer(limiter).into_inner()),
+                );
+        } else {
+            // Routes without rate limiting when Redis is unavailable
+            app = app
                 .route(
                     "/auth/login",
                     post(login_handler)
                         .layer(from_fn_with_state(state.clone(), login_guard_middleware)),
                 )
-                
-                // Token refresh endpoint with rate limiting
-                .route(
-                    "/auth/refresh",
-                    post(refresh_token_handler)
-                        .layer(rate_limiter.clone().unwrap_or_default()),
-                )
-                
-                // Account activation endpoint
-                .route("/auth/activate", get(activate_account_handler))
-                
-                // Password reset request with rate limiting
-                .route(
-                    "/auth/password-reset/request",
-                    post(password_reset_request_handler)
-                        .layer(rate_limiter.clone().unwrap_or_default()),
-                )
-                
-                // Password reset confirmation with rate limiting
-                .route(
-                    "/auth/password-reset/confirm",
-                    post(password_reset_confirm_handler)
-                        .layer(rate_limiter.clone().unwrap_or_default()),
-                )
-                
-                // Logout endpoint with JWT authentication required
-                .route(
-                    "/auth/logout",
-                    post(logout_handler)
-                        .layer(from_fn_with_state(state.clone(), jwt_auth::jwt_auth_middleware)),
-                )
-                
-                // Health check endpoint - simple alive check
-                .route("/health", get(health_handler))
-                
-                // Prometheus metrics endpoint
-                .route("/metrics", get(metrics_handler))
-                
-                // Readiness check with detailed component status
-                .route("/ready", get({
-                    let state = state.clone();
-                    move || readiness_handler(state)
-                }));
-            
-            // Add debug routes in non-production environments
-            let app_env = std::env::var("APP_ENV").unwrap_or_else(|_| "development".to_string());
-            if app_env != "production" {
-                Log::event(
-                    "INFO",
-                    "Application Builder",
-                    "Adding debug routes (non-production environment)",
-                    "debug_routes_added",
-                    "build_app"
-                );
-                
-                router = router.nest("/debug", debug_routes());
-                span.record("debug_routes_enabled", &true);
-            } else {
-                span.record("debug_routes_enabled", &false);
-            }
-            
-            router
-        });
+                .route("/auth/register", post(register_handler))
+                .route("/auth/password-reset/request", post(password_reset_request_handler))
+                .route("/auth/password-reset/confirm", post(password_reset_confirm_handler))
+                .route("/auth/refresh", post(refresh_token_handler))
+                .route("/auth/logout", post(logout_handler));
+        }
         
-        // Add shared state and CORS layer
-        let final_app_span = business_operation_span("finalize_app");
-        let final_app = final_app_span.in_scope(|| {
-            Log::event(
-                "DEBUG",
-                "Application Builder",
-                "Applying state and CORS middleware",
-                "app_finalize",
-                "build_app"
+        // Add remaining routes
+        app = app
+            .route("/auth/activate", get(activate_account_handler))
+            .route(
+                "/auth/protected",
+                get(|| async { "Protected resource" })
+                    .layer(from_fn_with_state(state.clone(), jwt_auth_middleware)),
             );
-            
-            app.with_state(state.clone()).layer(cors_layer)
-        });
-        
-        // Record successful build
+
+        // Add debug routes in non-production environments
+        let app_env = env::var("APP_ENV").unwrap_or_else(|_| "development".to_string());
+        if app_env != "production" {
+            span.record("debug_routes_enabled", &true);
+            app = app.nest("/debug", debug_routes());
+
+            Log::event(
+                "INFO",
+                "Application Builder",
+                "Debug routes enabled in non-production environment",
+                "debug_routes_enabled",
+                "build_app",
+            );
+        } else {
+            span.record("debug_routes_enabled", &false);
+
+            Log::event(
+                "INFO",
+                "Application Builder",
+                "Debug routes disabled in production environment",
+                "debug_routes_disabled",
+                "build_app",
+            );
+        }
+
+        // Add global middleware and state
+        let final_app = app
+            .with_state(state)
+            .layer(telemetry_layer)       // apply telemetry before CORS to keep Body=axum::body::Body
+            .layer(cors_layer);            // keep CORS
+
+        // Record successful build and metrics
+        let duration = start_time.elapsed().as_secs_f64();
         record_app_build_success();
+        record_app_build_duration(duration);
+
         span.record("result", &"success");
-        span.record("total_routes", &8); // Update if routes change
-        
+        span.record("duration_seconds", &duration);
+        span.record("total_routes", &11); // Update if routes change
+
         Log::event(
             "INFO",
             "Application Builder",
             "Axum application construction completed successfully",
             "app_build_success",
-            "build_app"
+            "build_app",
         );
-        
+
         final_app
     }
     .instrument(span_clone)
@@ -794,29 +659,30 @@ impl Default for RateLimiterLayer {
     fn default() -> Self {
         // Create span for default rate limiter
         let span = business_operation_span("create_default_rate_limiter");
-        
+
         span.in_scope(|| {
             Log::event(
                 "WARN",
                 "Rate Limiter",
-                "Creating no-op rate limiter (Redis unavailable)",
-                "rate_limiter_noop_created",
-                "RateLimiterLayer::default"
+                "Creating default (no-op) rate limiter due to missing Redis",
+                "default_rate_limiter",
+                "RateLimiterLayer::default",
             );
-            
+
             span.record("rate_limiter_type", &"noop");
             span.record("max_attempts", &u32::MAX);
-            
+
             RateLimiterLayer {
-                // Placeholder Redis client that won't actually be used
-                redis: Arc::new(RedisClient::open("redis://127.0.0.1/").expect("placeholder Redis")),
-                // Set maximum attempts to u32::MAX to effectively disable limiting
-                max_attempts: u32::MAX,
-                // Minimal window size since it won't be used
+                redis: Arc::new(
+                    RedisClient::open("redis://localhost/").unwrap_or_else(|_| {
+                        // This is a dummy client that will never be used
+                        RedisClient::open("redis://localhost/")
+                            .expect("Failed to create dummy Redis client")
+                    }),
+                ),
+                max_attempts: u32::MAX, // Allow unlimited attempts
                 window_secs: 1,
-                // Return same key for all requests to ensure no limiting
-                key_fn: Arc::new(|_| "noop".to_string()),
-                // Default configuration
+                key_fn: Arc::new(|_| "dummy".to_string()), // Dummy key function
                 config: RateLimitConfig::default(),
             }
         })
@@ -827,63 +693,66 @@ impl Default for RateLimiterLayer {
 mod tests {
     use super::*;
     use crate::config::database::init_pool;
+    use axum::http::StatusCode;
     use std::env;
-    
+
     #[tokio::test]
     async fn test_build_app_without_redis() {
         // Set up test environment
         env::set_var("DATABASE_URL", "sqlite::memory:");
-        
+
         let pool = init_pool();
         let app = build_app(pool, None, None).await;
-        
-        // Verify the app is created successfully - fix the test
-        // The Router doesn't have an is_empty method, we just check it builds
+
+        // Verify the app is created successfully
         let _service = app.into_make_service();
         // If we get here without panic, the test passes
     }
-    
+
     #[tokio::test]
     async fn test_service_info_handler() {
         let response = service_info_handler().await;
         let json_response = response.into_response();
         assert_eq!(json_response.status(), StatusCode::OK);
     }
-    
+
     #[tokio::test]
     async fn test_health_handler() {
         let response = health_handler().await;
         let text_response = response.into_response();
         assert_eq!(text_response.status(), StatusCode::OK);
     }
-    
+
     #[tokio::test]
     async fn test_metrics_handler() {
         let response = metrics_handler().await;
         let metrics_response = response.into_response();
         assert_eq!(metrics_response.status(), StatusCode::OK);
     }
-    
+
     #[test]
     fn test_configure_cors_development() {
         env::set_var("APP_ENV", "development");
-        let cors_layer = configure_cors();
+        let _cors_layer = configure_cors();
         // CORS layer is configured, but we can't easily test its internals
         // This test mainly ensures no panics occur during configuration
     }
-    
+
     #[test]
     fn test_configure_cors_production() {
         env::set_var("APP_ENV", "production");
-        env::set_var("CORS_ALLOWED_ORIGINS", "https://example.com,https://api.example.com");
-        let cors_layer = configure_cors();
+        env::set_var(
+            "CORS_ALLOWED_ORIGINS",
+            "https://example.com,https://api.example.com",
+        );
+        let _cors_layer = configure_cors();
         // CORS layer is configured, but we can't easily test its internals
         // This test mainly ensures no panics occur during configuration
-        
+
         // Clean up
         env::remove_var("CORS_ALLOWED_ORIGINS");
     }
-    
+
     #[test]
     fn test_rate_limiter_default() {
         let default_limiter = RateLimiterLayer::default();

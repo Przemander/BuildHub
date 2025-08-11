@@ -58,15 +58,22 @@ use tracing::Instrument;
 use crate::config::redis::store_password_reset_token;
 use crate::{
     config::redis::store_activation_code,
+    metricss::email_metrics::{
+        email_types,
+        failure_types,
+        record_activation_failure,
+        record_activation_failure_detailed,
+        // Business helper functions
+        record_activation_success,
+        // Core API functions
+        record_email_failure,
+        record_password_reset_failure,
+        record_password_reset_failure_detailed,
+        record_password_reset_success,
+        time_email_processing,
+    },
     utils::error_new::AuthServiceError,
     utils::log_new::Log,
-    metricss::email_metrics::{
-        // Core API functions
-        record_email_failure, time_email_processing, email_types, failure_types,
-        // Business helper functions
-        record_activation_success, record_activation_failure, record_activation_failure_detailed,
-        record_password_reset_success, record_password_reset_failure, record_password_reset_failure_detailed,
-    },
 };
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
@@ -111,7 +118,7 @@ impl EmailConfig {
     pub fn new() -> Result<Self, AuthServiceError> {
         // Create span for email service initialization
         let span = business_operation_span("init_email_service");
-        
+
         // Use the span to wrap the initialization logic
         span.in_scope(|| {
             Log::event(
@@ -119,9 +126,9 @@ impl EmailConfig {
                 "Email Configuration",
                 "Initializing email service",
                 "attempt",
-                "EmailConfig::new"
+                "EmailConfig::new",
             );
-            
+
             // Test mode: Use mock SMTP configuration for development and testing
             if Self::is_test_mode() {
                 Log::event(
@@ -129,12 +136,12 @@ impl EmailConfig {
                     "Email Configuration",
                     "Running in TEST_MODE - emails will be logged but not sent",
                     "info",
-                    "EmailConfig::new"
+                    "EmailConfig::new",
                 );
-                
+
                 span.record("test_mode", &true);
                 span.record("result", &"success");
-                
+
                 return Ok(Self {
                     from_address: "test@example.com".into(),
                     mailer: SmtpTransport::builder_dangerous("localhost")
@@ -142,9 +149,9 @@ impl EmailConfig {
                         .build(),
                 });
             }
-            
+
             span.record("test_mode", &false);
-            
+
             // Production mode: Configure real SMTP transport
             let smtp_server = match Self::get_required_env_var("SMTP_SERVER") {
                 Ok(server) => server,
@@ -154,7 +161,7 @@ impl EmailConfig {
                     return Err(e);
                 }
             };
-            
+
             let smtp_username = match Self::get_required_env_var("SMTP_USERNAME") {
                 Ok(username) => username,
                 Err(e) => {
@@ -163,7 +170,7 @@ impl EmailConfig {
                     return Err(e);
                 }
             };
-            
+
             let smtp_password = match Self::get_required_env_var("SMTP_PASSWORD") {
                 Ok(password) => password,
                 Err(e) => {
@@ -175,10 +182,10 @@ impl EmailConfig {
 
             let from_address = env::var("SMTP_FROM_ADDRESS")
                 .unwrap_or_else(|_| "no-reply@example.com".to_string());
-            
+
             span.record("smtp_server", &smtp_server);
             span.record("from_address", &from_address);
-            
+
             let credentials = Credentials::new(smtp_username, smtp_password);
             let mailer = SmtpTransport::relay(&smtp_server)
                 .map_err(|e| {
@@ -187,7 +194,7 @@ impl EmailConfig {
                         "Email Configuration",
                         &format!("SMTP transport creation failed: {}", e),
                         "failure",
-                        "EmailConfig::new"
+                        "EmailConfig::new",
                     );
                     record_email_failure(failure_types::CONFIGURATION, email_types::ACTIVATION);
                     span.record("result", &"failure");
@@ -204,13 +211,16 @@ impl EmailConfig {
                 "Email Configuration",
                 "SMTP transport configured successfully",
                 "success",
-                "EmailConfig::new"
+                "EmailConfig::new",
             );
-            
+
             span.record("result", &"success");
             span.record("timeout_seconds", &10);
 
-            Ok(Self { from_address, mailer })
+            Ok(Self {
+                from_address,
+                mailer,
+            })
         })
     }
 
@@ -222,7 +232,7 @@ impl EmailConfig {
                 "Email Configuration",
                 &format!("{} variable missing", name),
                 "failure",
-                "get_required_env_var"
+                "get_required_env_var",
             );
             record_email_failure(failure_types::CONFIGURATION, email_types::ACTIVATION);
             AuthServiceError::configuration(&format!("{} must be set", name))
@@ -264,19 +274,22 @@ impl EmailConfig {
     ) -> Result<(), AuthServiceError> {
         // Create span for activation email
         let span = business_operation_span("send_activation_email");
-        span.record("email_domain", &to_email.split('@').nth(1).unwrap_or("invalid"));
+        span.record(
+            "email_domain",
+            &to_email.split('@').nth(1).unwrap_or("invalid"),
+        );
         span.record("code_length", &activation_code.len());
-        
+
         // Clone span before moving it into async operation
         let span_clone = span.clone();
-        
+
         // Use timer API to measure operation time
         let _timer = time_email_processing(email_types::ACTIVATION);
-        
+
         // Wrap the email operation in the span
         async move {
             let activation_link = generate_activation_link(activation_code);
-            
+
             let email_body = format!(
                 "Hello,\n\n\
                  Welcome to BuildHub! To activate your account, click the link below:\n\n\
@@ -295,7 +308,7 @@ impl EmailConfig {
                     "Account Activation",
                     &format!("Failed to store activation code: {}", e),
                     "failure",
-                    "send_activation_email"
+                    "send_activation_email",
                 );
                 record_activation_failure_detailed(failure_types::TOKEN_STORAGE);
                 span.record("result", &"failure");
@@ -311,7 +324,7 @@ impl EmailConfig {
                     "Account Activation",
                     &format!("TEST MODE: Would send activation email to {}", to_email),
                     "success",
-                    "send_activation_email"
+                    "send_activation_email",
                 );
                 record_activation_success();
                 span.record("result", &"success");
@@ -320,12 +333,14 @@ impl EmailConfig {
             }
 
             // Production mode: Build and send email
-            let result = self.send_email_message(
-                to_email,
-                "Activate Your BuildHub Account",
-                &email_body,
-                email_types::ACTIVATION
-            ).await;
+            let result = self
+                .send_email_message(
+                    to_email,
+                    "Activate Your BuildHub Account",
+                    &email_body,
+                    email_types::ACTIVATION,
+                )
+                .await;
 
             match result {
                 Ok(()) => {
@@ -345,7 +360,7 @@ impl EmailConfig {
         .instrument(span_clone)
         .await
     }
-    
+
     /// Internal helper to send an email message via SMTP
     ///
     /// This function handles the core email sending with comprehensive error handling
@@ -359,24 +374,26 @@ impl EmailConfig {
     ) -> Result<(), AuthServiceError> {
         // Create span for email sending
         let span = business_operation_span("send_email");
-        span.record("email_domain", &recipient.split('@').nth(1).unwrap_or("invalid"));
+        span.record(
+            "email_domain",
+            &recipient.split('@').nth(1).unwrap_or("invalid"),
+        );
         span.record("email_type", &email_type);
         span.record("subject_length", &subject.len());
         span.record("body_length", &body.len());
-        
+
         // Clone span before moving it into async operation
         let span_clone = span.clone();
-        
+
         // Wrap the email sending in the span
         async move {
             // Create child span for message building
             let build_span = business_operation_span("build_email_message");
             build_span.record("email_type", &email_type);
-            
+
             // Build email message within its own span
-            let email = build_span.in_scope(|| {
-                self.build_email_message(recipient, subject, body, email_type)
-            })?;
+            let email = build_span
+                .in_scope(|| self.build_email_message(recipient, subject, body, email_type))?;
 
             // Send via SMTP
             match self.mailer.send(&email) {
@@ -386,7 +403,7 @@ impl EmailConfig {
                         "Email Service",
                         &format!("{} email sent to {}", email_type, recipient),
                         "success",
-                        "send_email_message"
+                        "send_email_message",
                     );
                     span.record("result", &"success");
                     Ok(())
@@ -397,12 +414,14 @@ impl EmailConfig {
                         "Email Service",
                         &format!("Failed to send {} email: {}", email_type, e),
                         "failure",
-                        "send_email_message"
+                        "send_email_message",
                     );
-                    
+
                     // Enhanced SMTP error classification
                     let error_string = e.to_string().to_lowercase();
-                    let failure_type = if error_string.contains("connection") || error_string.contains("connect") {
+                    let failure_type = if error_string.contains("connection")
+                        || error_string.contains("connect")
+                    {
                         "smtp_connection"
                     } else if error_string.contains("auth") || error_string.contains("credential") {
                         "smtp_auth"
@@ -411,30 +430,33 @@ impl EmailConfig {
                     } else {
                         "smtp_unknown"
                     };
-                    
+
                     record_email_failure(failure_type, email_type);
                     span.record("result", &"failure");
                     span.record("failure_reason", &failure_type);
                     span.record_error(&e);
-                    
-                    Err(AuthServiceError::configuration(&format!("Failed to send {} email", email_type)))
+
+                    Err(AuthServiceError::configuration(&format!(
+                        "Failed to send {} email",
+                        email_type
+                    )))
                 }
             }
         }
         .instrument(span_clone)
         .await
     }
-    
+
     /// Builds an email message with proper error handling
     ///
     /// This function constructs a valid email message with sender, recipient,
     /// subject, and body, with appropriate error handling for each step.
     fn build_email_message(
-        &self, 
-        recipient: &str, 
-        subject: &str, 
+        &self,
+        recipient: &str,
+        subject: &str,
         body: &str,
-        email_type: &str
+        email_type: &str,
     ) -> Result<Message, AuthServiceError> {
         Message::builder()
             .from(self.from_address.parse().map_err(|e| {
@@ -443,7 +465,7 @@ impl EmailConfig {
                     "Email Building",
                     &format!("Invalid sender address '{}': {}", self.from_address, e),
                     "failure",
-                    "build_email_message"
+                    "build_email_message",
                 );
                 record_email_failure(failure_types::CONFIGURATION, email_type);
                 AuthServiceError::configuration("Invalid sender email address configuration")
@@ -454,7 +476,7 @@ impl EmailConfig {
                     "Email Building",
                     &format!("Invalid recipient address '{}': {}", recipient, e),
                     "failure",
-                    "build_email_message"
+                    "build_email_message",
                 );
                 record_email_failure(failure_types::INVALID_ADDRESS, email_type);
                 AuthServiceError::configuration("Invalid recipient email address")
@@ -467,7 +489,7 @@ impl EmailConfig {
                     "Email Building",
                     &format!("Failed to build email message: {}", e),
                     "failure",
-                    "build_email_message"
+                    "build_email_message",
                 );
                 record_email_failure(failure_types::CONFIGURATION, email_type);
                 AuthServiceError::configuration("Failed to build email message")
@@ -521,15 +543,18 @@ pub async fn send_password_reset_email(
 ) -> Result<(), AuthServiceError> {
     // Create span for password reset email
     let span = business_operation_span("send_password_reset_email");
-    span.record("email_domain", &to_email.split('@').nth(1).unwrap_or("invalid"));
+    span.record(
+        "email_domain",
+        &to_email.split('@').nth(1).unwrap_or("invalid"),
+    );
     span.record("token_length", &reset_token.len());
-    
+
     // Clone span before moving it into async operation
     let span_clone = span.clone();
-    
+
     // Use timer API to measure operation time
     let _timer = time_email_processing(email_types::PASSWORD_RESET);
-    
+
     // Wrap the email operation in the span
     async move {
         // Store reset token in Redis before sending email
@@ -625,11 +650,11 @@ pub fn generate_activation_link(activation_code: &str) -> String {
             "Account Activation",
             "No FRONTEND_URL env variable, using localhost",
             "warning",
-            "generate_activation_link"
+            "generate_activation_link",
         );
         "http://localhost:3000".to_string()
     });
-    
+
     format!("{}/auth/activate?code={}", frontend_url, activation_code)
 }
 
@@ -640,39 +665,42 @@ pub fn generate_activation_link(activation_code: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_generate_activation_link() {
         let code = "test-activation-code-123";
         std::env::set_var("FRONTEND_URL", "https://example.com");
-        
+
         let link = generate_activation_link(code);
-        assert_eq!(link, "https://example.com/auth/activate?code=test-activation-code-123");
+        assert_eq!(
+            link,
+            "https://example.com/auth/activate?code=test-activation-code-123"
+        );
     }
-    
+
     #[test]
     fn test_generate_activation_code() {
         let code1 = generate_activation_code();
         let code2 = generate_activation_code();
-        
+
         // Verify UUIDs are valid and unique
         assert_ne!(code1, code2, "Activation codes should be unique");
         assert_eq!(code1.len(), 36, "Should be a valid UUID string");
-        
+
         // Verify it's a valid UUID
         assert!(uuid::Uuid::parse_str(&code1).is_ok());
     }
-    
+
     #[test]
     fn test_is_test_mode() {
         // Test when TEST_MODE is not set
         std::env::remove_var("TEST_MODE");
         assert!(!EmailConfig::is_test_mode());
-        
+
         // Test when TEST_MODE=true
         std::env::set_var("TEST_MODE", "true");
         assert!(EmailConfig::is_test_mode());
-        
+
         // Test when TEST_MODE has other value
         std::env::set_var("TEST_MODE", "1");
         assert!(!EmailConfig::is_test_mode());

@@ -12,13 +12,10 @@
 //! - Prometheus metrics for monitoring
 //! - Structured error handling with context
 
+use crate::metricss::validation_metrics::{field_types, instrument_validation};
 use crate::utils::error_new::{AuthServiceError, ValidationError};
 use crate::utils::log_new::Log;
 use crate::utils::telemetry::business_operation_span;
-use crate::metricss::validation_metrics::{
-    instrument_validation,
-    field_types,
-};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use tracing_error::SpanTrace;
@@ -53,10 +50,8 @@ const MAX_TLD_LENGTH: usize = 63;
 // =============================================================================
 
 /// Username validation regex: 3-30 chars, alphanumeric + underscore/dash
-static USERNAME_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"^[a-zA-Z0-9_-]{3,30}$")
-        .expect("USERNAME regex compilation failed")
-});
+static USERNAME_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^[a-zA-Z0-9_-]{3,30}$").expect("USERNAME regex compilation failed"));
 
 /// RFC-compliant email validation regex
 static EMAIL_REGEX: Lazy<Regex> = Lazy::new(|| {
@@ -101,14 +96,14 @@ pub fn validate_username(username: &str) -> Result<(), AuthServiceError> {
     let span = business_operation_span("validate_username");
     span.record("field", &field_types::USERNAME);
     span.record("input_length", &username.len());
-    
+
     span.in_scope(|| {
         instrument_validation(field_types::USERNAME, || {
             // Check if empty
             if username.is_empty() {
                 span.record("result", &"failure");
                 span.record("failure_reason", &"missing");
-                
+
                 return Err(ValidationError::MissingField {
                     field: field_types::USERNAME.to_string(),
                     span: SpanTrace::capture(),
@@ -121,15 +116,19 @@ pub fn validate_username(username: &str) -> Result<(), AuthServiceError> {
                 Log::event(
                     "WARN",
                     "Validation",
-                    &format!("Username length {} exceeds maximum {}", username.len(), MAX_INPUT_LENGTH),
+                    &format!(
+                        "Username length {} exceeds maximum {}",
+                        username.len(),
+                        MAX_INPUT_LENGTH
+                    ),
                     "username_too_long",
                     "validate_username",
                 );
-                
+
                 span.record("result", &"failure");
                 span.record("failure_reason", &"too_long");
                 span.record("max_allowed_length", &MAX_INPUT_LENGTH);
-                
+
                 return Err(ValidationError::TooLong {
                     field: field_types::USERNAME.to_string(),
                     max_length: MAX_INPUT_LENGTH,
@@ -144,7 +143,7 @@ pub fn validate_username(username: &str) -> Result<(), AuthServiceError> {
             } else {
                 span.record("result", &"failure");
                 span.record("failure_reason", &"invalid_format");
-                
+
                 Err(ValidationError::InvalidValue {
                     field: field_types::USERNAME.to_string(),
                     message: USERNAME_ERROR.to_string(),
@@ -175,21 +174,21 @@ pub fn validate_email(email: &str) -> Result<(), AuthServiceError> {
     let span = business_operation_span("validate_email");
     span.record("field", &field_types::EMAIL);
     span.record("input_length", &email.len());
-    
+
     // Extract and record domain for observability (privacy-safe)
     if let Some(at_pos) = email.find('@') {
         if let Some(domain) = email.get(at_pos + 1..) {
             span.record("email_domain", &domain);
         }
     }
-    
+
     span.in_scope(|| {
         instrument_validation(field_types::EMAIL, || {
             // Check if empty
             if email.is_empty() {
                 span.record("result", &"failure");
                 span.record("failure_reason", &"missing");
-                
+
                 return Err(ValidationError::MissingField {
                     field: field_types::EMAIL.to_string(),
                     span: SpanTrace::capture(),
@@ -201,15 +200,19 @@ pub fn validate_email(email: &str) -> Result<(), AuthServiceError> {
                 Log::event(
                     "WARN",
                     "Validation",
-                    &format!("Email length {} exceeds RFC limit {}", email.len(), MAX_EMAIL_LENGTH),
+                    &format!(
+                        "Email length {} exceeds RFC limit {}",
+                        email.len(),
+                        MAX_EMAIL_LENGTH
+                    ),
                     "email_too_long",
                     "validate_email",
                 );
-                
+
                 span.record("result", &"failure");
                 span.record("failure_reason", &"too_long");
                 span.record("max_allowed_length", &MAX_EMAIL_LENGTH);
-                
+
                 return Err(ValidationError::TooLong {
                     field: field_types::EMAIL.to_string(),
                     max_length: MAX_EMAIL_LENGTH,
@@ -221,7 +224,7 @@ pub fn validate_email(email: &str) -> Result<(), AuthServiceError> {
             if !EMAIL_REGEX.is_match(email) {
                 span.record("result", &"failure");
                 span.record("failure_reason", &"invalid_format");
-                
+
                 return Err(ValidationError::InvalidValue {
                     field: field_types::EMAIL.to_string(),
                     message: EMAIL_ERROR.to_string(),
@@ -240,10 +243,10 @@ pub fn validate_email(email: &str) -> Result<(), AuthServiceError> {
                     "internal_validation_error",
                     "validate_email",
                 );
-                
+
                 span.record("result", &"failure");
                 span.record("failure_reason", &"internal_error");
-                
+
                 return Err(ValidationError::InvalidValue {
                     field: field_types::EMAIL.to_string(),
                     message: EMAIL_ERROR.to_string(),
@@ -252,12 +255,12 @@ pub fn validate_email(email: &str) -> Result<(), AuthServiceError> {
             }
 
             let domain = parts[1];
-            
+
             // Check for dot in domain
             if !domain.contains('.') {
                 span.record("result", &"failure");
                 span.record("failure_reason", &"missing_domain_dot");
-                
+
                 return Err(ValidationError::InvalidValue {
                     field: field_types::EMAIL.to_string(),
                     message: "Email domain must contain at least one dot".to_string(),
@@ -268,17 +271,16 @@ pub fn validate_email(email: &str) -> Result<(), AuthServiceError> {
             // Validate TLD length
             if let Some(tld) = domain.split('.').last() {
                 span.record("tld_length", &tld.len());
-                
+
                 if tld.len() < MIN_TLD_LENGTH || tld.len() > MAX_TLD_LENGTH {
                     span.record("result", &"failure");
                     span.record("failure_reason", &"invalid_tld_length");
-                    
+
                     return Err(ValidationError::InvalidValue {
                         field: field_types::EMAIL.to_string(),
                         message: format!(
-                            "Email domain extension must be {}-{} characters", 
-                            MIN_TLD_LENGTH, 
-                            MAX_TLD_LENGTH
+                            "Email domain extension must be {}-{} characters",
+                            MIN_TLD_LENGTH, MAX_TLD_LENGTH
                         ),
                         span: SpanTrace::capture(),
                     });
@@ -316,14 +318,14 @@ pub fn validate_password(password: &str) -> Result<(), AuthServiceError> {
     span.record("field", &field_types::PASSWORD);
     // Security: Only record length, never the actual password
     span.record("input_length", &password.len());
-    
+
     span.in_scope(|| {
         instrument_validation(field_types::PASSWORD, || {
             // Check if empty
             if password.is_empty() {
                 span.record("result", &"failure");
                 span.record("failure_reason", &"missing");
-                
+
                 return Err(ValidationError::MissingField {
                     field: field_types::PASSWORD.to_string(),
                     span: SpanTrace::capture(),
@@ -335,7 +337,7 @@ pub fn validate_password(password: &str) -> Result<(), AuthServiceError> {
                 span.record("result", &"failure");
                 span.record("failure_reason", &"too_short");
                 span.record("min_required_length", &MIN_PASSWORD_LENGTH);
-                
+
                 return Err(ValidationError::InvalidValue {
                     field: field_types::PASSWORD.to_string(),
                     message: PASSWORD_ERROR.to_string(),
@@ -348,27 +350,31 @@ pub fn validate_password(password: &str) -> Result<(), AuthServiceError> {
                 Log::event(
                     "WARN",
                     "Validation",
-                    &format!("Password length {} exceeds maximum {}", password.len(), MAX_PASSWORD_LENGTH),
+                    &format!(
+                        "Password length {} exceeds maximum {}",
+                        password.len(),
+                        MAX_PASSWORD_LENGTH
+                    ),
                     "password_too_long",
                     "validate_password",
                 );
-                
+
                 span.record("result", &"failure");
                 span.record("failure_reason", &"too_long");
                 span.record("max_allowed_length", &MAX_PASSWORD_LENGTH);
-                
+
                 return Err(ValidationError::TooLong {
                     field: field_types::PASSWORD.to_string(),
                     max_length: MAX_PASSWORD_LENGTH,
                     span: SpanTrace::capture(),
                 });
             }
-            
+
             // Check complexity requirements
             let has_letter = password.chars().any(|c| c.is_alphabetic());
             let has_number = password.chars().any(|c| c.is_numeric());
             let has_special = password.chars().any(|c| SPECIAL_CHARS.contains(c));
-            
+
             // Record complexity analysis (privacy-safe)
             span.record("has_letter", &has_letter);
             span.record("has_number", &has_number);
@@ -377,7 +383,7 @@ pub fn validate_password(password: &str) -> Result<(), AuthServiceError> {
             if !has_letter || !has_number || !has_special {
                 span.record("result", &"failure");
                 span.record("failure_reason", &"insufficient_complexity");
-                
+
                 return Err(ValidationError::InvalidValue {
                     field: field_types::PASSWORD.to_string(),
                     message: PASSWORD_ERROR.to_string(),
@@ -430,14 +436,14 @@ pub fn validate_generic_field(
     span.record("min_length", &min_length);
     span.record("max_length", &max_length);
     span.record("has_regex", &regex.is_some());
-    
+
     span.in_scope(|| {
         instrument_validation(field_name, || {
             // Check if empty when required
             if value.is_empty() && min_length > 0 {
                 span.record("result", &"failure");
                 span.record("failure_reason", &"missing");
-                
+
                 return Err(ValidationError::MissingField {
                     field: field_name.to_string(),
                     span: SpanTrace::capture(),
@@ -448,13 +454,12 @@ pub fn validate_generic_field(
             if value.len() < min_length {
                 span.record("result", &"failure");
                 span.record("failure_reason", &"too_short");
-                
+
                 return Err(ValidationError::InvalidValue {
                     field: field_name.to_string(),
                     message: format!(
-                        "{} must be at least {} characters long", 
-                        field_name, 
-                        min_length
+                        "{} must be at least {} characters long",
+                        field_name, min_length
                     ),
                     span: SpanTrace::capture(),
                 });
@@ -464,7 +469,7 @@ pub fn validate_generic_field(
             if value.len() > max_length {
                 span.record("result", &"failure");
                 span.record("failure_reason", &"too_long");
-                
+
                 return Err(ValidationError::TooLong {
                     field: field_name.to_string(),
                     max_length,
@@ -477,7 +482,7 @@ pub fn validate_generic_field(
                 if !pattern.is_match(value) {
                     span.record("result", &"failure");
                     span.record("failure_reason", &"invalid_format");
-                    
+
                     return Err(ValidationError::InvalidValue {
                         field: field_name.to_string(),
                         message: custom_error.to_string(),
@@ -512,11 +517,11 @@ mod tests {
                 "User2024",
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", // 30 'a's
             ];
-            
+
             for username in valid_cases {
                 assert!(
                     validate_username(username).is_ok(),
-                    "Username '{}' should be valid", 
+                    "Username '{}' should be valid",
                     username
                 );
             }
@@ -532,12 +537,12 @@ mod tests {
                 ("user@domain", "contains @"),
                 ("user!test", "contains !"),
             ];
-            
+
             for (username, reason) in invalid_cases {
                 assert!(
                     validate_username(username).is_err(),
-                    "Username '{}' should be invalid: {}", 
-                    username, 
+                    "Username '{}' should be invalid: {}",
+                    username,
                     reason
                 );
             }
@@ -546,11 +551,11 @@ mod tests {
         #[test]
         fn username_length_boundaries() {
             assert!(validate_username("abc").is_ok()); // Minimum valid
-            
+
             // Create strings for testing that don't create temporary values
             let max_valid = "a".repeat(30);
             let over_limit = "a".repeat(31);
-            
+
             assert!(validate_username(&max_valid).is_ok()); // Maximum valid
             assert!(validate_username(&over_limit).is_err()); // Over limit
         }
@@ -568,11 +573,11 @@ mod tests {
                 "123@test.org",
                 "user@sub.domain.example.com",
             ];
-            
+
             for email in valid_cases {
                 assert!(
                     validate_email(email).is_ok(),
-                    "Email '{}' should be valid", 
+                    "Email '{}' should be valid",
                     email
                 );
             }
@@ -589,12 +594,12 @@ mod tests {
                 ("user@@example.com", "double @"),
                 ("user@domain.x", "TLD too short"),
             ];
-            
+
             for (email, reason) in invalid_cases {
                 assert!(
                     validate_email(email).is_err(),
-                    "Email '{}' should be invalid: {}", 
-                    email, 
+                    "Email '{}' should be invalid: {}",
+                    email,
                     reason
                 );
             }
@@ -605,10 +610,10 @@ mod tests {
             // Create persistent strings for testing
             let long_local_part = "a".repeat(241);
             let long_email = format!("{}@example.com", long_local_part);
-            
+
             let too_long_local_part = "a".repeat(242);
             let too_long_email = format!("{}@example.com", too_long_local_part);
-            
+
             assert!(validate_email(&long_email).is_ok()); // Maximum valid
             assert!(validate_email(&too_long_email).is_err()); // Over maximum length
         }
@@ -626,7 +631,7 @@ mod tests {
                 "p@ssW0rd",
                 "Complex1ty!",
             ];
-            
+
             for password in valid_cases {
                 assert!(
                     validate_password(password).is_ok(),
@@ -644,15 +649,15 @@ mod tests {
                 ("NoSpecial123", "no special chars"),
                 ("12345678!", "no letters"),
             ];
-            
+
             for (password, reason) in invalid_cases {
                 assert!(
                     validate_password(password).is_err(),
-                    "Password should be invalid: {}", 
+                    "Password should be invalid: {}",
                     reason
                 );
             }
-            
+
             // Test too long password separately to avoid temporary value issues
             let too_long = "a".repeat(129);
             assert!(
@@ -666,8 +671,8 @@ mod tests {
             // Test each requirement individually
             assert!(validate_password("Abcdefgh!").is_err()); // No number
             assert!(validate_password("12345678!").is_err()); // No letter
-            assert!(validate_password("Abcd1234").is_err());  // No special
-            assert!(validate_password("Ab1!").is_err());      // Too short
+            assert!(validate_password("Abcd1234").is_err()); // No special
+            assert!(validate_password("Ab1!").is_err()); // Too short
         }
     }
 
@@ -684,34 +689,26 @@ mod tests {
                 20,
                 None,
                 "Invalid field"
-            ).is_ok());
-            
+            )
+            .is_ok());
+
             // Too short
-            assert!(validate_generic_field(
-                "test_field",
-                "abc",
-                5,
-                20,
-                None,
-                "Invalid field"
-            ).is_err());
-            
+            assert!(
+                validate_generic_field("test_field", "abc", 5, 20, None, "Invalid field").is_err()
+            );
+
             // Too long - use a persistent string
             let too_long = "a".repeat(21);
-            assert!(validate_generic_field(
-                "test_field",
-                &too_long,
-                5,
-                20,
-                None,
-                "Invalid field"
-            ).is_err());
+            assert!(
+                validate_generic_field("test_field", &too_long, 5, 20, None, "Invalid field")
+                    .is_err()
+            );
         }
 
         #[test]
         fn generic_field_with_regex() {
             let phone_regex = Regex::new(r"^\+?[1-9]\d{9,14}$").unwrap();
-            
+
             // Valid phone numbers
             assert!(validate_generic_field(
                 "phone",
@@ -720,8 +717,9 @@ mod tests {
                 16,
                 Some(&phone_regex),
                 "Invalid phone number"
-            ).is_ok());
-            
+            )
+            .is_ok());
+
             // Invalid format
             assert!(validate_generic_field(
                 "phone",
@@ -730,7 +728,8 @@ mod tests {
                 16,
                 Some(&phone_regex),
                 "Invalid phone number"
-            ).is_err());
+            )
+            .is_err());
         }
     }
 }

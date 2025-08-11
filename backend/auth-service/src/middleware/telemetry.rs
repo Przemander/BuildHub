@@ -18,6 +18,7 @@ use axum::{
     response::Response,
 };
 use std::time::Instant;
+use std::sync::Arc; // <-- add
 use tracing::{field::Empty, Instrument, Level};
 use uuid::Uuid;
 
@@ -30,16 +31,16 @@ pub const HEADER_REQUEST_ID: &str = "X-Request-ID";
 // MIDDLEWARE
 // ──────────────────────────────────────────────────────────────────────────────
 pub async fn telemetry_middleware<B>(
-    State(_): State<AppState>,
+    State(_): State<Arc<AppState>>, // <-- was State<AppState>
     req: Request<B>,
     next: Next<B>,
 ) -> Response {
     // --- metadata -------------------------------------------------------------
     let request_id = request_id(&req);
-    let method     = req.method().as_str();
-    let path       = req.uri().path();
-    let health     = matches!(path, "/health" | "/healthz");
-    let started    = Instant::now();
+    let method = req.method().as_str();
+    let path = req.uri().path();
+    let health = matches!(path, "/health" | "/healthz");
+    let started = Instant::now();
 
     // --- tracing span ---------------------------------------------------------
     // `tracing::span!` needs a *literal* level. Build the span
@@ -103,8 +104,10 @@ pub async fn telemetry_middleware<B>(
     span.record("duration_ms", &duration);
 
     // propagate request-id
-    res.headers_mut()
-        .insert(HEADER_REQUEST_ID, HeaderValue::from_str(&request_id).unwrap());
+    res.headers_mut().insert(
+        HEADER_REQUEST_ID,
+        HeaderValue::from_str(&request_id).unwrap(),
+    );
 
     res
 }

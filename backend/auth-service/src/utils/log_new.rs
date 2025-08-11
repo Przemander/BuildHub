@@ -6,8 +6,8 @@
 //! - Uses tracing directly; dropped the old channel model.
 //! - Emits trace/span IDs via OTel context.
 
-use opentelemetry::trace::{TraceContextExt, Tracer};
 use opentelemetry::global;
+use opentelemetry::trace::{TraceContextExt, Tracer};
 use tracing::Level;
 
 /// Service name constant
@@ -18,13 +18,7 @@ pub struct Log;
 
 impl Log {
     /// Logs an event with ECS-compliant structured format via tracing/OTel
-    pub fn event(
-        level_str: &str,
-        process: &str,
-        message: &str,
-        outcome: &str,
-        origin: &str,
-    ) {
+    pub fn event(level_str: &str, process: &str, message: &str, outcome: &str, origin: &str) {
         // Start a temporary span to extract trace context
         let tracer = global::tracer(SERVICE_NAME);
         let span = tracer.start("log_event");
@@ -34,7 +28,8 @@ impl Log {
 
         // Emit structured event with literal level in macro
         match level_str {
-            "DEBUG" => tracing::event!(Level::DEBUG,
+            "DEBUG" => tracing::event!(
+                Level::DEBUG,
                 service = SERVICE_NAME,
                 process = process,
                 message = message,
@@ -43,7 +38,8 @@ impl Log {
                 trace_id = trace_id,
                 span_id = span_id
             ),
-            "INFO" => tracing::event!(Level::INFO,
+            "INFO" => tracing::event!(
+                Level::INFO,
                 service = SERVICE_NAME,
                 process = process,
                 message = message,
@@ -52,7 +48,8 @@ impl Log {
                 trace_id = trace_id,
                 span_id = span_id
             ),
-            "WARN" => tracing::event!(Level::WARN,
+            "WARN" => tracing::event!(
+                Level::WARN,
                 service = SERVICE_NAME,
                 process = process,
                 message = message,
@@ -61,7 +58,8 @@ impl Log {
                 trace_id = trace_id,
                 span_id = span_id
             ),
-            "ERROR" => tracing::event!(Level::ERROR,
+            "ERROR" => tracing::event!(
+                Level::ERROR,
                 service = SERVICE_NAME,
                 process = process,
                 message = message,
@@ -70,7 +68,8 @@ impl Log {
                 trace_id = trace_id,
                 span_id = span_id
             ),
-            _ => tracing::event!(Level::INFO,
+            _ => tracing::event!(
+                Level::INFO,
                 service = SERVICE_NAME,
                 process = process,
                 message = message,

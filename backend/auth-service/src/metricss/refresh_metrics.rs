@@ -22,10 +22,10 @@
 //! - Infrastructure failures during refresh (system health)
 //! - Unusual failure patterns (security monitoring)
 
-use lazy_static::lazy_static;
-use prometheus::{CounterVec, HistogramVec, HistogramTimer};
-use std::sync::atomic::{AtomicBool, Ordering};
 use crate::log_info;
+use lazy_static::lazy_static;
+use prometheus::{CounterVec, HistogramTimer, HistogramVec};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // Import our standardized metrics infrastructure
 use super::core::{
@@ -163,7 +163,11 @@ pub fn init_refresh_metrics() {
     lazy_static::initialize(&REFRESH_FAILURES);
     lazy_static::initialize(&REFRESH_DURATION);
 
-    log_info!("Metrics", "Refresh metrics initialized (production-ready with full standardization)", "refresh_metrics_init");
+    log_info!(
+        "Metrics",
+        "Refresh metrics initialized (production-ready with full standardization)",
+        "refresh_metrics_init"
+    );
 }
 
 // =============================================================================
@@ -175,7 +179,7 @@ pub fn record_refresh_operation(step: &str, result: &str) {
     observe_counter_vec(
         &REFRESH_OPERATIONS,
         "refresh_operations_total",
-        &[step, result]
+        &[step, result],
     );
 }
 
@@ -184,15 +188,13 @@ pub fn record_refresh_failure_detailed(step: &str, error_type: &str) {
     observe_counter_vec(
         &REFRESH_FAILURES,
         "refresh_failures_total",
-        &[step, error_type]
+        &[step, error_type],
     );
 }
 
 /// Times refresh step with standard prometheus timer
 pub fn time_refresh_step(step: &str) -> HistogramTimer {
-    REFRESH_DURATION
-        .with_label_values(&[step])
-        .start_timer()
+    REFRESH_DURATION.with_label_values(&[step]).start_timer()
 }
 
 /// Time a complete HTTP refresh operation and return a timer guard
@@ -317,36 +319,51 @@ mod tests {
     #[test]
     fn test_refresh_metrics_initialization() {
         init_refresh_metrics();
-        
+
         // Test that all metrics are properly initialized
-        assert_eq!(REFRESH_OPERATIONS.with_label_values(&[steps::COMPLETE_FLOW, results::SUCCESS]).get(), 0.0);
-        assert_eq!(REFRESH_FAILURES.with_label_values(&[steps::TOKEN_VALIDATION, error_types::INVALID_SIGNATURE]).get(), 0.0);
-        assert_eq!(REFRESH_DURATION.with_label_values(&[steps::COMPLETE_FLOW]).get_sample_count(), 0);
+        assert_eq!(
+            REFRESH_OPERATIONS
+                .with_label_values(&[steps::COMPLETE_FLOW, results::SUCCESS])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            REFRESH_FAILURES
+                .with_label_values(&[steps::TOKEN_VALIDATION, error_types::INVALID_SIGNATURE])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            REFRESH_DURATION
+                .with_label_values(&[steps::COMPLETE_FLOW])
+                .get_sample_count(),
+            0
+        );
     }
 
     #[test]
     fn test_complete_refresh_flow() {
         init_refresh_metrics();
-        
+
         let before_count = REFRESH_OPERATIONS
             .with_label_values(&[steps::COMPLETE_FLOW, results::SUCCESS])
             .get();
         let before_duration = REFRESH_DURATION
             .with_label_values(&[steps::COMPLETE_FLOW])
             .get_sample_count();
-        
+
         // Test complete flow success
         let timer = time_complete_refresh_flow();
         record_refresh_success();
         drop(timer);
-        
+
         let after_count = REFRESH_OPERATIONS
             .with_label_values(&[steps::COMPLETE_FLOW, results::SUCCESS])
             .get();
         let after_duration = REFRESH_DURATION
             .with_label_values(&[steps::COMPLETE_FLOW])
             .get_sample_count();
-        
+
         assert_eq!(after_count, before_count + 1.0);
         assert_eq!(after_duration, before_duration + 1);
     }
@@ -354,41 +371,82 @@ mod tests {
     #[test]
     fn test_step_specific_helpers() {
         init_refresh_metrics();
-        
+
         // Test all step helpers
         record_token_validation_success();
         record_token_validation_failure(error_types::TOKEN_EXPIRED);
-        
+
         record_token_type_check_success();
         record_token_type_check_failure(error_types::WRONG_TOKEN_TYPE);
-        
+
         record_token_revocation_success();
         record_token_revocation_failure(error_types::REVOCATION_FAILED);
-        
+
         record_access_token_generation_success();
         record_access_token_generation_failure(error_types::GENERATION_ERROR);
-        
+
         record_refresh_token_generation_success();
         record_refresh_token_generation_failure(error_types::GENERATION_ERROR);
-        
+
         // Verify operations were recorded
-        assert_eq!(REFRESH_OPERATIONS.with_label_values(&[steps::TOKEN_VALIDATION, results::SUCCESS]).get(), 1.0);
-        assert_eq!(REFRESH_OPERATIONS.with_label_values(&[steps::TOKEN_VALIDATION, results::FAILURE]).get(), 1.0);
-        
+        assert_eq!(
+            REFRESH_OPERATIONS
+                .with_label_values(&[steps::TOKEN_VALIDATION, results::SUCCESS])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            REFRESH_OPERATIONS
+                .with_label_values(&[steps::TOKEN_VALIDATION, results::FAILURE])
+                .get(),
+            1.0
+        );
+
         // Verify detailed failures were recorded
-        assert_eq!(REFRESH_FAILURES.with_label_values(&[steps::TOKEN_VALIDATION, error_types::TOKEN_EXPIRED]).get(), 1.0);
-        assert_eq!(REFRESH_FAILURES.with_label_values(&[steps::TOKEN_TYPE_CHECK, error_types::WRONG_TOKEN_TYPE]).get(), 1.0);
-        assert_eq!(REFRESH_FAILURES.with_label_values(&[steps::TOKEN_REVOCATION, error_types::REVOCATION_FAILED]).get(), 1.0);
-        assert_eq!(REFRESH_FAILURES.with_label_values(&[steps::ACCESS_TOKEN_GENERATION, error_types::GENERATION_ERROR]).get(), 1.0);
-        assert_eq!(REFRESH_FAILURES.with_label_values(&[steps::REFRESH_TOKEN_GENERATION, error_types::GENERATION_ERROR]).get(), 1.0);
+        assert_eq!(
+            REFRESH_FAILURES
+                .with_label_values(&[steps::TOKEN_VALIDATION, error_types::TOKEN_EXPIRED])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            REFRESH_FAILURES
+                .with_label_values(&[steps::TOKEN_TYPE_CHECK, error_types::WRONG_TOKEN_TYPE])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            REFRESH_FAILURES
+                .with_label_values(&[steps::TOKEN_REVOCATION, error_types::REVOCATION_FAILED])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            REFRESH_FAILURES
+                .with_label_values(&[
+                    steps::ACCESS_TOKEN_GENERATION,
+                    error_types::GENERATION_ERROR
+                ])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            REFRESH_FAILURES
+                .with_label_values(&[
+                    steps::REFRESH_TOKEN_GENERATION,
+                    error_types::GENERATION_ERROR
+                ])
+                .get(),
+            1.0
+        );
     }
 
     #[test]
     fn test_production_refresh_patterns() {
         init_refresh_metrics();
-        
+
         // Simulate realistic production patterns
-        
+
         // 5 successful refreshes
         for _ in 0..5 {
             record_token_validation_success();
@@ -398,28 +456,53 @@ mod tests {
             record_refresh_token_generation_success();
             record_refresh_success();
         }
-        
+
         // Some failures at different steps
         record_token_validation_failure(error_types::INVALID_SIGNATURE);
         record_token_type_check_failure(error_types::WRONG_TOKEN_TYPE);
         record_token_revocation_failure(error_types::REVOCATION_FAILED);
         record_access_token_generation_failure(error_types::GENERATION_ERROR);
         record_refresh_token_generation_failure(error_types::GENERATION_ERROR);
-        
+
         // Verify realistic metric patterns
-        assert_eq!(REFRESH_OPERATIONS.with_label_values(&[steps::COMPLETE_FLOW, results::SUCCESS]).get(), 5.0);
-        assert_eq!(REFRESH_OPERATIONS.with_label_values(&[steps::TOKEN_VALIDATION, results::FAILURE]).get(), 1.0);
-        
+        assert_eq!(
+            REFRESH_OPERATIONS
+                .with_label_values(&[steps::COMPLETE_FLOW, results::SUCCESS])
+                .get(),
+            5.0
+        );
+        assert_eq!(
+            REFRESH_OPERATIONS
+                .with_label_values(&[steps::TOKEN_VALIDATION, results::FAILURE])
+                .get(),
+            1.0
+        );
+
         // Specific failure types
-        assert_eq!(REFRESH_FAILURES.with_label_values(&[steps::TOKEN_VALIDATION, error_types::INVALID_SIGNATURE]).get(), 1.0);
-        assert_eq!(REFRESH_FAILURES.with_label_values(&[steps::TOKEN_TYPE_CHECK, error_types::WRONG_TOKEN_TYPE]).get(), 1.0);
-        assert_eq!(REFRESH_FAILURES.with_label_values(&[steps::TOKEN_REVOCATION, error_types::REVOCATION_FAILED]).get(), 1.0);
+        assert_eq!(
+            REFRESH_FAILURES
+                .with_label_values(&[steps::TOKEN_VALIDATION, error_types::INVALID_SIGNATURE])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            REFRESH_FAILURES
+                .with_label_values(&[steps::TOKEN_TYPE_CHECK, error_types::WRONG_TOKEN_TYPE])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            REFRESH_FAILURES
+                .with_label_values(&[steps::TOKEN_REVOCATION, error_types::REVOCATION_FAILED])
+                .get(),
+            1.0
+        );
     }
 
     #[test]
     fn test_type_safety_constants() {
         init_refresh_metrics();
-        
+
         // Verify all constants are valid and type-safe
         assert_eq!(steps::TOKEN_VALIDATION, "token_validation");
         assert_eq!(steps::TOKEN_TYPE_CHECK, "token_type_check");
@@ -427,10 +510,10 @@ mod tests {
         assert_eq!(steps::ACCESS_TOKEN_GENERATION, "access_token_generation");
         assert_eq!(steps::REFRESH_TOKEN_GENERATION, "refresh_token_generation");
         assert_eq!(steps::COMPLETE_FLOW, "complete_flow");
-        
+
         assert_eq!(results::SUCCESS, "success");
         assert_eq!(results::FAILURE, "failure");
-        
+
         assert_eq!(error_types::INVALID_SIGNATURE, "invalid_signature");
         assert_eq!(error_types::TOKEN_EXPIRED, "token_expired");
         assert_eq!(error_types::TOKEN_REVOKED, "token_revoked");
@@ -438,12 +521,22 @@ mod tests {
         assert_eq!(error_types::REVOCATION_FAILED, "revocation_failed");
         assert_eq!(error_types::GENERATION_ERROR, "generation_error");
         assert_eq!(error_types::REDIS_UNAVAILABLE, "redis_unavailable");
-        
+
         // Use constants in actual operations
         record_refresh_operation(steps::TOKEN_VALIDATION, results::SUCCESS);
         record_refresh_failure_detailed(steps::TOKEN_REVOCATION, error_types::REVOCATION_FAILED);
-        
-        assert_eq!(REFRESH_OPERATIONS.with_label_values(&[steps::TOKEN_VALIDATION, results::SUCCESS]).get(), 1.0);
-        assert_eq!(REFRESH_FAILURES.with_label_values(&[steps::TOKEN_REVOCATION, error_types::REVOCATION_FAILED]).get(), 1.0);
+
+        assert_eq!(
+            REFRESH_OPERATIONS
+                .with_label_values(&[steps::TOKEN_VALIDATION, results::SUCCESS])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            REFRESH_FAILURES
+                .with_label_values(&[steps::TOKEN_REVOCATION, error_types::REVOCATION_FAILED])
+                .get(),
+            1.0
+        );
     }
 }

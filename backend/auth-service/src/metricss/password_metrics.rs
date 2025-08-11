@@ -22,10 +22,10 @@
 //! - Infrastructure failures during reset (system health)
 //! - Unusual failure patterns (security monitoring)
 
-use lazy_static::lazy_static;
-use prometheus::{CounterVec, HistogramVec, HistogramTimer};
-use std::sync::atomic::{AtomicBool, Ordering};
 use crate::log_info;
+use lazy_static::lazy_static;
+use prometheus::{CounterVec, HistogramTimer, HistogramVec};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // Import our standardized metrics infrastructure
 use super::core::{
@@ -166,7 +166,11 @@ pub fn init_password_reset_metrics() {
     lazy_static::initialize(&PASSWORD_RESET_FAILURES);
     lazy_static::initialize(&PASSWORD_RESET_DURATION);
 
-    log_info!("Metrics", "Password reset metrics initialized (production-ready with full standardization)", "password_reset_metrics_init");
+    log_info!(
+        "Metrics",
+        "Password reset metrics initialized (production-ready with full standardization)",
+        "password_reset_metrics_init"
+    );
 }
 
 // =============================================================================
@@ -178,7 +182,7 @@ pub fn record_password_reset_operation(step: &str, result: &str) {
     observe_counter_vec(
         &PASSWORD_RESET_OPERATIONS,
         "password_reset_operations_total",
-        &[step, result]
+        &[step, result],
     );
 }
 
@@ -187,7 +191,7 @@ pub fn record_password_reset_failure_detailed(step: &str, error_type: &str) {
     observe_counter_vec(
         &PASSWORD_RESET_FAILURES,
         "password_reset_failures_total",
-        &[step, error_type]
+        &[step, error_type],
     );
 }
 
@@ -360,36 +364,51 @@ mod tests {
     #[test]
     fn test_password_reset_metrics_initialization() {
         init_password_reset_metrics();
-        
+
         // Test that all metrics are properly initialized
-        assert_eq!(PASSWORD_RESET_OPERATIONS.with_label_values(&[steps::COMPLETE_REQUEST, results::SUCCESS]).get(), 0.0);
-        assert_eq!(PASSWORD_RESET_FAILURES.with_label_values(&[steps::TOKEN_VALIDATION, error_types::INVALID_TOKEN]).get(), 0.0);
-        assert_eq!(PASSWORD_RESET_DURATION.with_label_values(&[steps::COMPLETE_CONFIRM]).get_sample_count(), 0);
+        assert_eq!(
+            PASSWORD_RESET_OPERATIONS
+                .with_label_values(&[steps::COMPLETE_REQUEST, results::SUCCESS])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            PASSWORD_RESET_FAILURES
+                .with_label_values(&[steps::TOKEN_VALIDATION, error_types::INVALID_TOKEN])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            PASSWORD_RESET_DURATION
+                .with_label_values(&[steps::COMPLETE_CONFIRM])
+                .get_sample_count(),
+            0
+        );
     }
 
     #[test]
     fn test_complete_request_flow() {
         init_password_reset_metrics();
-        
+
         let before_count = PASSWORD_RESET_OPERATIONS
             .with_label_values(&[steps::COMPLETE_REQUEST, results::SUCCESS])
             .get();
         let before_duration = PASSWORD_RESET_DURATION
             .with_label_values(&[steps::COMPLETE_REQUEST])
             .get_sample_count();
-        
+
         // Test complete request success
         let timer = time_complete_request_flow();
         record_request_success();
         drop(timer);
-        
+
         let after_count = PASSWORD_RESET_OPERATIONS
             .with_label_values(&[steps::COMPLETE_REQUEST, results::SUCCESS])
             .get();
         let after_duration = PASSWORD_RESET_DURATION
             .with_label_values(&[steps::COMPLETE_REQUEST])
             .get_sample_count();
-        
+
         assert_eq!(after_count, before_count + 1.0);
         assert_eq!(after_duration, before_duration + 1);
     }
@@ -397,26 +416,26 @@ mod tests {
     #[test]
     fn test_complete_confirm_flow() {
         init_password_reset_metrics();
-        
+
         let before_count = PASSWORD_RESET_OPERATIONS
             .with_label_values(&[steps::COMPLETE_CONFIRM, results::SUCCESS])
             .get();
         let before_duration = PASSWORD_RESET_DURATION
             .with_label_values(&[steps::COMPLETE_CONFIRM])
             .get_sample_count();
-        
+
         // Test complete confirm success
         let timer = time_complete_confirm_flow();
         record_confirm_success();
         drop(timer);
-        
+
         let after_count = PASSWORD_RESET_OPERATIONS
             .with_label_values(&[steps::COMPLETE_CONFIRM, results::SUCCESS])
             .get();
         let after_duration = PASSWORD_RESET_DURATION
             .with_label_values(&[steps::COMPLETE_CONFIRM])
             .get_sample_count();
-        
+
         assert_eq!(after_count, before_count + 1.0);
         assert_eq!(after_duration, before_duration + 1);
     }
@@ -424,52 +443,82 @@ mod tests {
     #[test]
     fn test_step_specific_helpers() {
         init_password_reset_metrics();
-        
+
         // Test request step helpers
         record_redis_check_success();
         record_redis_check_failure(error_types::REDIS_UNAVAILABLE);
-        
+
         record_user_lookup_success();
         record_user_lookup_failure(error_types::USER_NOT_FOUND);
-        
+
         record_token_generation_success();
-        
+
         record_redis_store_success();
         record_redis_store_failure(error_types::REDIS_STORE_FAILED);
-        
+
         record_email_send_success();
         record_email_send_failure(error_types::EMAIL_SEND_FAILED);
-        
+
         // Test confirm step helpers
         record_token_validation_success();
         record_token_validation_failure(error_types::INVALID_TOKEN);
-        
+
         record_password_validation_success();
         record_password_validation_failure(error_types::WEAK_PASSWORD);
-        
+
         record_password_update_success();
         record_password_update_failure(error_types::PASSWORD_UPDATE_FAILED);
-        
+
         record_token_invalidation_success();
         record_token_invalidation_failure(error_types::TOKEN_INVALIDATION_FAILED);
-        
+
         // Verify operations were recorded
-        assert_eq!(PASSWORD_RESET_OPERATIONS.with_label_values(&[steps::REDIS_CHECK, results::SUCCESS]).get(), 1.0);
-        assert_eq!(PASSWORD_RESET_OPERATIONS.with_label_values(&[steps::REDIS_CHECK, results::FAILURE]).get(), 1.0);
-        
+        assert_eq!(
+            PASSWORD_RESET_OPERATIONS
+                .with_label_values(&[steps::REDIS_CHECK, results::SUCCESS])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            PASSWORD_RESET_OPERATIONS
+                .with_label_values(&[steps::REDIS_CHECK, results::FAILURE])
+                .get(),
+            1.0
+        );
+
         // Verify detailed failures were recorded
-        assert_eq!(PASSWORD_RESET_FAILURES.with_label_values(&[steps::REDIS_CHECK, error_types::REDIS_UNAVAILABLE]).get(), 1.0);
-        assert_eq!(PASSWORD_RESET_FAILURES.with_label_values(&[steps::USER_LOOKUP, error_types::USER_NOT_FOUND]).get(), 1.0);
-        assert_eq!(PASSWORD_RESET_FAILURES.with_label_values(&[steps::TOKEN_VALIDATION, error_types::INVALID_TOKEN]).get(), 1.0);
-        assert_eq!(PASSWORD_RESET_FAILURES.with_label_values(&[steps::PASSWORD_VALIDATION, error_types::WEAK_PASSWORD]).get(), 1.0);
+        assert_eq!(
+            PASSWORD_RESET_FAILURES
+                .with_label_values(&[steps::REDIS_CHECK, error_types::REDIS_UNAVAILABLE])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            PASSWORD_RESET_FAILURES
+                .with_label_values(&[steps::USER_LOOKUP, error_types::USER_NOT_FOUND])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            PASSWORD_RESET_FAILURES
+                .with_label_values(&[steps::TOKEN_VALIDATION, error_types::INVALID_TOKEN])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            PASSWORD_RESET_FAILURES
+                .with_label_values(&[steps::PASSWORD_VALIDATION, error_types::WEAK_PASSWORD])
+                .get(),
+            1.0
+        );
     }
 
     #[test]
     fn test_production_reset_patterns() {
         init_password_reset_metrics();
-        
+
         // Simulate realistic production patterns
-        
+
         // 5 successful request flows
         for _ in 0..5 {
             record_redis_check_success();
@@ -479,7 +528,7 @@ mod tests {
             record_email_send_success();
             record_request_success();
         }
-        
+
         // 3 successful confirm flows
         for _ in 0..3 {
             record_redis_check_success();
@@ -489,7 +538,7 @@ mod tests {
             record_token_invalidation_success();
             record_confirm_success();
         }
-        
+
         // Some failures at different steps
         record_redis_check_failure(error_types::REDIS_UNAVAILABLE);
         record_user_lookup_failure(error_types::USER_NOT_FOUND);
@@ -498,22 +547,52 @@ mod tests {
         record_password_validation_failure(error_types::WEAK_PASSWORD);
         record_password_update_failure(error_types::PASSWORD_UPDATE_FAILED);
         record_token_invalidation_failure(error_types::TOKEN_INVALIDATION_FAILED);
-        
+
         // Verify realistic metric patterns
-        assert_eq!(PASSWORD_RESET_OPERATIONS.with_label_values(&[steps::COMPLETE_REQUEST, results::SUCCESS]).get(), 5.0);
-        assert_eq!(PASSWORD_RESET_OPERATIONS.with_label_values(&[steps::COMPLETE_CONFIRM, results::SUCCESS]).get(), 3.0);
-        
+        assert_eq!(
+            PASSWORD_RESET_OPERATIONS
+                .with_label_values(&[steps::COMPLETE_REQUEST, results::SUCCESS])
+                .get(),
+            5.0
+        );
+        assert_eq!(
+            PASSWORD_RESET_OPERATIONS
+                .with_label_values(&[steps::COMPLETE_CONFIRM, results::SUCCESS])
+                .get(),
+            3.0
+        );
+
         // Specific failure types
-        assert_eq!(PASSWORD_RESET_FAILURES.with_label_values(&[steps::REDIS_CHECK, error_types::REDIS_UNAVAILABLE]).get(), 1.0);
-        assert_eq!(PASSWORD_RESET_FAILURES.with_label_values(&[steps::USER_LOOKUP, error_types::USER_NOT_FOUND]).get(), 1.0);
-        assert_eq!(PASSWORD_RESET_FAILURES.with_label_values(&[steps::EMAIL_SEND, error_types::EMAIL_SEND_FAILED]).get(), 1.0);
-        assert_eq!(PASSWORD_RESET_FAILURES.with_label_values(&[steps::TOKEN_VALIDATION, error_types::INVALID_TOKEN]).get(), 1.0);
+        assert_eq!(
+            PASSWORD_RESET_FAILURES
+                .with_label_values(&[steps::REDIS_CHECK, error_types::REDIS_UNAVAILABLE])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            PASSWORD_RESET_FAILURES
+                .with_label_values(&[steps::USER_LOOKUP, error_types::USER_NOT_FOUND])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            PASSWORD_RESET_FAILURES
+                .with_label_values(&[steps::EMAIL_SEND, error_types::EMAIL_SEND_FAILED])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            PASSWORD_RESET_FAILURES
+                .with_label_values(&[steps::TOKEN_VALIDATION, error_types::INVALID_TOKEN])
+                .get(),
+            1.0
+        );
     }
 
     #[test]
     fn test_type_safety_constants() {
         init_password_reset_metrics();
-        
+
         // Verify all constants are valid and type-safe
         assert_eq!(steps::REDIS_CHECK, "redis_check");
         assert_eq!(steps::USER_LOOKUP, "user_lookup");
@@ -526,22 +605,35 @@ mod tests {
         assert_eq!(steps::TOKEN_INVALIDATION, "token_invalidation");
         assert_eq!(steps::COMPLETE_REQUEST, "complete_request");
         assert_eq!(steps::COMPLETE_CONFIRM, "complete_confirm");
-        
+
         assert_eq!(results::SUCCESS, "success");
         assert_eq!(results::FAILURE, "failure");
-        
+
         assert_eq!(error_types::REDIS_UNAVAILABLE, "redis_unavailable");
         assert_eq!(error_types::USER_NOT_FOUND, "user_not_found");
         assert_eq!(error_types::EMAIL_SEND_FAILED, "email_send_failed");
         assert_eq!(error_types::INVALID_TOKEN, "invalid_token");
         assert_eq!(error_types::WEAK_PASSWORD, "weak_password");
-        assert_eq!(error_types::PASSWORD_UPDATE_FAILED, "password_update_failed");
-        
+        assert_eq!(
+            error_types::PASSWORD_UPDATE_FAILED,
+            "password_update_failed"
+        );
+
         // Use constants in actual operations
         record_password_reset_operation(steps::EMAIL_SEND, results::SUCCESS);
         record_password_reset_failure_detailed(steps::TOKEN_VALIDATION, error_types::INVALID_TOKEN);
-        
-        assert_eq!(PASSWORD_RESET_OPERATIONS.with_label_values(&[steps::EMAIL_SEND, results::SUCCESS]).get(), 1.0);
-        assert_eq!(PASSWORD_RESET_FAILURES.with_label_values(&[steps::TOKEN_VALIDATION, error_types::INVALID_TOKEN]).get(), 1.0);
+
+        assert_eq!(
+            PASSWORD_RESET_OPERATIONS
+                .with_label_values(&[steps::EMAIL_SEND, results::SUCCESS])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            PASSWORD_RESET_FAILURES
+                .with_label_values(&[steps::TOKEN_VALIDATION, error_types::INVALID_TOKEN])
+                .get(),
+            1.0
+        );
     }
 }

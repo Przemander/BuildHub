@@ -20,9 +20,7 @@ use prometheus::{CounterVec, HistogramVec};
 
 // Import our standardized metrics infrastructure
 use super::core::{
-    create_counter_vec, create_histogram_vec,
-    observe_counter_vec,
-    LATENCY_BUCKETS_FAST,
+    create_counter_vec, create_histogram_vec, observe_counter_vec, LATENCY_BUCKETS_FAST,
 };
 
 // =============================================================================
@@ -66,7 +64,7 @@ pub fn record_rate_limit_request(result: &str, is_startup: bool) {
     observe_counter_vec(
         &RATE_LIMIT_REQUESTS,
         "rate_limit_requests_total",
-        &[result, context]
+        &[result, context],
     );
 }
 
@@ -76,7 +74,7 @@ pub fn record_rate_limit_redis_error(error_type: &str, is_startup: bool) {
     observe_counter_vec(
         &RATE_LIMIT_REDIS_ERRORS,
         "rate_limit_redis_errors_total",
-        &[error_type, context]
+        &[error_type, context],
     );
 }
 
@@ -112,15 +110,15 @@ pub mod errors {
 /// Request result helpers for runtime operations
 pub mod request {
     use super::*;
-    
+
     pub fn record_runtime_allowed() {
         record_rate_limit_request(results::ALLOWED, false);
     }
-    
+
     pub fn record_runtime_blocked() {
         record_rate_limit_request(results::BLOCKED, false);
     }
-    
+
     pub fn record_runtime_fail_open() {
         record_rate_limit_request(results::FAIL_OPEN, false);
     }
@@ -129,15 +127,15 @@ pub mod request {
 /// Redis error helpers for runtime operations
 pub mod redis {
     use super::*;
-    
+
     pub fn record_runtime_connection_error() {
         record_rate_limit_redis_error(errors::CONNECTION, false);
     }
-    
+
     pub fn record_runtime_timeout_error() {
         record_rate_limit_redis_error(errors::TIMEOUT, false);
     }
-    
+
     pub fn record_runtime_command_error() {
         record_rate_limit_redis_error(errors::COMMAND, false);
     }
@@ -156,13 +154,13 @@ mod tests {
         let before = RATE_LIMIT_REQUESTS
             .with_label_values(&[results::ALLOWED, "runtime"])
             .get();
-        
+
         request::record_runtime_allowed();
-        
+
         let after = RATE_LIMIT_REQUESTS
             .with_label_values(&[results::ALLOWED, "runtime"])
             .get();
-        
+
         assert_eq!(after, before + 1.0);
     }
 
@@ -171,13 +169,13 @@ mod tests {
         let before = RATE_LIMIT_REDIS_ERRORS
             .with_label_values(&[errors::CONNECTION, "runtime"])
             .get();
-        
+
         redis::record_runtime_connection_error();
-        
+
         let after = RATE_LIMIT_REDIS_ERRORS
             .with_label_values(&[errors::CONNECTION, "runtime"])
             .get();
-        
+
         assert_eq!(after, before + 1.0);
     }
 
@@ -185,7 +183,7 @@ mod tests {
     fn test_duration_timer() {
         let timer = time_rate_limit_check(false);
         drop(timer);
-        
+
         let count = RATE_LIMIT_CHECK_DURATION
             .with_label_values(&["runtime"])
             .get_sample_count();
@@ -197,7 +195,7 @@ mod tests {
         // Test runtime operations
         request::record_runtime_blocked();
         redis::record_runtime_timeout_error();
-        
+
         // Verify context separation
         let runtime_requests = RATE_LIMIT_REQUESTS
             .with_label_values(&[results::BLOCKED, "runtime"])
@@ -205,7 +203,7 @@ mod tests {
         let runtime_errors = RATE_LIMIT_REDIS_ERRORS
             .with_label_values(&[errors::TIMEOUT, "runtime"])
             .get();
-        
+
         assert!(runtime_requests >= 1.0);
         assert!(runtime_errors >= 1.0);
     }
@@ -215,7 +213,7 @@ mod tests {
         request::record_runtime_allowed();
         request::record_runtime_blocked();
         request::record_runtime_fail_open();
-        
+
         let allowed = RATE_LIMIT_REQUESTS
             .with_label_values(&[results::ALLOWED, "runtime"])
             .get();
@@ -225,7 +223,7 @@ mod tests {
         let fail_open = RATE_LIMIT_REQUESTS
             .with_label_values(&[results::FAIL_OPEN, "runtime"])
             .get();
-        
+
         assert!(allowed >= 1.0);
         assert!(blocked >= 1.0);
         assert!(fail_open >= 1.0);
@@ -236,7 +234,7 @@ mod tests {
         redis::record_runtime_connection_error();
         redis::record_runtime_timeout_error();
         redis::record_runtime_command_error();
-        
+
         let connection_errors = RATE_LIMIT_REDIS_ERRORS
             .with_label_values(&[errors::CONNECTION, "runtime"])
             .get();
@@ -246,7 +244,7 @@ mod tests {
         let command_errors = RATE_LIMIT_REDIS_ERRORS
             .with_label_values(&[errors::COMMAND, "runtime"])
             .get();
-        
+
         assert!(connection_errors >= 1.0);
         assert!(timeout_errors >= 1.0);
         assert!(command_errors >= 1.0);

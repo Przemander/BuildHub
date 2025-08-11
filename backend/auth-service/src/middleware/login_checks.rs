@@ -96,61 +96,63 @@ pub async fn login_guard_middleware(
     next: Next<Body>,
 ) -> Response {
     let start_time = Instant::now();
-    
+
     // Create comprehensive middleware span
     let span = http_middleware_span("login_security_guard");
     span.record("http.method", &req.method().to_string());
     span.record("http.path", &req.uri().path());
     span.record("middleware.type", &"security");
     span.record("security.layer", &"login_protection");
-    
+
     let span_clone = span.clone();
-    
+
     async move {
         // ─────────────────────────────────────────────────────────────────
         // PHASE 1: Request Body Processing
         // ─────────────────────────────────────────────────────────────────
         let body_span = business_operation_span("request_body_processing");
         body_span.record("operation", &"extract_login_payload");
-        
+
         let bytes: Bytes = match body_span.in_scope(|| to_bytes(req.body_mut())).await {
             Ok(body_bytes) => {
                 body_span.record("result", &"success");
                 body_span.record("body_size_bytes", &body_bytes.len());
                 span.record("request.body_size", &body_bytes.len());
-                
+
                 Log::event(
                     "DEBUG",
                     "LoginSecurity",
-                    &format!("Successfully extracted request body ({} bytes)", body_bytes.len()),
+                    &format!(
+                        "Successfully extracted request body ({} bytes)",
+                        body_bytes.len()
+                    ),
                     "body_extraction_success",
-                    "login_guard_middleware"
+                    "login_guard_middleware",
                 );
-                
+
                 body_bytes
             }
             Err(body_error) => {
                 body_span.record("result", &"failure");
                 body_span.record("error.type", &"body_read_error");
                 body_span.record_error(&body_error);
-                
+
                 span.record("security.result", &"failure");
                 span.record("security.failure_reason", &"invalid_request_body");
                 span.record("http.status_code", &400);
                 span.record_error(&body_error);
-                
+
                 Log::event(
                     "WARN",
                     "LoginSecurity",
                     &format!("Failed to read request body: {}", body_error),
                     "body_extraction_failure",
-                    "login_guard_middleware"
+                    "login_guard_middleware",
                 );
-                
+
                 login_guard::record_redis_error("body_read_error");
-                
-                return ApiError::bad_request("Invalid request body format")
-                    .into_response();
+
+                return ApiError::bad_request("Invalid request body format").into_response();
             }
         };
 
@@ -160,32 +162,36 @@ pub async fn login_guard_middleware(
         let extract_span = business_operation_span("login_identifier_extraction");
         extract_span.record("operation", &"parse_login_field");
         extract_span.record("payload_size", &bytes.len());
-        
+
         let login_identifier = extract_span.in_scope(|| {
             // Parse JSON safely with detailed error handling
             match serde_json::from_slice::<serde_json::Value>(&bytes) {
                 Ok(json_value) => {
                     extract_span.record("json.parsed", &true);
-                    
+
                     // Extract login field with type detection
                     match json_value.get("login").and_then(|l| l.as_str()) {
                         Some(login_str) if !login_str.trim().is_empty() => {
                             let login = login_str.trim().to_string();
-                            
+
                             // Classify login type for metrics (privacy-safe)
-                            let login_type = if login.contains('@') { "email" } else { "username" };
+                            let login_type = if login.contains('@') {
+                                "email"
+                            } else {
+                                "username"
+                            };
                             extract_span.record("login.type", &login_type);
                             extract_span.record("login.length", &login.len());
                             extract_span.record("login.present", &true);
                             extract_span.record("result", &"success");
-                            
+
                             // Privacy-safe domain logging for emails only
                             if login_type == "email" {
                                 if let Some(domain) = login.split('@').nth(1) {
                                     extract_span.record("login.domain", &domain);
                                 }
                             }
-                            
+
                             Some(login)
                         }
                         Some(_) => {
@@ -217,7 +223,14 @@ pub async fn login_guard_middleware(
         span.record("login.extracted", &login_identifier.is_some());
         if let Some(ref login) = login_identifier {
             span.record("login.length", &login.len());
-            span.record("login.type", &if login.contains('@') { "email" } else { "username" });
+            span.record(
+                "login.type",
+                &if login.contains('@') {
+                    "email"
+                } else {
+                    "username"
+                },
+            );
         }
 
         // ─────────────────────────────────────────────────────────────────
@@ -226,14 +239,20 @@ pub async fn login_guard_middleware(
         if let (Some(login), Some(redis_client)) = (&login_identifier, &app_state.redis_client) {
             span.record("redis.available", &true);
             span.record("security.checks_enabled", &true);
-            
+
             Log::event(
                 "DEBUG",
                 "LoginSecurity",
-                &format!("Initiating security checks for {} identifier", 
-                        if login.contains('@') { "email" } else { "username" }),
+                &format!(
+                    "Initiating security checks for {} identifier",
+                    if login.contains('@') {
+                        "email"
+                    } else {
+                        "username"
+                    }
+                ),
                 "security_checks_start",
-                "login_guard_middleware"
+                "login_guard_middleware",
             );
 
             // Account Lockout Check
@@ -241,7 +260,7 @@ pub async fn login_guard_middleware(
                 span.record("security.result", &"blocked");
                 span.record("security.block_reason", &"account_lockout");
                 span.record("http.status_code", &lockout_response.status().as_u16());
-                
+
                 return lockout_response;
             }
 
@@ -250,7 +269,7 @@ pub async fn login_guard_middleware(
                 span.record("security.result", &"blocked");
                 span.record("security.block_reason", &"rate_limit_exceeded");
                 span.record("http.status_code", &rate_limit_response.status().as_u16());
-                
+
                 return rate_limit_response;
             }
 
@@ -259,13 +278,13 @@ pub async fn login_guard_middleware(
                 "LoginSecurity",
                 "All security checks passed - proceeding with login attempt",
                 "security_checks_passed",
-                "login_guard_middleware"
+                "login_guard_middleware",
             );
         } else {
             // Record why security checks were bypassed
             span.record("redis.available", &app_state.redis_client.is_some());
             span.record("security.checks_enabled", &false);
-            
+
             if login_identifier.is_none() {
                 span.record("security.bypass_reason", &"no_login_identifier");
                 Log::event(
@@ -273,7 +292,7 @@ pub async fn login_guard_middleware(
                     "LoginSecurity",
                     "No valid login identifier found - bypassing security checks",
                     "no_login_identifier",
-                    "login_guard_middleware"
+                    "login_guard_middleware",
                 );
             } else {
                 span.record("security.bypass_reason", &"redis_unavailable");
@@ -282,7 +301,7 @@ pub async fn login_guard_middleware(
                     "LoginSecurity",
                     "Redis unavailable - security checks disabled (fail-open policy)",
                     "redis_unavailable_failopen",
-                    "login_guard_middleware"
+                    "login_guard_middleware",
                 );
             }
         }
@@ -290,19 +309,19 @@ pub async fn login_guard_middleware(
         // ─────────────────────────────────────────────────────────────────
         // PHASE 4: Request Reconstruction & Forwarding
         // ─────────────────────────────────────────────────────────────────
-        
+
         // Safely reconstruct the request body for downstream handlers
         *req.body_mut() = Body::from(bytes);
-        
+
         span.record("security.result", &"allowed");
         span.record("request.reconstructed", &true);
-        
+
         // Record successful processing
         login_guard::record_allowed("login_security");
-        
+
         // Forward to next middleware/handler
         let response = next.run(req).await;
-        
+
         // Record final metrics
         let total_duration = start_time.elapsed();
         span.record("duration_ms", &total_duration.as_millis());
@@ -311,9 +330,12 @@ pub async fn login_guard_middleware(
         Log::event(
             "DEBUG",
             "LoginSecurity",
-            &format!("Login security middleware completed in {}ms", total_duration.as_millis()),
+            &format!(
+                "Login security middleware completed in {}ms",
+                total_duration.as_millis()
+            ),
             "middleware_completed",
-            "login_guard_middleware"
+            "login_guard_middleware",
         );
 
         response
@@ -350,8 +372,15 @@ async fn enforce_account_lockout(
     let span = business_operation_span("account_lockout_enforcement");
     span.record("operation", &"lockout_check");
     span.record("identifier.length", &login.len());
-    span.record("identifier.type", &if login.contains('@') { "email" } else { "username" });
-    
+    span.record(
+        "identifier.type",
+        &if login.contains('@') {
+            "email"
+        } else {
+            "username"
+        },
+    );
+
     span.in_scope(|| async {
         // Establish Redis connection with error handling
         let connection_span = business_operation_span("redis_lockout_connection");
@@ -478,26 +507,29 @@ async fn enforce_login_rate_limit(
     span.record("identifier.length", &login.len());
     span.record("rate_limit.max_attempts", &MAX_LOGIN_ATTEMPTS);
     span.record("rate_limit.window_seconds", &RATE_LIMIT_WINDOW_SECS);
-    
+
     span.in_scope(|| async {
         // Generate rate limiting key
         let rate_limit_key = format!("auth:rate_limit:login:{}", login);
         span.record("redis.key_type", &"rate_limit");
-        
+
         // Perform atomic rate limit check using shared Redis function
         let rate_check_span = business_operation_span("redis_rate_limit_check");
         rate_check_span.record("redis.operation", &"check_and_increment");
         rate_check_span.record("max_attempts", &MAX_LOGIN_ATTEMPTS);
         rate_check_span.record("window_seconds", &RATE_LIMIT_WINDOW_SECS);
-        
-        let is_allowed = match rate_check_span.in_scope(|| {
-            check_and_increment_rate_limit(
-                redis_client,
-                &rate_limit_key,
-                MAX_LOGIN_ATTEMPTS,
-                RATE_LIMIT_WINDOW_SECS,
-            )
-        }).await {
+
+        let is_allowed = match rate_check_span
+            .in_scope(|| {
+                check_and_increment_rate_limit(
+                    redis_client,
+                    &rate_limit_key,
+                    MAX_LOGIN_ATTEMPTS,
+                    RATE_LIMIT_WINDOW_SECS,
+                )
+            })
+            .await
+        {
             Ok(allowed) => {
                 rate_check_span.record("result", &"success");
                 rate_check_span.record("rate_limit.allowed", &allowed);
@@ -509,50 +541,53 @@ async fn enforce_login_rate_limit(
                 rate_check_span.record("result", &"failure");
                 rate_check_span.record("error.type", &"redis_operation_failed");
                 rate_check_span.record_error(&rate_limit_error);
-                
+
                 span.record("redis.operation", &"failed");
                 span.record("result", &"fail_open");
                 span.record("fail_open.reason", &"redis_rate_limit_error");
                 span.record_error(&rate_limit_error);
-                
+
                 Log::event(
                     "WARN",
                     "LoginRateLimit",
                     &format!("Redis rate limit operation failed: {}", rate_limit_error),
                     "redis_rate_limit_failed",
-                    "enforce_login_rate_limit"
+                    "enforce_login_rate_limit",
                 );
-                
+
                 login_guard::record_redis_error("rate_limit_operation_failed");
                 true // Fail open
             }
         };
-        
+
         if !is_allowed {
             span.record("result", &"blocked");
             span.record("block.reason", &"rate_limit_exceeded");
             span.record("http.status_code", &429);
-            
+
             Log::event(
                 "INFO",
                 "LoginRateLimit",
-                &format!("Blocked login attempt - rate limit exceeded (identifier length: {})", login.len()),
+                &format!(
+                    "Blocked login attempt - rate limit exceeded (identifier length: {})",
+                    login.len()
+                ),
                 "rate_limit_exceeded",
-                "enforce_login_rate_limit"
+                "enforce_login_rate_limit",
             );
-            
+
             login_guard::record_rate_limit_blocked("login_security");
-            
+
             let error = ApiError::too_many_requests(
-                "Too many login attempts. Please try again in a minute."
+                "Too many login attempts. Please try again in a minute.",
             );
-            
+
             return Err(error.into_response());
         }
-        
+
         span.record("result", &"allowed");
         span.record("rate_limit.within_limits", &true);
-        
+
         Ok(())
     })
     .await
