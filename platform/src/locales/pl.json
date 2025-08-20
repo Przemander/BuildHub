@@ -1,0 +1,140 @@
+{
+  "errors": {
+    "auth": {
+      "invalid_credentials": "Nieprawidłowy adres e-mail lub hasło.",
+      "email_not_verified": "Zweryfikuj swój adres e-mail przed zalogowaniem.",
+      "email_taken": "Adres e-mail jest już zajęty.",
+      "csrf_token_mismatch": "Token CSRF wygasł. Spróbuj ponownie.",
+      "reset_request_missing": "Brak żądania resetu dla tego adresu e-mail.",
+      "session_expired": "Sesja wygasła. Spróbuj ponownie."
+    },
+    "generic": {
+      "validation_error": "Wystąpił błąd walidacji.",
+      "unknown": "Wystąpił nieoczekiwany błąd. Spróbuj ponownie później."
+    }
+  },
+  "navigation": {
+    "home": "Strona główna",
+    "about": "O nas",
+    "sign_in": "Zaloguj się",
+    "logout": "Wyloguj się"
+  },
+  "main": {
+    "title": "Znajdź sprawdzonych specjalistów w Twojej okolicy",
+    "subtitle": "Mamy 501 518 wykonawców, ocenianych średnio na 4.7, z czego 11 169 jest teraz online"
+  },
+  "about": {
+    "title": "Witamy w BuildHub",
+    "subtitle": "Nasza platforma to nowoczesny portal ogłoszeniowy dedykowany branży budowlanej. Łączymy wykonawców, firmy i klientów indywidualnych, ułatwiając znalezienie specjalistów oraz usług w zakresie budowy, remontów i prac wykończeniowych. Dzięki intuicyjnej wyszukiwarce, przejrzystym kategoriom i szczegółowym profilom ogłoszeń, znalezienie odpowiedniego fachowca jest szybkie i bezproblemowe."
+  },
+  "form": {
+    "email": {
+      "label": "Adres e-mail",
+      "placeholder": "Wpisz adres e-mail",
+      "errors": {
+        "required": "Adres e-mail jest wymagany!",
+        "invalid": "Adres e-mail jest nieprawidłowy!"
+      }
+    },
+    "password": {
+      "label": "Hasło",
+      "placeholder": "Wpisz hasło",
+      "errors": {
+        "length": "Hasło jest za krótkie!",
+        "confirmation": "Hasła nie są identyczne!",
+        "required": "Hasło jest wymagane!"
+      }
+    },
+    "search": {
+      "placeholder": "Wyszukaj usługę, której potrzebujesz"
+    }
+  },
+  "forgot_password": {
+    "title": {
+      "triggering": "Nie pamiętasz hasła?",
+      "main": "Resetuj hasło"
+    },
+    "subtitle": {
+      "triggering": "Podaj swój adres e-mail, a wyślemy Ci link do zresetowania hasła.",
+      "main": "Podaj swój adres e-mail i nowe hasło"
+    },
+    "button": {
+      "label": "Zresetuj hasło"
+    },
+    "triggering_button": {
+      "label": "Zapomniałeś hasła do logowania?"
+    },
+    "success": {
+      "link_sent": "Link do resetu hasła został wysłany na podany adres e-mail",
+      "reset": "Twoje hasło zostało pomyślnie zresetowane"
+    }
+  },
+  "login": {
+    "title": "Zaloguj się, aby uzyskać więcej opcji!",
+    "subtitle": "",
+    "divider": {
+      "label": "lub"
+    },
+    "button": {
+      "label": "Zaloguj się"
+    }
+  },
+  "register": {
+    "title": "Utwórz konto, aby uzyskać więcej opcji!",
+    "subtitle": "Po utworzeniu konta możesz przechowywać przesłane logi, wyświetlać je w formie wykresów i udostępniać innym osobom.",
+    "triggering_button": {
+      "label": "Zarejestruj się"
+    },
+    "button": {
+      "label": "Zarejestruj się"
+    },
+    "success": {
+      "link_sent": "Link aktywacyjny został wysłany na podany adres e-mail",
+      "account_activated": "Twoje konto zostało pomyślnie aktywowane. Możesz się teraz zalogować"
+    }
+  },
+  "404": {
+    "button": {
+      "label": "Przejdź do strony głównej"
+    },
+    "title": "Coś poszło nie tak",
+    "subtitle": "Może występować problem z Twoim połączeniem lub naszymi serwerami. Sprawdź swoje połączenie internetowe lub spróbuj ponownie później. Dziękujemy za cierpliwość."
+  },
+  "statute": {
+    "label": "I accept the <span class='text-primary statute-link'>terms</span> of service of buildhub.com",
+    "header": "Terms of Use for the buildhub.com application",
+    "subheader": "Welcome to the buildhub.com application (hereinafter referred to as the “Application”). Before creating an account, please read the following terms of use.",
+    "introduction": {
+      "label": "Introduction",
+      "value": "These Terms of Service define the rules for using the buildhub.com application, which allows for the creating and managing of advertisements. By registering in the Application, the user accepts the terms outlined below."
+    },
+    "account_registration": {
+      "label": "Account Registration",
+      "value": "To create an account in the Application, the user must provide their email address and password. The user agrees to provide true and accurate information and not to share their login credentials with third parties. During registration, the user will receive a confirmation email to activate the account."
+    },
+    "processing_data": {
+      "label": "Collection and Processing of Personal Data",
+      "value": "The Application collects the following personal data: Email address - to enable registration, login and communication with the user. Password - to ensure the security of the user's account. Personal data is processed to provide the services of the Application, including registration, login, and user communication. Users have the right to access, correct, or request the deletion of their data. Data is stored in the Application's database and may also be stored in cookies to manage user preferences, such as language and theme (light/dark). Users can delete these data at any time via their browser settings."
+    },
+    "google_analytics": {
+      "label": "Google Analytics and Other Analytical Tools",
+      "value": "The Application uses analytical tools such as Google Analytics to track user activity on the website, including visit counts and time spent on specific pages. Information collected by Google Analytics may include IP address, device type, browser, geographic data, time spent on the site, and interactions with content. By using the Application, the user consents to the collection and processing of this data for analysis and improvement purposes. Users may opt out of Google Analytics by blocking the relevant cookies in their browser settings."
+    },
+    "cookies": {
+      "label": "Cookies and Local Storage",
+      "value": "The Application uses cookies and local storage to store user preferences such as language selection and theme (light/dark). This data is stored on the user's device to provide a smooth and personalized experience. Users have the right to manage their cookie settings in their browser. Blocking cookies may affect the functionality of some parts of the Application."
+    },
+    "security": {
+      "label": "Security",
+      "value": "User data is stored securely using appropriate technical safeguards. User passwords are stored in encrypted form to ensure their protection. Nevertheless, users should be aware that no method of data storage is completely immune to unauthorized access."
+    },
+    "terms_changes": {
+      "label": "Changes to the Terms",
+      "value": "We reserve the right to modify these Terms of Service at any time. Changes will be published on this page, and users will be notified via the Application. Accepting the updated terms will require users to re-confirm their acceptance of the Terms of Service."
+    },
+    "contact": {
+      "label": "Contact",
+      "value": "If you have any questions regarding these Terms or the Privacy Policy, please contact us at: contact@buildhub.com"
+    }
+  }
+}

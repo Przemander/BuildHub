@@ -1,0 +1,3 @@
+<template>
+  strona główna
+</template>

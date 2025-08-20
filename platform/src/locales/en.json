@@ -1,0 +1,140 @@
+{
+  "errors": {
+    "auth": {
+      "invalid_credentials": "Invalid email or password.",
+      "email_not_verified": "Please verify your email before logging in.",
+      "email_taken": "Email is alerady taken.",
+      "csrf_token_mismatch": "CSRF token expired. Try again.",
+      "reset_request_missing": "Missing reset request for this email address.",
+      "session_expired": "Session expired. Try again."
+    },
+    "generic": {
+      "validation_error": "A validation error occurred.",
+      "unknown": "An unexpected error occurred. Please try again later."
+    }
+  },
+  "navigation": {
+    "home": "Home page",
+    "about": "About",
+    "sign_in": "Sign in",
+    "logout": "Logout"
+  },
+  "main": {
+    "title": "Find trusted specialists in your area",
+    "subtitle": "We have 501,518 contractors, rated on average 4.7, and 11,169 of them are online now"
+  },
+  "about": {
+    "title": "Welcome in BuildHub",
+    "subtitle": "Our platform is a modern classifieds portal dedicated to the construction industry. We connect contractors, companies, and individual clients, making it easy to find professionals and services in construction, renovation, and finishing works. With an intuitive search engine, clear categories, and detailed ad profiles, finding the right specialist is fast and effortless."
+  },
+  "form": {
+    "email": {
+      "label": "Email",
+      "placeholder": "Enter email address",
+      "errors": {
+        "required": "Email address is required!",
+        "invalid": "Email address is invalid!"
+      }
+    },
+    "password": {
+      "label": "Password",
+      "placeholder": "Enter password",
+      "errors": {
+        "length": "Password is too short!",
+        "confirmation": "Passwords do not match!",
+        "required": "Password is required!"
+      }
+    },
+    "search": {
+      "placeholder": "Search for the service you need"
+    }
+  },
+  "forgot_password": {
+    "title": {
+      "triggering": "Forgot your password?",
+      "main": "Reset password"
+    },
+    "subtitle": {
+      "triggering": "Enter your email address and we'll send you a link to reset your password.",
+      "main": "Enter your email address and new password"
+    },
+    "button": {
+      "label": "Reset password"
+    },
+    "triggering_button": {
+      "label": "Forgot login password?"
+    },
+    "success": {
+      "link_sent": "A password reset link has been sent to the provided email address",
+      "reset": "Your password has been reset successfully"
+    }
+  },
+  "login": {
+    "title": "Log in to have more options!",
+    "subtitle": "",
+    "divider": {
+      "label": "or"
+    },
+    "button": {
+      "label": "Sign in"
+    }
+  },
+  "register": {
+    "title": "Create an account to have more options!",
+    "subtitle": "After creating an account, you can store the logs you sent, also display them in the form of charts and share them with other people.",
+    "triggering_button": {
+      "label": "Sign up"
+    },
+    "button": {
+      "label": "Sign up"
+    },
+    "success": {
+      "link_sent": "An activation link has been sent to the provided email address",
+      "account_activated": "Your account has been successfully activated. You may now log in"
+    }
+  },
+  "404": {
+    "button": {
+      "label": "Go to the homepage"
+    },
+    "title": "Something went wrong",
+    "subtitle": "There might be a problem with your connection or our servers. Please check your internet connection or try again later. We appreciate your patience."
+  },
+  "statute": {
+    "label": "I accept the <span class='text-primary statute-link'>terms</span> of service of buildhub.com",
+    "header": "Terms of Use for the buildhub.com application",
+    "subheader": "Welcome to the buildhub.com application (hereinafter referred to as the “Application”). Before creating an account, please read the following terms of use.",
+    "introduction": {
+      "label": "Introduction",
+      "value": "These Terms of Service define the rules for using the buildhub.com application, which allows for the creating and managing of advertisements. By registering in the Application, the user accepts the terms outlined below."
+    },
+    "account_registration": {
+      "label": "Account Registration",
+      "value": "To create an account in the Application, the user must provide their email address and password. The user agrees to provide true and accurate information and not to share their login credentials with third parties. During registration, the user will receive a confirmation email to activate the account."
+    },
+    "processing_data": {
+      "label": "Collection and Processing of Personal Data",
+      "value": "The Application collects the following personal data: Email address - to enable registration, login and communication with the user. Password - to ensure the security of the user's account. Personal data is processed to provide the services of the Application, including registration, login, and user communication. Users have the right to access, correct, or request the deletion of their data. Data is stored in the Application's database and may also be stored in cookies to manage user preferences, such as language and theme (light/dark). Users can delete these data at any time via their browser settings."
+    },
+    "google_analytics": {
+      "label": "Google Analytics and Other Analytical Tools",
+      "value": "The Application uses analytical tools such as Google Analytics to track user activity on the website, including visit counts and time spent on specific pages. Information collected by Google Analytics may include IP address, device type, browser, geographic data, time spent on the site, and interactions with content. By using the Application, the user consents to the collection and processing of this data for analysis and improvement purposes. Users may opt out of Google Analytics by blocking the relevant cookies in their browser settings."
+    },
+    "cookies": {
+      "label": "Cookies and Local Storage",
+      "value": "The Application uses cookies and local storage to store user preferences such as language selection and theme (light/dark). This data is stored on the user's device to provide a smooth and personalized experience. Users have the right to manage their cookie settings in their browser. Blocking cookies may affect the functionality of some parts of the Application."
+    },
+    "security": {
+      "label": "Security",
+      "value": "User data is stored securely using appropriate technical safeguards. User passwords are stored in encrypted form to ensure their protection. Nevertheless, users should be aware that no method of data storage is completely immune to unauthorized access."
+    },
+    "terms_changes": {
+      "label": "Changes to the Terms",
+      "value": "We reserve the right to modify these Terms of Service at any time. Changes will be published on this page, and users will be notified via the Application. Accepting the updated terms will require users to re-confirm their acceptance of the Terms of Service."
+    },
+    "contact": {
+      "label": "Contact",
+      "value": "If you have any questions regarding these Terms or the Privacy Policy, please contact us at: contact@buildhub.com"
+    }
+  }
+}
