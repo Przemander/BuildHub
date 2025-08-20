@@ -1,3 +1,5 @@
+name: BuildHub
+
 services:
   vite_docker:
     image: node:23-alpine3.20
