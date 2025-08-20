@@ -1,10 +1,11 @@
 import AxiosInstance from '../config/axios';
-import { ref, type Ref } from 'vue';
+import { ref } from 'vue';
 import { useRouter } from "vue-router";
 import type { LoginFormInterface, RegistrationFormInterface } from '@/types';
 
-const isAuthenticated: Ref<boolean> = ref(false);
-const userData: Ref<null> = ref(null);
+const isAuthenticated = ref<boolean>(false);
+const userData = ref<null>(null);
+const isLoginDialogVisible = ref<boolean>(false);
 
 export function useAuthentication() {
 
@@ -65,5 +66,6 @@ export function useAuthentication() {
     getUser,
     isAuthenticated,
     userData,
+    isLoginDialogVisible
   }
 }

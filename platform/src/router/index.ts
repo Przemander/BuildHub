@@ -70,19 +70,19 @@ const router = createRouter({
   ]
 });
 
-router.beforeEach(async (to, from, next) => {
-  const { isAuthenticated, getUser } = useAuthentication();
+// router.beforeEach(async (to, from, next) => {
+//   const { isAuthenticated, getUser } = useAuthentication();
 
-  await getUser();
+//   await getUser();
 
-  if (to.meta.isAuth && !isAuthenticated.value) {
-    next('/');
-  }
+//   if (to.meta.isAuth && !isAuthenticated.value) {
+//     next('/');
+//   }
 
-  if (to.name === 'login' && isAuthenticated.value) {
-    next('/files')
-  }
-  return next();
-})
+//   if (to.name === 'login' && isAuthenticated.value) {
+//     next('/files')
+//   }
+//   return next();
+// })
 
 export default router
