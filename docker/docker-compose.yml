@@ -1,9 +1,20 @@
-version: "3.9"
-
 services:
+  vite_docker:
+    image: node:23-alpine3.20
+    container_name: BuildHub_frontend
+    ports:
+      - 3004:3004
+    working_dir: /var/www/html/platform
+    entrypoint: ["/bin/sh", "-c", "npm install && npm run dev"]
+    volumes:
+      - ../platform:/var/www/html/platform
+    tty: true
+    networks:
+      - auth-network
+
   postgres:
     image: postgres:15-alpine
-    container_name: auth-postgres
+    container_name: BuildHub_postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-buildhub}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-bhdbjpak}
@@ -22,7 +33,7 @@ services:
 
   redis:
     image: redis:7-alpine
-    container_name: auth-redis
+    container_name: Buildhub_redis
     command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
     ports:
       - "${REDIS_PORT:-6380}:6379"  # Change external port to 6380
@@ -38,10 +49,10 @@ services:
 
   auth-service:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ../
+      dockerfile: docker/rust.dockerfile
     image: buildhub/auth-service:latest
-    container_name: auth-service
+    container_name: BuildHub_auth
     depends_on:
       postgres:
         condition: service_healthy
@@ -94,13 +105,13 @@ services:
   # Optional: Prometheus for metrics
   prometheus:
     image: prom/prometheus:latest
-    container_name: auth-prometheus
+    container_name: BuildHub_prometheus
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
     volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - prometheus_data:/prometheus
+      - ../backend/auth-service/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../backend/auth-service/prometheus_data:/prometheus
     ports:
       - "${PROMETHEUS_PORT:-9090}:9090"
     networks:
@@ -111,12 +122,12 @@ services:
   # Optional: Grafana for visualization
   grafana:
     image: grafana/grafana:latest
-    container_name: auth-grafana
+    container_name: BuildHub_grafana
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
       - GF_USERS_ALLOW_SIGN_UP=false
     volumes:
-      - grafana_data:/var/lib/grafana
+      - ../backend/auth-service/grafana_data:/var/lib/grafana
     ports:
       - "${GRAFANA_PORT:-3001}:3000"
     networks:

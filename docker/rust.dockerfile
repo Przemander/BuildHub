@@ -9,10 +9,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # Copy manifests first for layer caching
-COPY Cargo.toml Cargo.lock ./
+COPY backend/auth-service/Cargo.toml ./
+COPY backend/auth-service/Cargo.lock ./
 
 # Copy migrations directory (required for embed_migrations!)
-COPY migrations ./migrations
+COPY backend/auth-service/migrations ./migrations
 
 # Create dummy src to build dependencies
 RUN mkdir -p src && echo "fn main() {}" > src/main.rs
@@ -20,7 +21,7 @@ RUN cargo build --release
 RUN rm -rf src target/release/deps/auth_service*
 
 # Copy real source and build
-COPY src ./src
+COPY backend/auth-service/src ./src
 
 # Build the binary
 RUN cargo build --release
