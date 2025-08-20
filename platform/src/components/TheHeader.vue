@@ -9,7 +9,7 @@
       </v-list-item>
       <v-list-item to="/about" :active="route.name === 'about'" active-class="text-success">{{
         i18n.global.t('navigation.about') }}</v-list-item>
-      <v-list-item>{{
+      <v-list-item @click="openLoginDialog()">{{
         i18n.global.t('navigation.sign_in') }}</v-list-item>
       <v-list-item class="mt-auto">
         <v-btn-toggle v-model="themeSwitch" mandatory @update:modelValue="toggleTheme">
@@ -45,7 +45,7 @@
           {{ i18n.global.t('navigation.about') }}
         </RouterLink>
       </v-btn>
-      <v-btn v-if="!isAuthenticated" :prepend-icon="mdiAccount" class="d-none d-md-flex">
+      <v-btn v-if="!isAuthenticated" :prepend-icon="mdiAccount" class="d-none d-md-flex" @click="openLoginDialog()">
         {{ i18n.global.t('navigation.sign_in') }}
       </v-btn>
       <v-btn-toggle v-model="themeSwitch" class="d-none d-md-flex" mandatory @update:modelValue="toggleTheme">
@@ -74,7 +74,7 @@ import LanguageSwitcher from '@/components/LanguageSwitcher.vue'
 
 const route = useRoute();
 const { toggle: toggleTheme, theme } = useTheme();
-const { isAuthenticated, logOut } = useAuthentication();
+const { isAuthenticated, logOut, openLoginDialog } = useAuthentication();
 
 const drawer = ref<boolean>(false);
 const themeSwitch = ref<boolean>(theme.value === 'light');

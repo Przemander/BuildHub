@@ -2,7 +2,7 @@
   <v-container>
     STRONA GÓWNA
   </v-container>
-  <v-dialog v-model="isLoginDialogVisible" max-width="400" transition="dialog-bottom-transition">
+  <v-dialog v-model="isLoginDialogVisible" max-width="600" transition="dialog-bottom-transition">
     <TheLoginForm />
   </v-dialog>
 </template>

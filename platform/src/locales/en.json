@@ -71,7 +71,7 @@
   },
   "login": {
     "title": "Log in to have more options!",
-    "subtitle": "",
+    "subtitle": "After creating an account, you can add advertisements and contact with another users.",
     "divider": {
       "label": "or"
     },
@@ -81,7 +81,7 @@
   },
   "register": {
     "title": "Create an account to have more options!",
-    "subtitle": "After creating an account, you can store the logs you sent, also display them in the form of charts and share them with other people.",
+    "subtitle": "After creating an account, you can creating advertisements and contact with another users.",
     "triggering_button": {
       "label": "Sign up"
     },

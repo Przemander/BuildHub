@@ -59,11 +59,16 @@ export function useAuthentication() {
     }
   }
 
+  const openLoginDialog = () => {
+    isLoginDialogVisible.value = true;
+  }
+
   return {
     login,
     register,
     logOut,
     getUser,
+    openLoginDialog,
     isAuthenticated,
     userData,
     isLoginDialogVisible

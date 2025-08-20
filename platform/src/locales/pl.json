@@ -71,7 +71,7 @@
   },
   "login": {
     "title": "Zaloguj się, aby uzyskać więcej opcji!",
-    "subtitle": "",
+    "subtitle": "Po utworzeniu konta możesz dodawać ogłoszenia oraz kontaktować się z innymi użytkownikami",
     "divider": {
       "label": "lub"
     },
@@ -81,7 +81,7 @@
   },
   "register": {
     "title": "Utwórz konto, aby uzyskać więcej opcji!",
-    "subtitle": "Po utworzeniu konta możesz przechowywać przesłane logi, wyświetlać je w formie wykresów i udostępniać innym osobom.",
+    "subtitle": "Po utworzeniu konta możesz dodawać ogłoszenia oraz kontaktować się z innymi użytkownikami",
     "triggering_button": {
       "label": "Zarejestruj się"
     },
