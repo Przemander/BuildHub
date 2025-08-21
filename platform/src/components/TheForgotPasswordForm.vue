@@ -37,8 +37,8 @@ onBeforeUnmount(() => {
 
 </script>
 <template>
-  <v-card class="mb-4 rounded-lg px-10 py-6" variant="elevated" :title="i18n.global.t('forgot_password.title')"
-    :subtitle="i18n.global.t('forgot_password.subtitle')">
+  <v-card class="mb-4 rounded-lg px-10 py-6" variant="elevated" :title="i18n.global.t('forgot_password.title.triggering')"
+    :subtitle="i18n.global.t('forgot_password.subtitle.triggering')">
 
     <v-btn class="position-absolute top-0 right-0 mt-2 mr-2 z-index-1" variant="text"
       @click="isForgotPasswordModalVisible = false">

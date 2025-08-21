@@ -72,7 +72,7 @@ const submit = async (): Promise<void> => {
       </v-btn>
     </v-form>
   </v-card>
-  <v-dialog v-model="isForgotPasswordModalVisible" max-width="600">
+  <v-dialog v-model="isForgotPasswordModalVisible" max-width="650">
     <TheForgotPasswordForm />
   </v-dialog>
 </template>
