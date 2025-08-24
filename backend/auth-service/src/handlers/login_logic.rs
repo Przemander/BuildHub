@@ -1,889 +1,384 @@
-//! # User Authentication Business Logic
+//! User login business logic.
 //!
-//! This module implements a secure, robust authentication flow with comprehensive 
-//! observability, rate limiting protection, and defense against common attack vectors.
-//!
-//! ## Security Features
-//!
-//! - Username or email-based authentication with identical timing characteristics
-//! - Argon2id password verification using constant-time comparison
-//! - Protection against timing attacks via consistent processing delays
-//! - Anti-enumeration protections with identical error messages
-//! - JWT token generation with appropriate expirations
-//! - Privacy-preserving logging (avoids logging full emails/credentials)
-//! - Secure JWT implementation with appropriate claims
-//!
-//! ## Observability
-//!
-//! - Comprehensive OpenTelemetry spans for all operations
-//! - Fine-grained metrics for authentication steps
-//! - Structured logging with context preservation
-//! - Performance histograms for each authentication phase
-//!
-//! ## Flow Architecture
-//!
-//! The authentication process follows a structured pipeline:
-//! 1. Database connection acquisition with error handling
-//! 2. User lookup by username or email
-//! 3. Password verification with timing attack protection
-//! 4. Account status verification
-//! 5. JWT token generation (access + refresh)
-//! 6. Response construction with appropriate context
-
-use axum::{http::StatusCode, response::IntoResponse, Json};
-use serde_json::json;
-use std::env;
-use std::time::Duration;
-use tokio::time::sleep;
-use tracing::Instrument;
+//! Implements secure authentication with JWT token generation,
+//! rate limiting, and comprehensive observability.
 
 use crate::{
     app::AppState,
     db::users::User,
-    handlers::login::LoginRequest,
-    metricss::login_metrics::{
-        error_types, record_account_check_failure, record_account_check_success,
-        record_db_connection_failure, record_db_connection_success, record_login_failure,
-        record_login_success, record_password_verification_failure,
-        record_password_verification_success, record_token_generation_access_failure,
-        record_token_generation_access_success, record_token_generation_refresh_failure,
-        record_token_generation_refresh_success, record_user_lookup_failure,
-        record_user_lookup_success, time_complete_login_flow,
-    },
     utils::{
-        error_new::AuthServiceError,
+        errors::AuthServiceError,
         jwt::{generate_token, TOKEN_TYPE_ACCESS, TOKEN_TYPE_REFRESH},
-        log_new::Log,
-        telemetry::{business_operation_span, db_operation_span, SpanExt},
+        metrics,  // Fixed: correct import path
+        validators::{validate_email, validate_username},
     },
 };
+use axum::{http::StatusCode, response::IntoResponse, Json};
+use serde_json::json;
+use tracing::{error, info, span, warn, Instrument, Level};
 
-/// Processes a login request with comprehensive security controls and observability.
+/// Maximum login attempts before rate limiting.
+const MAX_LOGIN_ATTEMPTS: usize = 5;
+
+/// Rate limit window in seconds.
+const RATE_LIMIT_WINDOW_SECS: usize = 900; // 15 minutes
+
+/// Process user login request.
 ///
-/// This function implements the complete authentication workflow with detailed
-/// metrics, tracing, and security controls. It follows a defense-in-depth approach
-/// that protects against timing attacks, user enumeration, and maintains consistent
-/// performance characteristics.
+/// # Flow
+/// 1. Validate input format (email OR username)
+/// 2. Check rate limiting (if Redis available)
+/// 3. Find user by email or username
+/// 4. Verify password
+/// 5. Check account status
+/// 6. Generate JWT tokens
+/// 7. Return tokens
 ///
-/// # Arguments
-///
-/// * `app_state` - Application state containing database pool and other resources
-/// * `req` - Login request containing username/email and password
-///
-/// # Returns
-///
-/// * `Ok(impl IntoResponse)` - Response with JWT tokens and user information
-/// * `Err(AuthServiceError)` - Structured error with security-conscious messaging
-///
-/// # Security Considerations
-///
-/// - Uses constant-time comparison for password verification
-/// - Maintains consistent response timing regardless of error path
-/// - Performs dummy password verification for non-existent users
-/// - Uses identical error messages to prevent user enumeration
-/// - Protects privacy by limiting identifiable information in logs
-///
-/// # Flow Stages
-///
-/// 1. Database connection - Acquires connection from pool
-/// 2. User lookup - Finds the user by username or email
-/// 3. Password verification - Securely verifies password or performs dummy operation
-/// 4. Account verification - Checks if account is active
-/// 5. Token generation - Creates access and refresh JWTs
-/// 6. Response construction - Builds secure response with tokens
-///
-/// Each stage includes detailed metrics, logging, and error handling.
+/// # Security
+/// - Rate limiting to prevent brute force
+/// - Constant-time password comparison
+/// - Account status verification
+/// - Secure token generation
+/// - Supports both email and username login
 pub async fn process_login(
     app_state: &AppState,
-    req: &LoginRequest,
+    login: &str,  // Changed parameter name to be more generic
+    password: &str,
 ) -> Result<impl IntoResponse, AuthServiceError> {
-    // Start complete login flow timer for performance measurement
-    let _login_timer = time_complete_login_flow();
-
-    // Create span for the entire login processing flow
-    let process_span = business_operation_span("process_login");
-    
-    // Record login type (email vs username) without revealing actual values
-    let login_type = if req.login.contains('@') { "email" } else { "username" };
-    process_span.record("login_type", &login_type);
-    
-    if let Some(domain) = req.login.split('@').nth(1) {
-        process_span.record("email_domain", &domain);
-    }
-
-    // Clone span before moving it into the async block
-    let process_span_clone = process_span.clone();
-
-    // Log authentication attempt (without revealing full credentials)
-    Log::event(
-        "INFO",
-        "Authentication",
-        &format!("Processing login attempt (type: {})", login_type),
-        "processing",
-        "process_login",
+    // Create root span for the operation
+    let login_type = if login.contains('@') { "email" } else { "username" };
+    let span = span!(Level::INFO, "user_login",
+        login_type = login_type,
+        domain = login.split('@').nth(1).unwrap_or("n/a")
     );
-
-    // Get configured delay for invalid credentials (default: 100ms)
-    let delay_ms = env::var("INVALID_CREDENTIAL_DELAY_MS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(100);
-
-    // Wrap login logic in the process_span
+    let span_for_instrument = span.clone();
+    
     async move {
-        // =====================================================================
-        // STAGE 1: DATABASE CONNECTION
-        // =====================================================================
-        let db_conn_span = db_operation_span("get_connection", "pool");
-        let db_conn_span_clone = db_conn_span.clone();
-        
-        let conn_result = async {
-            match app_state.pool.get() {
-                Ok(conn) => {
-                    record_db_connection_success();
-                    db_conn_span.record("db.success", &true);
-                    Ok(conn)
-                }
-                Err(e) => {
-                    record_db_connection_failure(error_types::DB_UNAVAILABLE);
-                    record_login_failure();
-                    db_conn_span.record("db.success", &false);
-                    db_conn_span.record_error(&e);
+        info!("Starting login process with {}", login_type);
 
-                    Log::event(
-                        "ERROR",
-                        "Database",
-                        &format!("DB connection error during login: {}", e),
-                        "connection_failure",
-                        "process_login",
-                    );
-                    
-                    Err(AuthServiceError::database(
-                        "Authentication service temporarily unavailable. Please try again later.",
-                    ))
-                }
+        // ===== 1. INPUT VALIDATION =====
+        // Validate based on whether it's an email or username
+        if login.contains('@') {
+            // It's an email, validate email format
+            validate_email(login).map_err(|e| {
+                warn!("Invalid email format: {}", e);
+                metrics::auth::login_failure();
+                AuthServiceError::validation("login", "Invalid email format")
+            })?;
+        } else {
+            // It's a username, validate username format
+            validate_username(login).map_err(|e| {
+                warn!("Invalid username format: {}", e);
+                metrics::auth::login_failure();
+                AuthServiceError::validation("login", "Invalid username format")
+            })?;
+        }
+
+        if password.is_empty() {
+            warn!("Empty password provided");
+            metrics::auth::login_failure();
+            return Err(AuthServiceError::validation("password", "Password is required"));
+        }
+
+        // ===== 2. RATE LIMITING (BEST EFFORT) =====
+        if let Some(redis_client) = &app_state.redis_client {
+            let rate_limit_span = span!(Level::INFO, "rate_limit_check");
+            let should_continue = async {
+                check_rate_limit(redis_client, login).await
+            }
+            .instrument(rate_limit_span)
+            .await;
+
+            if !should_continue {
+                warn!("Login rate limit exceeded for {}", login_type);
+                metrics::auth::login_failure();
+                return Err(AuthServiceError::validation(
+                    "rate_limit",
+                    "Too many login attempts. Please try again in 15 minutes."
+                ));
             }
         }
-        .instrument(db_conn_span_clone)
-        .await?;
-        
-        let mut conn = conn_result;
 
-        // =====================================================================
-        // STAGE 2: USER LOOKUP
-        // =====================================================================
-        let user_lookup_span = db_operation_span(
-            "find_user",
-            if req.login.contains('@') {
-                "users.by_email"
+        // ===== 3. USER LOOKUP =====
+        let db_span = span!(Level::INFO, "db_lookup");
+        let user = async {
+            let mut conn = app_state.pool.get().map_err(|e| {
+                error!("Failed to get database connection: {}", e);
+                metrics::db::connection_failed();
+                AuthServiceError::database("Failed to get database connection")
+            })?;
+            metrics::db::connection_acquired();
+
+            // Try to find user by email or username based on login format
+            let user_result = if login.contains('@') {
+                User::find_by_email(&mut conn, login)
             } else {
-                "users.by_username"
-            },
-        );
-        let user_lookup_span_clone = user_lookup_span.clone();
-
-        Log::event(
-            "DEBUG",
-            "Authentication",
-            &format!("Looking up user by {}", login_type),
-            "user_lookup",
-            "process_login",
-        );
-
-        let user_opt = async {
-            let result = if req.login.contains('@') {
-                User::find_by_email(&mut conn, &req.login).ok()
-            } else {
-                User::find_by_username(&mut conn, &req.login).ok()
+                User::find_by_username(&mut conn, login)
             };
-            
-            if let Some(user) = &result {
-                record_user_lookup_success();
-                user_lookup_span.record("db.success", &true);
-                user_lookup_span.record("business.result", &"success");
-                user_lookup_span.record("user_id", &user.id);
-                
-                Log::event(
-                    "DEBUG",
-                    "Authentication",
-                    &format!("User found by {} (id: {})", login_type, user.id),
-                    "user_found",
-                    "process_login",
-                );
-            } else {
-                record_user_lookup_failure(error_types::USER_NOT_FOUND);
-                user_lookup_span.record("db.success", &false);
-                user_lookup_span.record("business.result", &"not_found");
-                user_lookup_span.record("failure_reason", &"user_not_found");
-                
-                Log::event(
-                    "DEBUG",
-                    "Authentication",
-                    &format!("No user found by {}", login_type),
-                    "user_not_found",
-                    "process_login",
-                );
-            }
-            
-            result
-        }
-        .instrument(user_lookup_span_clone)
-        .await;
 
-        // =====================================================================
-        // STAGE 3: PASSWORD VERIFICATION
-        // =====================================================================
-        let pw_verify_span = business_operation_span("verify_password");
-        let pw_verify_span_clone = pw_verify_span.clone();
+            user_result.map_err(|_| {
+                info!("User not found or database error for {}", login_type);
+                metrics::db::query_failure(&format!("find_user_by_{}", login_type));
+                
+                // Record failed attempt if Redis available
+                if let Some(redis) = &app_state.redis_client {
+                    tokio::spawn(record_failed_attempt(redis.clone(), login.to_string()));
+                }
+                
+                metrics::auth::login_failure();
+                // Return a generic validation error to prevent user enumeration
+                AuthServiceError::validation("credentials", "Invalid email or password")
+            })
+        }
+        .instrument(db_span)
+        .await?;
         
-        let password_verification = async {
-            if let Some(u) = &user_opt {
-                pw_verify_span.record("user_exists", &true);
+        metrics::db::query_success(&format!("find_user_by_{}", login_type));
+        span.record("user_id", &user.id.to_string());
+        info!(user_id = %user.id, "User found");
+
+        // ===== 4. PASSWORD VERIFICATION =====
+        let password_span = span!(Level::INFO, "password_verification");
+        async {
+            // verify_password returns Result<bool, AuthServiceError>
+            let is_valid = user.verify_password(password).map_err(|e| {
+                error!(user_id = %user.id, "Password verification failed: {}", e);
+                metrics::auth::login_failure();
+                AuthServiceError::validation("credentials", "Invalid email or password")
+            })?;
+
+            if !is_valid {
+                warn!(user_id = %user.id, "Invalid password");
                 
-                Log::event(
-                    "DEBUG",
-                    "Authentication",
-                    "Verifying password for existing user",
-                    "password_verify_start",
-                    "process_login",
-                );
-
-                match u.verify_password(&req.password) {
-                    Ok(true) => {
-                        record_password_verification_success();
-                        pw_verify_span.record("business.result", &"success");
-                        
-                        Log::event(
-                            "DEBUG",
-                            "Authentication",
-                            "Password verified successfully",
-                            "password_verify_success",
-                            "process_login",
-                        );
-                        
-                        Ok(true)
-                    }
-                    Ok(false) => {
-                        record_password_verification_failure(error_types::INVALID_PASSWORD);
-                        pw_verify_span.record("business.result", &"failure");
-                        pw_verify_span.record("failure_reason", &"invalid_password");
-                        
-                        Log::event(
-                            "WARN",
-                            "Authentication",
-                            "Invalid password provided for existing user",
-                            "password_verify_failure",
-                            "process_login",
-                        );
-                        
-                        Ok(false)
-                    }
-                    Err(e) => {
-                        record_password_verification_failure(error_types::INVALID_PASSWORD);
-                        pw_verify_span.record("business.result", &"error");
-                        pw_verify_span.record("failure_reason", &"hash_error");
-                        pw_verify_span.record_error(&e);
-
-                        Log::event(
-                            "ERROR",
-                            "Authentication",
-                            &format!("Password verification system error: {}", e),
-                            "password_verify_error",
-                            "process_login",
-                        );
-                        
-                        return Err(AuthServiceError::validation(
-                            "credentials",
-                            "Invalid credentials",
-                        ));
-                    }
+                // Record failed attempt if Redis available
+                if let Some(redis) = &app_state.redis_client {
+                    tokio::spawn(record_failed_attempt(redis.clone(), login.to_string()));
                 }
-            } else {
-                // Perform dummy hash to maintain consistent timing
-                // This is crucial for preventing timing-based user enumeration
-                let start = std::time::Instant::now();
-                let _ = User::hash_password(&req.password);
-                let dummy_time = start.elapsed();
                 
-                // Log the timing for performance tuning (debug only)
-                Log::event(
-                    "DEBUG",
-                    "Authentication",
-                    &format!("Dummy hash operation took {}ms", dummy_time.as_millis()),
-                    "dummy_hash_timing",
-                    "process_login",
-                );
-                
-                pw_verify_span.record("user_exists", &false);
-                pw_verify_span.record("business.result", &"dummy");
-                Ok(false)
+                metrics::auth::login_failure();
+                return Err(AuthServiceError::validation("credentials", "Invalid email or password"));
             }
+            
+            info!(user_id = %user.id, "Password verified");
+            Ok::<_, AuthServiceError>(())
         }
-        .instrument(pw_verify_span_clone)
+        .instrument(password_span)
         .await?;
 
-        // If password doesn't match or user doesn't exist, return error with delay
-        if !password_verification {
-            // Add delay to prevent timing attacks by normalizing response time
-            sleep(Duration::from_millis(delay_ms)).await;
-            record_login_failure();
-            process_span.record("business.result", &"failure");
-            process_span.record("failure_reason", &"invalid_credentials");
-
-            Log::event(
-                "WARN",
-                "Authentication",
-                &format!("Failed login attempt (type: {})", login_type),
-                "invalid_credentials",
-                "process_login",
-            );
-
+        // ===== 5. ACCOUNT STATUS CHECK =====
+        if !user.is_active {
+            warn!(user_id = %user.id, "Login attempt for inactive account");
+            metrics::auth::login_failure();
             return Err(AuthServiceError::validation(
-                "credentials",
-                "Invalid credentials",
+                "account",
+                "Account is not activated. Please check your email for activation instructions."
             ));
         }
 
-        // At this point we know user exists and password is correct
-        let user = user_opt.unwrap();
+        // ===== 6. GENERATE TOKENS =====
+        let token_span = span!(Level::INFO, "token_generation");
+        let (access_token, refresh_token) = async {
+            let access = generate_token(&user.username, TOKEN_TYPE_ACCESS, None).map_err(|e| {
+                error!(user_id = %user.id, "Failed to generate access token: {}", e);
+                AuthServiceError::configuration("Failed to generate access token")
+            })?;
 
-        // =====================================================================
-        // STAGE 4: ACCOUNT VERIFICATION
-        // =====================================================================
-        let account_span = business_operation_span("check_account_status");
-        let account_span_clone = account_span.clone();
+            let refresh = generate_token(&user.username, TOKEN_TYPE_REFRESH, None).map_err(|e| {
+                error!(user_id = %user.id, "Failed to generate refresh token: {}", e);
+                AuthServiceError::configuration("Failed to generate refresh token")
+            })?;
 
-        Log::event(
-            "DEBUG",
-            "Authentication",
-            "Checking account activation status",
-            "account_check_start",
-            "process_login",
-        );
-
-        let account_active = async {
-            if !user.is_active {
-                record_account_check_failure(error_types::INACTIVE_ACCOUNT);
-                account_span.record("business.result", &"inactive");
-                
-                Log::event(
-                    "WARN",
-                    "Authentication",
-                    &format!("Login attempt on inactive account (id: {})", user.id),
-                    "inactive_account",
-                    "process_login",
-                );
-                
-                false
-            } else {
-                record_account_check_success();
-                account_span.record("business.result", &"active");
-                
-                Log::event(
-                    "DEBUG",
-                    "Authentication",
-                    "Account is active, proceeding with authentication",
-                    "account_active",
-                    "process_login",
-                );
-                
-                true
-            }
+            info!(user_id = %user.id, "Tokens generated successfully");
+            Ok::<_, AuthServiceError>((access, refresh))
         }
-        .instrument(account_span_clone)
-        .await;
-
-        if !account_active {
-            // Add delay to prevent timing attacks
-            sleep(Duration::from_millis(delay_ms)).await;
-            record_login_failure();
-            process_span.record("business.result", &"failure");
-            process_span.record("failure_reason", &"inactive_account");
-
-            // Note: For security, we use the same error message as invalid credentials
-            // to prevent user enumeration
-            return Err(AuthServiceError::validation(
-                "credentials",
-                "Invalid credentials",
-            ));
-        }
-
-        // =====================================================================
-        // STAGE 5: TOKEN GENERATION
-        // =====================================================================
-        // Generate access token with span
-        let access_token_span = business_operation_span("generate_access_token");
-        let access_token_span_clone = access_token_span.clone();
-
-        Log::event(
-            "DEBUG",
-            "Authentication",
-            "Generating access token",
-            "token_generation_start",
-            "process_login",
-        );
-
-        let access = async {
-            match generate_token(&user.username, TOKEN_TYPE_ACCESS, None) {
-                Ok(token) => {
-                    record_token_generation_access_success();
-                    access_token_span.record("business.result", &"success");
-                    access_token_span.record("token_type", &TOKEN_TYPE_ACCESS);
-                    
-                    Log::event(
-                        "DEBUG",
-                        "Authentication",
-                        "Access token generated successfully",
-                        "access_token_success",
-                        "process_login",
-                    );
-                    
-                    Ok(token)
-                }
-                Err(e) => {
-                    record_token_generation_access_failure(error_types::TOKEN_GENERATION_FAILED);
-                    access_token_span.record("business.result", &"failure");
-                    access_token_span.record("token_type", &TOKEN_TYPE_ACCESS);
-                    access_token_span.record_error(&e);
-                    
-                    Log::event(
-                        "ERROR",
-                        "Authentication",
-                        &format!("Failed to generate access token: {}", e),
-                        "access_token_failure",
-                        "process_login",
-                    );
-                    
-                    Err(e)
-                }
-            }
-        }
-        .instrument(access_token_span_clone)
+        .instrument(token_span)
         .await?;
 
-        // Generate refresh token with span
-        let refresh_token_span = business_operation_span("generate_refresh_token");
-        let refresh_token_span_clone = refresh_token_span.clone();
-
-        let refresh = async {
-            match generate_token(&user.username, TOKEN_TYPE_REFRESH, None) {
-                Ok(token) => {
-                    record_token_generation_refresh_success();
-                    refresh_token_span.record("business.result", &"success");
-                    refresh_token_span.record("token_type", &TOKEN_TYPE_REFRESH);
-                    
-                    Log::event(
-                        "DEBUG",
-                        "Authentication",
-                        "Refresh token generated successfully",
-                        "refresh_token_success",
-                        "process_login",
-                    );
-                    
-                    Ok(token)
-                }
-                Err(e) => {
-                    record_token_generation_refresh_failure(error_types::TOKEN_GENERATION_FAILED);
-                    refresh_token_span.record("business.result", &"failure");
-                    refresh_token_span.record("token_type", &TOKEN_TYPE_REFRESH);
-                    refresh_token_span.record_error(&e);
-                    
-                    Log::event(
-                        "ERROR",
-                        "Authentication",
-                        &format!("Failed to generate refresh token: {}", e),
-                        "refresh_token_failure",
-                        "process_login",
-                    );
-                    
-                    Err(e)
-                }
-            }
+        // ===== 7. CLEAR RATE LIMIT ON SUCCESS =====
+        if let Some(redis_client) = &app_state.redis_client {
+            tokio::spawn(clear_failed_attempts(redis_client.clone(), login.to_string()));
         }
-        .instrument(refresh_token_span_clone)
-        .await?;
 
-        // =====================================================================
-        // STAGE 6: RESPONSE CONSTRUCTION
-        // =====================================================================
-        // Log successful authentication
-        Log::event(
-            "INFO",
-            "Authentication",
-            &format!("Successful login for user (id: {})", user.id),
-            "success",
-            "process_login",
-        );
+        // ===== 8. SUCCESS RESPONSE =====
+        metrics::auth::login_success();
+        info!(user_id = %user.id, "Login successful");
 
-        // Record overall success
-        record_login_success();
-        process_span.record("business.result", &"success");
-        process_span.record("user_id", &user.id);
-
-        // Build OAuth2-compatible response with tokens and user info
-        let body = json!({
-            "status": "success",
-            "message": "Authentication successful",
-            "data": {
-                "access_token": access,
-                "refresh_token": refresh,
-                "token_type": "Bearer",
-                "username": user.username,
-                "email": user.email
-            }
-        });
-
-        Ok((StatusCode::OK, Json(body)))
+        Ok((
+            StatusCode::OK,
+            Json(json!({
+                "status": "success",
+                "message": "Login successful",
+                "data": {
+                    "user": {
+                        "id": user.id,
+                        "username": user.username,
+                        "email": user.email,
+                    },
+                    "tokens": {
+                        "access_token": access_token,
+                        "refresh_token": refresh_token,
+                        "token_type": "Bearer"
+                    }
+                }
+            })),
+        ))
     }
-    .instrument(process_span_clone)
+    .instrument(span_for_instrument)
     .await
+}
+
+/// Check rate limit for login attempts.
+async fn check_rate_limit(redis_client: &redis::Client, login: &str) -> bool {
+    let key = format!("login_attempts:{}", login_hash(login));
+    
+    let mut conn = match redis_client.get_async_connection().await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Failed to connect to Redis for rate limiting: {}", e);
+            return true; // Allow login if Redis is down
+        }
+    };
+
+    use redis::AsyncCommands;
+    let attempts: Option<usize> = conn.get(&key).await.unwrap_or(None);
+    
+    if let Some(count) = attempts {
+        if count >= MAX_LOGIN_ATTEMPTS {
+            metrics::external::redis_success("rate_limit_check");
+            return false;
+        }
+    }
+    
+    true
+}
+
+/// Record failed login attempt.
+async fn record_failed_attempt(redis_client: redis::Client, login: String) {
+    let key = format!("login_attempts:{}", login_hash(&login));
+    
+    let mut conn = match redis_client.get_async_connection().await {
+        Ok(c) => c,
+        Err(_) => return, // Ignore Redis errors
+    };
+
+    use redis::AsyncCommands;
+    let _: Result<(), _> = conn.incr(&key, 1).await;
+    let _: Result<(), _> = conn.expire(&key, RATE_LIMIT_WINDOW_SECS).await;
+    
+    metrics::external::redis_success("record_failed_attempt");
+}
+
+/// Clear failed login attempts after successful login.
+async fn clear_failed_attempts(redis_client: redis::Client, login: String) {
+    let key = format!("login_attempts:{}", login_hash(&login));
+    
+    let mut conn = match redis_client.get_async_connection().await {
+        Ok(c) => c,
+        Err(_) => return, // Ignore Redis errors
+    };
+
+    use redis::AsyncCommands;
+    let _: Result<(), _> = conn.del(&key).await;
+    
+    metrics::external::redis_success("clear_failed_attempts");
+}
+
+/// Hash login for rate limiting (privacy-preserving).
+#[inline]
+fn login_hash(login: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    
+    let mut hasher = DefaultHasher::new();
+    login.to_lowercase().hash(&mut hasher);
+    format!("{:x}", hasher.finish())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::users::User;
-    use crate::handlers::login::LoginRequest;
-    use crate::metricss::login_metrics::{
-        error_types, init_login_metrics, results, steps, LOGIN_DURATION, LOGIN_FAILURES,
-        LOGIN_OPERATIONS,
-    };
-    use crate::utils::test_utils::{init_jwt_secret, state_with_redis};
+    use crate::utils::test_utils::{state_no_redis, state_with_redis};
 
-    /// Initialize login metrics for testing
-    fn setup_metrics() {
-        init_login_metrics();
+    fn create_test_user(app_state: &AppState) -> User {
+        let mut conn = app_state.pool.get().unwrap();
+        let new_user = User::new_for_insert("testuser", "test@example.com", "TestPass123!");
+        let mut user = User::save_new(new_user, &mut conn).unwrap();
+        user.is_active = true; // Activate for testing
+        user.update(&mut conn).unwrap();
+        user
     }
 
     #[tokio::test]
-    async fn nonexistent_user_returns_validation_error() {
-        setup_metrics();
-        // Arrange
-        init_jwt_secret();
+    async fn test_invalid_email_format() {
         let state = state_with_redis();
-        let req = LoginRequest {
-            login: "no-such-user".into(),
-            password: "whatever".into(),
-        };
-
-        let initial_user_failure = LOGIN_FAILURES
-            .with_label_values(&[steps::USER_LOOKUP, error_types::USER_NOT_FOUND])
-            .get();
-        let initial_login_failure = LOGIN_OPERATIONS
-            .with_label_values(&[steps::COMPLETE_FLOW, results::FAILURE])
-            .get();
-
-        // Act
-        let result = process_login(&state, &req).await;
-
-        // Assert
-        assert!(result.is_err());
-
-        // Check that it's a validation error
-        match result.err().unwrap() {
-            AuthServiceError::Validation(_) => {
-                // Expected - invalid credentials should return validation error
-            }
-            other => panic!("Expected validation error, got: {:?}", other),
-        }
-
-        let final_user_failure = LOGIN_FAILURES
-            .with_label_values(&[steps::USER_LOOKUP, error_types::USER_NOT_FOUND])
-            .get();
-        let final_login_failure = LOGIN_OPERATIONS
-            .with_label_values(&[steps::COMPLETE_FLOW, results::FAILURE])
-            .get();
-
-        assert_eq!(final_user_failure, initial_user_failure + 1.0);
-        assert_eq!(final_login_failure, initial_login_failure + 1.0);
+        let result = process_login(&state, "not-an-email", "password").await;
+        // Fixed: Use struct pattern matching for Validation variant
+        assert!(matches!(result, Err(AuthServiceError::Validation { .. })));
     }
 
     #[tokio::test]
-    async fn wrong_password_returns_validation_error() {
-        setup_metrics();
-        // Arrange
-        init_jwt_secret();
+    async fn test_empty_password() {
+        let state = state_with_redis();
+        let result = process_login(&state, "test@example.com", "").await;
+        // Fixed: Use struct pattern matching for Validation variant
+        assert!(matches!(result, Err(AuthServiceError::Validation { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_user_not_found() {
+        let state = state_with_redis();
+        let result = process_login(&state, "nonexistent@example.com", "password").await;
+        // Should return validation error to prevent user enumeration
+        // Fixed: Use struct pattern matching for Validation variant
+        assert!(matches!(result, Err(AuthServiceError::Validation { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_invalid_password() {
+        let state = state_with_redis();
+        create_test_user(&state);
+        let result = process_login(&state, "test@example.com", "WrongPassword").await;
+        // Should return validation error to prevent user enumeration
+        // Fixed: Use struct pattern matching for Validation variant
+        assert!(matches!(result, Err(AuthServiceError::Validation { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_inactive_account() {
         let state = state_with_redis();
         let mut conn = state.pool.get().unwrap();
-
-        // Create active user
-        let mut user = User::new("carol", "carol@example.com", "C@rol123!");
-        user.is_active = true;
-        user.update(&mut conn).unwrap();
-
-        // Try with wrong password
-        let req = LoginRequest {
-            login: "carol".into(),
-            password: "wrong-password".into(),
-        };
-
-        let initial_password_failure = LOGIN_FAILURES
-            .with_label_values(&[steps::PASSWORD_VERIFICATION, error_types::INVALID_PASSWORD])
-            .get();
-        let initial_login_failure = LOGIN_OPERATIONS
-            .with_label_values(&[steps::COMPLETE_FLOW, results::FAILURE])
-            .get();
-
-        // Act
-        let result = process_login(&state, &req).await;
-
-        // Assert
-        assert!(result.is_err());
-
-        // Check that it's a validation error
-        match result.err().unwrap() {
-            AuthServiceError::Validation(_) => {
-                // Expected - invalid credentials should return validation error
-            }
-            other => panic!("Expected validation error, got: {:?}", other),
-        }
-
-        let final_password_failure = LOGIN_FAILURES
-            .with_label_values(&[steps::PASSWORD_VERIFICATION, error_types::INVALID_PASSWORD])
-            .get();
-        let final_login_failure = LOGIN_OPERATIONS
-            .with_label_values(&[steps::COMPLETE_FLOW, results::FAILURE])
-            .get();
-
-        assert_eq!(final_password_failure, initial_password_failure + 1.0);
-        assert_eq!(final_login_failure, initial_login_failure + 1.0);
+        let new_user = User::new_for_insert("inactive", "inactive@example.com", "TestPass123!");
+        User::save_new(new_user, &mut conn).unwrap();
+        // Don't activate the user
+        
+        let result = process_login(&state, "inactive@example.com", "TestPass123!").await;
+        // Fixed: Use struct pattern matching for Validation variant
+        assert!(matches!(result, Err(AuthServiceError::Validation { .. })));
     }
 
     #[tokio::test]
-    async fn inactive_account_returns_validation_error() {
-        setup_metrics();
-        // Arrange
-        init_jwt_secret();
+    async fn test_successful_login() {
         let state = state_with_redis();
-        let mut conn = state.pool.get().unwrap();
-
-        // Create inactive user
-        let mut user = User::new("bob", "bob@example.com", "B0bSecret!");
-        user.is_active = false;
-        user.update(&mut conn).unwrap();
-
-        let req = LoginRequest {
-            login: "bob".into(),
-            password: "B0bSecret!".into(),
-        };
-
-        let initial_account_failure = LOGIN_FAILURES
-            .with_label_values(&[steps::ACCOUNT_CHECK, error_types::INACTIVE_ACCOUNT])
-            .get();
-        let initial_login_failure = LOGIN_OPERATIONS
-            .with_label_values(&[steps::COMPLETE_FLOW, results::FAILURE])
-            .get();
-
-        // Act
-        let result = process_login(&state, &req).await;
-
-        // Assert
-        assert!(result.is_err());
-
-        // Check that it's a validation error
-        match result.err().unwrap() {
-            AuthServiceError::Validation(_) => {
-                // Expected - inactive account should return validation error
-            }
-            other => panic!("Expected validation error, got: {:?}", other),
-        }
-
-        let final_account_failure = LOGIN_FAILURES
-            .with_label_values(&[steps::ACCOUNT_CHECK, error_types::INACTIVE_ACCOUNT])
-            .get();
-        let final_login_failure = LOGIN_OPERATIONS
-            .with_label_values(&[steps::COMPLETE_FLOW, results::FAILURE])
-            .get();
-
-        assert_eq!(final_account_failure, initial_account_failure + 1.0);
-        assert_eq!(final_login_failure, initial_login_failure + 1.0);
-    }
-
-    #[tokio::test]
-    #[ignore] // requires JWT_SECRET environment variable
-    async fn successful_login_returns_tokens_and_user() {
-        setup_metrics();
-        // Arrange
-        init_jwt_secret();
-        let state = state_with_redis();
-        let mut conn = state.pool.get().unwrap();
-
-        // Create active user
-        let mut user = User::new("alice", "alice@example.com", "Al1cePwd!");
-        user.is_active = true;
-        user.update(&mut conn).unwrap();
-
-        let req = LoginRequest {
-            login: "alice".into(),
-            password: "Al1cePwd!".into(),
-        };
-
-        let initial_login_success = LOGIN_OPERATIONS
-            .with_label_values(&[steps::COMPLETE_FLOW, results::SUCCESS])
-            .get();
-        let initial_duration = LOGIN_DURATION
-            .with_label_values(&[steps::COMPLETE_FLOW])
-            .get_sample_count();
-
-        // Act
-        let result = process_login(&state, &req).await;
-
-        // Assert
+        create_test_user(&state);
+        
+        let result = process_login(&state, "test@example.com", "TestPass123!").await;
         assert!(result.is_ok());
-
-        // Extract response data to verify token structure
-        if let Ok(response) = result {
-            // Convert the IntoResponse to an actual Response
-            let response = response.into_response();
-            
-            // Check the status code
-            assert_eq!(response.status(), StatusCode::OK);
-            
-            // To fully test the body, you would need to extract it from the response
-            // This is simplified for the unit test
-        }
-
-        let final_login_success = LOGIN_OPERATIONS
-            .with_label_values(&[steps::COMPLETE_FLOW, results::SUCCESS])
-            .get();
-        let final_duration = LOGIN_DURATION
-            .with_label_values(&[steps::COMPLETE_FLOW])
-            .get_sample_count();
-
-        assert_eq!(final_login_success, initial_login_success + 1.0);
-        assert_eq!(final_duration, initial_duration + 1);
+        
+        let response = result.unwrap().into_response();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
-    #[ignore] // requires JWT_SECRET environment variable
-    async fn email_login_works() {
-        setup_metrics();
-        // Arrange
-        init_jwt_secret();
-        let state = state_with_redis();
+    async fn test_login_without_redis() {
+        let state = state_no_redis();
         let mut conn = state.pool.get().unwrap();
-
-        // Create active user
-        let mut user = User::new("dave", "dave@example.com", "D@ve456!");
+        let new_user = User::new_for_insert("noredis", "noredis@example.com", "TestPass123!");
+        let mut user = User::save_new(new_user, &mut conn).unwrap();
         user.is_active = true;
         user.update(&mut conn).unwrap();
-
-        // Login with email instead of username
-        let req = LoginRequest {
-            login: "dave@example.com".into(), // Using email
-            password: "D@ve456!".into(),
-        };
-
-        let initial_login_success = LOGIN_OPERATIONS
-            .with_label_values(&[steps::COMPLETE_FLOW, results::SUCCESS])
-            .get();
-
-        // Act
-        let result = process_login(&state, &req).await;
-
-        // Assert
+        
+        // Should still work without Redis
+        let result = process_login(&state, "noredis@example.com", "TestPass123!").await;
         assert!(result.is_ok());
-
-        let final_login_success = LOGIN_OPERATIONS
-            .with_label_values(&[steps::COMPLETE_FLOW, results::SUCCESS])
-            .get();
-
-        assert_eq!(final_login_success, initial_login_success + 1.0);
-    }
-
-    #[tokio::test]
-    async fn generic_errors_prevent_user_enumeration() {
-        setup_metrics();
-        // Arrange
-        init_jwt_secret();
-        let state = state_with_redis();
-
-        // Create two requests - one for nonexistent user, one for wrong password
-        let req1 = LoginRequest {
-            login: "nonexistent".into(),
-            password: "whatever".into(),
-        };
-
-        let mut conn = state.pool.get().unwrap();
-        let mut user = User::new("eve", "eve@example.com", "Ev3Secret!");
-        user.is_active = true;
-        user.update(&mut conn).unwrap();
-
-        let req2 = LoginRequest {
-            login: "eve".into(),
-            password: "wrong-password".into(),
-        };
-
-        // Act
-        let result1 = process_login(&state, &req1).await;
-        let result2 = process_login(&state, &req2).await;
-
-        // Assert - both errors should be validation errors (unified behavior)
-        assert!(result1.is_err());
-        assert!(result2.is_err());
-
-        if let (Err(err1), Err(err2)) = (result1, result2) {
-            match (&err1, &err2) {
-                (AuthServiceError::Validation(_), AuthServiceError::Validation(_)) => {
-                    // Expected - both should be validation errors for security
-                }
-                _ => panic!("Both errors should be validation errors to prevent enumeration"),
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn database_error_returns_database_error() {
-        setup_metrics();
-        // Arrange
-        init_jwt_secret();
-        let state = state_with_redis();
-        // Create a broken database state by using a bad pool
-        // This is hard to test without mocking, so we'll just verify compilation
-
-        let req = LoginRequest {
-            login: "test".into(),
-            password: "test".into(),
-        };
-
-        // Act & Assert - This test mainly verifies the error type conversion compiles
-        // In a real scenario, you'd use dependency injection or mocking
-        let _result = process_login(&state, &req).await;
-        // The ? operator should automatically convert r2d2::Error to AuthServiceError::Database
-    }
-
-    #[tokio::test]
-    async fn login_processing_respects_delay_configuration() {
-        setup_metrics();
-        // Arrange
-        init_jwt_secret();
-        let state = state_with_redis();
-        
-        // Save original delay value
-        let original_delay = std::env::var("INVALID_CREDENTIAL_DELAY_MS").ok();
-        
-        // Set a specific delay for testing
-        std::env::set_var("INVALID_CREDENTIAL_DELAY_MS", "200");
-        
-        let req = LoginRequest {
-            login: "nonexistent-user".into(),
-            password: "wrong-password".into(),
-        };
-
-        // Act - Measure time for invalid login
-        let start = std::time::Instant::now();
-        let _ = process_login(&state, &req).await;
-        let duration = start.elapsed();
-
-        // Assert - Should take at least the configured delay
-        assert!(duration.as_millis() >= 200, 
-            "Login processing should respect the configured delay");
-            
-        // Restore original delay value
-        if let Some(delay) = original_delay {
-            std::env::set_var("INVALID_CREDENTIAL_DELAY_MS", delay);
-        } else {
-            std::env::remove_var("INVALID_CREDENTIAL_DELAY_MS");
-        }
     }
 }

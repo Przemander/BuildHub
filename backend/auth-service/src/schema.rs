@@ -2,10 +2,13 @@
 
 diesel::table! {
     users (id) {
-        id -> Nullable<Integer>,
-        username -> Text,
-        email -> Text,
-        password_hash -> Text,
-        is_active -> Nullable<Bool>,
+        id -> Int4,
+        #[max_length = 255]
+        username -> Varchar,
+        #[max_length = 255]
+        email -> Varchar,
+        #[max_length = 255]
+        password_hash -> Varchar,
+        is_active -> Bool,
     }
 }

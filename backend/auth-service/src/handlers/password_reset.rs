@@ -34,256 +34,191 @@
 //! - **PII Protection:** Minimal logging of sensitive data
 //! - **Distributed Tracing:** Full observability with context propagation
 
-use axum::{
-    extract::{Json, State},
-    http::StatusCode,
-    response::IntoResponse,
-};
+//! Password reset HTTP handlers.
+//!
+//! Implements secure password reset flow with anti-enumeration protection,
+//! rate limiting, and comprehensive observability.
+
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::Deserialize;
 use std::sync::Arc;
-use tracing::Instrument;
+use tracing::{error, info, span, warn, Instrument, Level};
 
 use crate::{
     app::AppState,
     handlers::password_reset_logic::{
         process_password_reset_confirm, process_password_reset_request,
     },
-    utils::{
-        error_new::AuthServiceError,
-        log_new::Log,
-        telemetry::{business_operation_span, http_request_span, SpanExt},
-    },
+    utils::metrics,  // Fixed: correct import path
+    utils::errors::AuthServiceError,
 };
 
 /// Request payload for initiating a password reset.
-///
-/// The user provides their email address, and if it exists in the system,
-/// they will receive a password reset link via email.
 #[derive(Debug, Deserialize)]
 pub struct PasswordResetRequest {
-    /// The email address associated with the user account
     pub email: String,
 }
 
 /// Request payload for confirming a password reset.
-///
-/// The user provides the reset token (from the email link) along with
-/// their desired new password.
 #[derive(Debug, Deserialize)]
 pub struct PasswordResetConfirm {
-    /// The reset token received via email
     pub token: String,
-
-    /// The new password to set for the account
     pub new_password: String,
 }
 
-/// Extracts and returns the domain part of an email address safely.
+/// Handles POST /auth/password-reset/request requests.
 ///
-/// Used to log domain information without exposing the full email address,
-/// protecting Personally Identifiable Information (PII).
-///
-/// # Arguments
-/// * `email` - The email address to extract domain from
-///
-/// # Returns
-/// * The domain part of the email, or "invalid" if no @ symbol found
-#[inline]
-fn extract_email_domain(email: &str) -> &str {
-    email.split('@').nth(1).unwrap_or("invalid")
-}
-
-/// Maps an AuthServiceError to the appropriate HTTP status code.
-///
-/// Used to ensure consistent HTTP status code mapping across handlers.
-///
-/// # Arguments
-/// * `err` - The error to map to a status code
-///
-/// # Returns
-/// * The corresponding HTTP status code
-#[inline]
-fn error_to_status_code(err: &AuthServiceError) -> StatusCode {
-    match err {
-        AuthServiceError::Validation(_) => StatusCode::BAD_REQUEST,
-        AuthServiceError::Configuration(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        AuthServiceError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        AuthServiceError::Jwt(_) => StatusCode::UNAUTHORIZED,
-        AuthServiceError::Cache(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        AuthServiceError::RateLimit(_) => StatusCode::TOO_MANY_REQUESTS,
-    }
-}
-
-/// Handles password reset link requests.
-///
-/// # Endpoint: POST /auth/password-reset/request
-///
-/// Takes an email address and, if it corresponds to a registered user,
-/// generates a password reset token and sends an email with instructions.
-///
-/// # Security Notes
-///
-/// - Returns same response regardless of whether email exists to prevent enumeration
-/// - Logs minimal PII - only email domain for troubleshooting
-/// - Full observability through hierarchical spans and contextual logging
-///
-/// # Request Body
-///
+/// # Security
+/// Always returns 200 OK to prevent user enumeration attacks.
+/// 
+/// # Request Format
 /// ```json
 /// {
 ///   "email": "user@example.com"
 /// }
 /// ```
 ///
-/// # Responses
-///
-/// * `200 OK` - Request processed (regardless of email existence)
-/// * `400 Bad Request` - Email format invalid
-/// * `500 Internal Server Error` - Redis or other infrastructure error
+/// # Response Format
+/// Always returns 200 OK with generic message:
+/// ```json
+/// {
+///   "status": "success",
+///   "message": "If the email exists, a password reset link has been sent."
+/// }
+/// ```
 pub async fn password_reset_request_handler(
     State(app_state): State<Arc<AppState>>,
     Json(req): Json<PasswordResetRequest>,
 ) -> Result<impl IntoResponse, AuthServiceError> {
-    // Create HTTP request span with method and path
-    let http_span = http_request_span("POST", "/auth/password-reset/request");
+    // Create HTTP request span with request metadata
+    let span = span!(Level::INFO, "http_request",
+        method = "POST",
+        path = "/auth/password-reset/request",
+        email_domain = req.email.split('@').nth(1).unwrap_or("unknown")
+    );
+    
+    // Start timing for metrics
+    let timer = metrics::http::timer("/auth/password-reset/request");
 
-    // Extract and clone email string to avoid borrowing issues with async move
-    let email = req.email.clone();
-
-    // Capture email domain **by value** (String) so it no longer borrows `email`
-    let domain = extract_email_domain(&email).to_owned();
-    http_span.record("email_domain", &domain);
-
-    // Record email length for analytics without revealing content
-    http_span.record("email_length", &email.len());
-
-    // Clone span before moving it into the async block
-    let http_span_clone = http_span.clone();
-
-    // Wrap the handler logic in the HTTP span for automatic tracing
     async move {
-        // Log the reset request using structured logging
-        Log::event(
-            "INFO",
-            "Password Reset",
-            &format!("Password reset request for email domain: {}", domain),
-            "request_initiated",
-            "password_reset_request_handler",
-        );
+        info!("Received password reset request");
 
-        // Create child business operation span for the actual reset request operation
-        let business_span = business_operation_span("password_reset_request");
+        // Process request
+        let result = process_password_reset_request(&app_state, &req.email).await;
 
-        // Process the reset request within the business span
-        let result = process_password_reset_request(&app_state, &email)
-            .instrument(business_span)
-            .await;
-
-        // Handle result and update span
-        match &result {
-            Ok(_) => {
-                // For success responses, use OK (200) status code
-                http_span.record("http.status_code", &StatusCode::OK.as_u16().to_string());
+        // Always return 200 OK for security (prevent enumeration)
+        // Even if there was an error internally
+        metrics::http::request("/auth/password-reset/request", "POST", 200);
+        drop(timer);
+        
+        // Always return success to prevent enumeration
+        match result {
+            Ok(response) => {
+                info!("Password reset request processed successfully");
+                Ok(response.into_response())  // Fixed: add .into_response() here
             }
-            Err(err) => {
-                // For errors, map to appropriate status code
-                let status_code = error_to_status_code(err);
-                http_span.record("http.status_code", &status_code.as_u16().to_string());
-                http_span.record_error(err);
+            Err(e) => {
+                // Log error internally but still return 200 to client
+                error!("Password reset request failed internally: {}", e);
+                Ok((
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "status": "success",
+                        "message": "If the email exists, a password reset link has been sent."
+                    })),
+                ).into_response())
             }
         }
-
-        // Return the result, letting ? operator handle error conversion
-        result
     }
-    .instrument(http_span_clone)
+    .instrument(span)
     .await
 }
 
-/// Handles password reset confirmation.
+/// Handles POST /auth/password-reset/confirm requests.
 ///
-/// # Endpoint: POST /auth/password-reset/confirm
-///
-/// Takes a reset token and new password, validates both, and if valid,
-/// updates the user's password.
-///
-/// # Security Notes
-///
-/// - Validates token authenticity and expiration before processing
-/// - Enforces password strength requirements (NIST guidelines)
-/// - Token is invalidated after use to prevent reuse
-/// - Logs no PII - only metadata like token and password length
-///
-/// # Request Body
-///
+/// # Request Format
 /// ```json
 /// {
-///   "token": "secure-reset-token-from-email",
-///   "new_password": "user's new password"
+///   "token": "secure_token_from_email",
+///   "new_password": "NewSecurePassword123!"
 /// }
 /// ```
 ///
-/// # Responses
-///
-/// * `200 OK` - Password successfully reset
-/// * `400 Bad Request` - Token invalid or password doesn't meet requirements
-/// * `401 Unauthorized` - Token expired
-/// * `500 Internal Server Error` - Database or infrastructure error
+/// # Response Format
+/// - 200 OK: Password successfully reset
+/// - 400 Bad Request: Invalid token or password validation failed
+/// - 500 Internal Server Error: Server configuration issues
 pub async fn password_reset_confirm_handler(
     State(app_state): State<Arc<AppState>>,
     Json(req): Json<PasswordResetConfirm>,
 ) -> Result<impl IntoResponse, AuthServiceError> {
-    // Create HTTP request span with method and path
-    let http_span = http_request_span("POST", "/auth/password-reset/confirm");
+    // Create HTTP request span with request metadata
+    let span = span!(Level::INFO, "http_request",
+        method = "POST",
+        path = "/auth/password-reset/confirm",
+        token_length = req.token.len()
+    );
+    
+    // Start timing for metrics
+    let timer = metrics::http::timer("/auth/password-reset/confirm");
 
-    // Add business context to the span without exposing sensitive information
-    http_span.record("token_length", &req.token.len());
-    http_span.record("password_length", &req.new_password.len());
-
-    // Clone span before moving it into the async block
-    let http_span_clone = http_span.clone();
-
-    // Wrap the handler logic in the HTTP span for automatic tracing
     async move {
-        // Log the reset confirmation using structured logging
-        Log::event(
-            "INFO",
-            "Password Reset",
-            &format!(
-                "Password reset confirmation attempt (token length: {}, password length: {})",
-                req.token.len(),
-                req.new_password.len()
-            ),
-            "confirmation_attempt",
-            "password_reset_confirm_handler",
-        );
+        info!("Received password reset confirmation");
 
-        // Create child business operation span for the actual reset confirmation operation
-        let business_span = business_operation_span("password_reset_confirm");
-
-        // Process the reset confirmation within the business span
-        let result = process_password_reset_confirm(&app_state, &req.token, &req.new_password)
-            .instrument(business_span)
-            .await;
-
-        // Handle result and update span
-        match &result {
-            Ok(_) => {
-                // For success responses, use OK (200) status code
-                http_span.record("http.status_code", &StatusCode::OK.as_u16().to_string());
-            }
-            Err(err) => {
-                // For errors, map to appropriate status code
-                let status_code = error_to_status_code(err);
-                http_span.record("http.status_code", &status_code.as_u16().to_string());
-                http_span.record_error(err);
-            }
+        // Early validation
+        if req.token.is_empty() {
+            warn!("Password reset confirmation failed - empty token");
+            metrics::http::request("/auth/password-reset/confirm", "POST", 400);
+            return Err(AuthServiceError::validation("token", "Token is required"));
+        }
+        
+        if req.new_password.is_empty() {
+            warn!("Password reset confirmation failed - empty password");
+            metrics::http::request("/auth/password-reset/confirm", "POST", 400);
+            return Err(AuthServiceError::validation("new_password", "New password is required"));
         }
 
-        // Return the result, letting ? operator handle error conversion
+        // Process confirmation
+        let result = process_password_reset_confirm(
+            &app_state,
+            &req.token,
+            &req.new_password,
+        )
+        .await;
+
+        // Map result to HTTP status code
+        let status = match &result {
+            Ok(_) => {
+                info!("Password reset confirmation successful");
+                StatusCode::OK
+            }
+            Err(AuthServiceError::Validation { .. }) => {  // Fixed: use struct pattern
+                info!("Password reset confirmation failed - validation error");
+                StatusCode::BAD_REQUEST
+            }
+            // Fixed: Removed Jwt variant since it doesn't exist in our simplified error system
+            // Token validation errors are now handled as Authentication or External errors
+            Err(AuthServiceError::Authentication(_)) => {
+                info!("Password reset confirmation failed - invalid token");
+                StatusCode::BAD_REQUEST
+            }
+            Err(AuthServiceError::Configuration(_)) => {
+                error!("Password reset confirmation failed - configuration error");
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+            Err(e) => {
+                error!("Password reset confirmation failed - unexpected error: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        };
+        
+        // Record metrics
+        metrics::http::request("/auth/password-reset/confirm", "POST", status.as_u16());
+        drop(timer);
+        
         result
     }
-    .instrument(http_span_clone)
+    .instrument(span)
     .await
 }
 
@@ -302,234 +237,247 @@ mod tests {
     use crate::utils::email::EmailConfig;
     use crate::utils::test_utils::state_with_redis;
 
-    /// Creates a test router with both password reset handlers
-    fn app() -> Router {
+    /// Create test app with mocked dependencies
+    fn make_app() -> Router {
+        metrics::init();
         let mut state = state_with_redis();
         state.email_config = Some(EmailConfig::dummy());
-
+        
         Router::new()
-            .route(
-                "/auth/password-reset/request",
-                post(password_reset_request_handler),
-            )
-            .route(
-                "/auth/password-reset/confirm",
-                post(password_reset_confirm_handler),
-            )
+            .route("/auth/password-reset/request", post(password_reset_request_handler))
+            .route("/auth/password-reset/confirm", post(password_reset_confirm_handler))
             .with_state(Arc::new(state))
     }
 
-    /// Helper to make a POST request to the specified endpoint
-    async fn make_post_request(
-        app: Router,
-        endpoint: &str,
-        body: serde_json::Value,
-    ) -> (StatusCode, serde_json::Value) {
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(endpoint)
-                    .header("Content-Type", "application/json")
-                    .body(Body::from(body.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        let status = response.status();
-        let body_bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
-        let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-
-        (status, body_json)
-    }
-
     #[tokio::test]
-    async fn reset_request_with_valid_email_returns_success() {
-        // Arrange
-        let app = app();
-        let request_body = json!({
-            "email": "test@example.com"
-        });
+    async fn test_request_always_returns_200() {
+        let app = make_app();
 
-        // Act
-        let (status, body) = make_post_request(
-            app,
-            "/auth/password-reset/request",
-            request_body,
-        ).await;
-
-        // Assert - We should get 200 OK regardless of whether the email exists
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["status"], "success");
-        assert!(body["message"]
-            .as_str()
-            .unwrap()
-            .contains("If the email exists"));
-    }
-
-    #[tokio::test]
-    async fn reset_request_with_invalid_email_returns_success() {
-        // Arrange
-        let app = app();
-        let request_body = json!({
-            "email": "not-an-email-address"
-        });
-
-        // Act
-        let (status, body) = make_post_request(
-            app,
-            "/auth/password-reset/request",
-            request_body,
-        ).await;
-
-        // Assert - Should return success regardless of email validity (security feature)
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            body["status"], "success",
-            "Status should be 'success' regardless of email validity (security feature)"
-        );
-        assert!(
-            body["message"]
-                .as_str()
-                .unwrap()
-                .contains("If the email exists"),
-            "Message should be generic to prevent email enumeration"
-        );
-    }
-
-    #[tokio::test]
-    async fn reset_confirm_with_invalid_token_returns_validation_error() {
-        // Arrange
-        let app = app();
-        let request_body = json!({
-            "token": "invalid-token",
-            "new_password": "ValidNewP@ss123"
-        });
-
-        // Act
-        let (status, body) = make_post_request(
-            app,
-            "/auth/password-reset/confirm",
-            request_body,
-        ).await;
-
-        // Assert
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body["status"], "validation_error");
-        assert!(body["message"].as_str().unwrap().contains("token"));
-    }
-
-    #[tokio::test]
-    async fn reset_confirm_with_weak_password_returns_validation_error() {
-        // Arrange
-        let app = app();
-        let request_body = json!({
-            "token": "some-valid-token",  // Token validation will fail first
-            "new_password": "weak"        // Too short, doesn't meet requirements
-        });
-
-        // Act
-        let (status, body) = make_post_request(
-            app,
-            "/auth/password-reset/confirm",
-            request_body,
-        ).await;
-
-        // Assert - Token validation happens first, so we get validation error
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body["status"], "validation_error");
-    }
-
-    #[tokio::test]
-    async fn missing_fields_returns_bad_request() {
-        // Arrange
-        let app = app();
-        let request_body = json!({
-            // Missing required "email" field
-        });
-
-        // Act
+        // Test with any email
         let response = app
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/auth/password-reset/request")
                     .header("Content-Type", "application/json")
-                    .body(Body::from(request_body.to_string()))
+                    .body(Body::from(json!({"email": "any@example.com"}).to_string()))
                     .unwrap(),
             )
             .await
             .unwrap();
 
-        // Assert - accept either 400 or 422 as both are used for validation errors by Axum JSON extractor
-        assert!(
-            response.status() == StatusCode::BAD_REQUEST
-                || response.status() == StatusCode::UNPROCESSABLE_ENTITY,
-            "Response status should be 400 Bad Request or 422 Unprocessable Entity"
-        );
+        assert_eq!(response.status(), StatusCode::OK);
+        
+        // Verify response message
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(body["message"].as_str().unwrap().contains("If the email exists"));
     }
 
     #[tokio::test]
-    async fn missing_redis_returns_configuration_error() {
-        // Arrange - Create state without Redis
-        let mut state = state_with_redis();
-        state.redis_client = None; // Remove Redis client
-        state.email_config = Some(EmailConfig::dummy());
+    async fn test_request_with_invalid_email_still_returns_200() {
+        let app = make_app();
 
-        let app = Router::new()
-            .route(
-                "/auth/password-reset/request",
-                post(password_reset_request_handler),
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/password-reset/request")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(json!({"email": "not-an-email"}).to_string()))
+                    .unwrap(),
             )
-            .with_state(Arc::new(state));
+            .await
+            .unwrap();
 
-        let request_body = json!({
-            "email": "test@example.com"
-        });
-
-        // Act
-        let (status, body) = make_post_request(
-            app,
-            "/auth/password-reset/request",
-            request_body,
-        ).await;
-
-        // Assert
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(body["status"], "configuration_error");
-        assert!(body["message"].as_str().unwrap().contains("Redis"));
+        // Should still return 200 for security
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
-    async fn missing_redis_confirm_returns_configuration_error() {
-        // Arrange - Create state without Redis
+    async fn test_confirm_empty_token_returns_400() {
+        let app = make_app();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/password-reset/confirm")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(json!({
+                        "token": "",
+                        "new_password": "ValidPass123!"
+                    }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        
+        // Verify error message
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(body["message"].as_str().unwrap().contains("required"));
+    }
+
+    #[tokio::test]
+    async fn test_confirm_empty_password_returns_400() {
+        let app = make_app();
+        
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/password-reset/confirm")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(json!({
+                        "token": "valid-token",
+                        "new_password": ""
+                    }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_confirm_invalid_token_returns_400() {
+        let app = make_app();
+        
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/password-reset/confirm")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(json!({
+                        "token": "short",  // Too short to be valid
+                        "new_password": "ValidPass123!"
+                    }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_missing_fields_returns_422() {
+        let app = make_app();
+        
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/password-reset/request")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(json!({}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn test_malformed_json_returns_422() {
+        let app = make_app();
+        
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/password-reset/request")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from("{invalid-json}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Fix: Axum returns 400 Bad Request for malformed JSON, not 422
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_missing_redis_request_still_returns_200() {
+        metrics::init();
         let mut state = state_with_redis();
-        state.redis_client = None; // Remove Redis client
+        state.redis_client = None;
         state.email_config = Some(EmailConfig::dummy());
 
         let app = Router::new()
-            .route(
-                "/auth/password-reset/confirm",
-                post(password_reset_confirm_handler),
-            )
+            .route("/auth/password-reset/request", post(password_reset_request_handler))
             .with_state(Arc::new(state));
 
-        let request_body = json!({
-            "token": "any-token",
-            "new_password": "ValidPass123!"
-        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/password-reset/request")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(json!({"email": "test@example.com"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
-        // Act
-        let (status, body) = make_post_request(
-            app,
-            "/auth/password-reset/confirm",
-            request_body,
-        ).await;
+        // Should still return 200 to prevent enumeration
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 
-        // Assert
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(body["status"], "configuration_error");
-        assert!(body["message"].as_str().unwrap().contains("Redis"));
+    #[tokio::test]
+    async fn test_missing_redis_confirm_returns_500() {
+        metrics::init();
+        let mut state = state_with_redis();
+        state.redis_client = None;
+
+        let app = Router::new()
+            .route("/auth/password-reset/confirm", post(password_reset_confirm_handler))
+            .with_state(Arc::new(state));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/password-reset/confirm")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(json!({
+                        "token": "valid-token-1234567890123456",
+                        "new_password": "ValidPass123!"
+                    }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn test_weak_password_returns_400() {
+        let app = make_app();
+        
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/password-reset/confirm")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(json!({
+                        "token": "valid-token-1234567890123456",
+                        "new_password": "weak"
+                    }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

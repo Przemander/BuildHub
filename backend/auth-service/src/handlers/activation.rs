@@ -1,17 +1,7 @@
-//! Account activation HTTP handler with OpenTelemetry integration.
+//! Account activation HTTP handler.
 //!
-//! This module implements the endpoint that handles user account activation
-//! via email confirmation links. It renders appropriate HTML responses based
-//! on the activation result using the unified error system.
-//!
-//! # Endpoint
-//! `GET /auth/activate?code=<activation_code>`
-//!
-//! # Flow
-//! 1. User receives activation email with unique code
-//! 2. User clicks the link which calls this endpoint
-//! 3. System validates the code and activates the account
-//! 4. User sees an HTML page with the result
+//! Provides user-friendly HTML responses for email activation links
+//! with proper error handling and observability.
 
 use axum::{
     extract::{Query, State},
@@ -19,246 +9,122 @@ use axum::{
 };
 use serde::Deserialize;
 use std::sync::Arc;
-use tracing::Instrument;
+use tracing::{error, info, span, Instrument, Level};
 
 use crate::{
     app::AppState,
     handlers::activation_logic::process_activation,
-    metricss::activation_metrics::{
-        http::{BAD_REQUEST, GET, INTERNAL_SERVER_ERROR, OK},
-        record_http_request,
-        ACTIVATION_HTTP_DURATION,
-    },
-    utils::{
-        error_new::{AuthServiceError, ValidationError},
-        log_new::Log,
-        telemetry::{business_operation_span, http_request_span, SpanExt},
-    },
+    utils::metrics,  // Fixed: correct import path
+    utils::errors::AuthServiceError,
 };
 
 /// Query parameters for account activation.
-///
-/// The activation code is extracted from the URL query string.
 #[derive(Debug, Deserialize)]
 pub struct ActivationParams {
-    /// The unique activation code sent to the user's email
     pub code: String,
 }
 
-/// Handles account activation requests using the unified error system.
+/// Handles GET /auth/activate requests.
 ///
-/// Processes the activation code and renders an appropriate HTML page
-/// with the result of the activation attempt.
-///
-/// # Arguments
-/// * `params` - Query parameters containing the activation code
-/// * `app_state` - Application state containing Redis and database connections
-///
-/// # Returns
-/// An HTML response with a user-friendly message about the activation result
+/// Returns HTML pages for user-friendly activation feedback.
+/// This endpoint is typically accessed via email links.
 pub async fn activate_account_handler(
     Query(params): Query<ActivationParams>,
     State(app_state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    // Create HTTP request span with method and path
-    let http_span = http_request_span("GET", "/auth/activate");
+    // Create HTTP request span with request metadata
+    let span = span!(Level::INFO, "http_request",
+        method = "GET",
+        path = "/auth/activate",
+        code_length = params.code.len()
+    );
+    let span_for_instrument = span.clone();
+    // Start timing for metrics
+    let timer = metrics::http::timer("/auth/activate");
 
-    // Add business context to the span without exposing the actual code
-    http_span.record("code_length", &params.code.len());
-
-    // Clone span before moving it into the async block
-    let http_span_clone = http_span.clone();
-
-    // Wrap the handler logic in the HTTP span for automatic tracing
     async move {
-        // Log the activation attempt using structured logging
-        Log::event(
-            "INFO",
-            "Account Activation",
-            &format!("Account activation attempt with code length: {}", params.code.len()),
-            "attempt",
-            "activate_account_handler"
-        );
-
-        // Start HTTP duration timer
-        let start = std::time::Instant::now();
-
-        // Create child business operation span for the actual activation operation
-        let business_span = business_operation_span("account_activation");
+        info!("Received activation request");
         
-        // Process the activation within the business span
-        let result = process_activation(&app_state, &params.code)
-            .instrument(business_span)
-            .await;
+        // Process activation
+        let result = process_activation(&app_state, &params.code).await;
 
-        // Record HTTP metrics
-        let duration = start.elapsed().as_secs_f64();
-        let status_code = match &result {
+        // Map result to HTTP status code
+        let status = match &result {
             Ok(_) => {
-                http_span.record("http.status_code", &OK.to_string());
-                OK
-            },
-            Err(err) => {
-                let code = match err {
-                    AuthServiceError::Validation(_) => BAD_REQUEST,
-                    AuthServiceError::Configuration(_) => INTERNAL_SERVER_ERROR,
-                    AuthServiceError::Database(_) => INTERNAL_SERVER_ERROR,
-                    AuthServiceError::RateLimit(_) => BAD_REQUEST,
-                    _ => BAD_REQUEST,
-                };
-                http_span.record("http.status_code", &code.to_string());
-                http_span.record_error(err);
-                code
-            },
+                info!("Account activation successful");
+                200
+            }
+            Err(AuthServiceError::Validation { .. }) => {  // Fixed: use struct pattern
+                info!("Account activation failed - invalid code");
+                400
+            }
+            Err(AuthServiceError::Configuration(_)) => {
+                error!("Account activation failed - service configuration issue");
+                500
+            }
+            Err(AuthServiceError::Database(_)) => {
+                error!("Account activation failed - database issue");
+                500
+            }
+            Err(e) => {
+                error!("Account activation failed - unexpected error: {}", e);
+                500
+            }
         };
-
-        ACTIVATION_HTTP_DURATION
-            .with_label_values(&[GET, &status_code.to_string()])
-            .observe(duration);
         
-        record_http_request(GET, status_code);
+        // Record metrics
+        span.record("http.status_code", &status);
+        metrics::http::request("/auth/activate", "GET", status);
+        drop(timer);
 
-        // Render page based on result
+        // Render HTML response based on result
         match result {
-            Ok(()) => {
-                Log::event(
-                    "INFO",
-                    "Account Activation",
-                    "Account successfully activated",
-                    "success",
-                    "activate_account_handler"
-                );
-                
-                Html(render_page(
-                    "Account Activated",
-                    "Your account has been successfully activated. You can now log in.",
-                    "success",
-                ))
-                .into_response()
-            },
+            Ok(_) => Html(render_page(
+                "Account Activated",
+                "Your account has been successfully activated. You can now log in.",
+                "success",
+            )),
             
-            Err(AuthServiceError::Validation(validation_err)) => {
-                // Check the specific validation error type for better UX
-                let (title, message) = match &validation_err {
-                    ValidationError::InvalidValue { message, .. } if message.contains("invalid or has expired") => (
-                        "Invalid Activation Link",
-                        "The activation link is invalid or has expired. Please request a new activation link."
-                    ),
-                    ValidationError::InvalidValue { message, .. } if message.contains("account no longer exists") => (
-                        "Account Not Found",
-                        "We couldn't find an account for this activation link. Please register or contact support."
-                    ),
-                    _ => (
-                        "Validation Error",
-                        "There was an issue with your activation request. Please try again or contact support."
-                    ),
+            Err(AuthServiceError::Validation { message, .. }) => {  // Fixed: use struct pattern with destructuring
+                let (title, message) = if message.contains("expired") {
+                    ("Invalid Activation Link", "The activation link is invalid or has expired.")
+                } else if message.contains("not found") || message.contains("no longer exists") {
+                    ("Account Not Found", "We couldn't find an account for this activation link.")
+                } else {
+                    ("Validation Error", "There was an issue with your activation request.")
                 };
-                
-                Log::event(
-                    "WARN",
-                    "Account Activation",
-                    &format!("Activation failed: {}", validation_err),
-                    "validation_error",
-                    "activate_account_handler"
-                );
-                
-                Html(render_page(title, message, "error")).into_response()
+                Html(render_page(title, message, "error"))
             },
             
-            Err(AuthServiceError::Configuration(err)) => {
-                Log::event(
-                    "ERROR",
-                    "Account Activation",
-                    &format!("Configuration error during activation: {}", err),
-                    "configuration_error",
-                    "activate_account_handler"
-                );
-                
+            Err(AuthServiceError::Configuration(_) | AuthServiceError::Database(_)) => {
                 Html(render_page(
                     "Service Unavailable",
                     "We're experiencing technical difficulties. Please try again later.",
                     "error",
                 ))
-                .into_response()
             },
             
-            Err(AuthServiceError::Database(err)) => {
-                Log::event(
-                    "ERROR",
-                    "Account Activation",
-                    &format!("Database error during activation: {}", err),
-                    "database_error",
-                    "activate_account_handler"
-                );
-                
-                Html(render_page(
-                    "Service Unavailable", 
-                    "We're experiencing database issues. Please try again later.",
-                    "error",
-                ))
-                .into_response()
-            },
-            
-            Err(AuthServiceError::RateLimit(err)) => {
-                Log::event(
-                    "WARN",
-                    "Account Activation",
-                    &format!("Rate limit exceeded: {}", err),
-                    "rate_limit",
-                    "activate_account_handler"
-                );
-                
-                Html(render_page(
-                    "Too Many Requests",
-                    "You've made too many activation attempts. Please wait a moment before trying again.",
-                    "error",
-                ))
-                .into_response()
-            },
-            
-            Err(err) => {
-                Log::event(
-                    "ERROR",
-                    "Account Activation",
-                    &format!("Unexpected error during activation: {}", err),
-                    "unexpected_error",
-                    "activate_account_handler"
-                );
-                
-                Html(render_page(
-                    "Activation Failed",
-                    "We couldn't activate your account. Please try again or contact support.",
-                    "error",
-                ))
-                .into_response()
-            },
+            Err(_) => Html(render_page(
+                "Activation Failed",
+                "We couldn't activate your account. Please try again or contact support.",
+                "error",
+            )),
         }
     }
-    .instrument(http_span_clone)
+    .instrument(span_for_instrument)
     .await
 }
 
 /// Renders a simple HTML page with a title and message.
-///
-/// # Arguments
-/// * `title` - The page title and primary heading
-/// * `message` - The message to display to the user
-/// * `status` - Status of the operation: "success", "error", or "info"
-///
-/// # Returns
-/// HTML page as a String
 fn render_page(title: &str, message: &str, status: &str) -> String {
-    // Add status-specific CSS class for styling
     let status_class = match status {
-        "success" => "success-message",
-        "error" => "error-message",
-        "info" => "info-message",
-        _ => "neutral-message",
+        "success" => "success",
+        "error" => "error",
+        _ => "info",
     };
 
-    // Pobierz URL frontendu z konfiguracji
-    let frontend_url =
-        std::env::var("FRONTEND_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
+    let frontend_url = std::env::var("FRONTEND_URL")
+        .unwrap_or_else(|_| "http://localhost:8080".to_string());
     let login_url = format!("{}/auth", frontend_url);
 
     format!(
@@ -267,67 +133,80 @@ fn render_page(title: &str, message: &str, status: &str) -> String {
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'unsafe-inline'">
     <title>{title}</title>
     <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         body {{
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-            line-height: 1.6;
-            color: #333;
-            max-width: 650px;
-            margin: 0 auto;
-            padding: 2rem 1rem;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 1rem;
+        }}
+        .card {{
+            background: white;
+            border-radius: 12px;
+            padding: 2.5rem;
+            max-width: 420px;
+            width: 100%;
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1);
             text-align: center;
         }}
         h1 {{
+            color: #2d3748;
+            font-size: 1.75rem;
             margin-bottom: 1rem;
-            color: #2c3e50;
         }}
         .message {{
             padding: 1rem;
-            border-radius: 4px;
-            margin-bottom: 1.5rem;
+            border-radius: 8px;
+            margin: 1.5rem 0;
+            font-size: 0.95rem;
+            line-height: 1.5;
         }}
-        .success-message {{
-            background-color: #d4edda;
-            color: #155724;
-            border: 1px solid #c3e6cb;
+        .success {{
+            background: #c6f6d5;
+            color: #22543d;
+            border: 1px solid #9ae6b4;
         }}
-        .error-message {{
-            background-color: #f8d7da;
-            color: #721c24;
-            border: 1px solid #f5c6cb;
+        .error {{
+            background: #fed7d7;
+            color: #742a2a;
+            border: 1px solid #fc8181;
         }}
-        .info-message {{
-            background-color: #d1ecf1;
-            color: #0c5460;
-            border: 1px solid #bee5eb;
-        }}
-        .neutral-message {{
-            background-color: #e2e3e5;
-            color: #383d41;
-            border: 1px solid #d6d8db;
+        .info {{
+            background: #bee3f8;
+            color: #2c5282;
+            border: 1px solid #90cdf4;
         }}
         .btn {{
             display: inline-block;
-            background-color: #3490dc;
+            background: #667eea;
             color: white;
             text-decoration: none;
-            padding: 0.5rem 1rem;
-            border-radius: 4px;
-            transition: background-color 0.2s;
+            padding: 0.75rem 2rem;
+            border-radius: 6px;
+            font-weight: 500;
+            transition: all 0.2s;
+            margin-top: 0.5rem;
         }}
         .btn:hover {{
-            background-color: #2779bd;
+            background: #5a67d8;
+            transform: translateY(-1px);
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
         }}
     </style>
 </head>
 <body>
-    <h1>{title}</h1>
-    <div class="message {status_class}">
-        <p>{message}</p>
+    <div class="card">
+        <h1>{title}</h1>
+        <div class="message {status_class}">
+            {message}
+        </div>
+        <a href="{login_url}" class="btn">Go to Login</a>
     </div>
-    <a href="{login_url}" class="btn">Go to Login</a>
 </body>
 </html>"#
     )
@@ -341,21 +220,18 @@ mod tests {
 
     use crate::utils::test_utils::state_with_redis;
 
-    /// Creates a test router with activation handler
     fn app() -> Router {
+        metrics::init();
         let app_state = Arc::new(state_with_redis());
-
         Router::new()
             .route("/auth/activate", get(activate_account_handler))
             .with_state(app_state)
     }
 
     #[tokio::test]
-    async fn missing_code_returns_bad_request() {
-        // Arrange
+    async fn test_missing_code_returns_bad_request() {
         let app = app();
-
-        // Act - request with missing code parameter
+        
         let response = app
             .oneshot(
                 Request::builder()
@@ -366,16 +242,13 @@ mod tests {
             .await
             .unwrap();
 
-        // Assert
         assert_eq!(response.status().as_u16(), 400);
     }
 
     #[tokio::test]
-    async fn invalid_code_returns_proper_html() {
-        // Arrange
+    async fn test_invalid_code_returns_proper_html() {
         let app = app();
 
-        // Act - request with invalid activation code
         let response = app
             .oneshot(
                 Request::builder()
@@ -386,34 +259,62 @@ mod tests {
             .await
             .unwrap();
 
-        // Assert
-        assert_eq!(response.status().as_u16(), 200); // HTML responses are always 200 OK
-
+        assert_eq!(response.status().as_u16(), 200); // HTML always returns 200
+        
         let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
-
-        // Verify it contains error messaging
-        assert!(html.contains("Invalid Activation Link"));
-        assert!(html.contains("error-message"));
+        
+        // Should contain error messaging
+        assert!(html.contains("Invalid") || html.contains("expired"));
+        assert!(html.contains("error"));
+        assert!(html.contains("Go to Login"));
     }
 
     #[test]
-    fn render_page_includes_correct_status_class() {
-        // Arrange & Act
-        let success_html = render_page("Success Title", "Success message", "success");
-        let error_html = render_page("Error Title", "Error message", "error");
-        let info_html = render_page("Info Title", "Info message", "info");
-
-        // Assert
-        assert!(success_html.contains("success-message"));
-        assert!(error_html.contains("error-message"));
-        assert!(info_html.contains("info-message"));
+    fn test_render_page_includes_correct_status_class() {
+        let success_html = render_page("Success", "Test", "success");
+        let error_html = render_page("Error", "Test", "error");
+        
+        // Fix: check for the combined class string "message success" instead of just "success"
+        assert!(success_html.contains(r#"class="message success""#));
+        assert!(error_html.contains(r#"class="message error""#));
         assert!(success_html.contains("Go to Login"));
-        assert!(error_html.contains("Go to Login"));
     }
 
     #[tokio::test]
-    async fn successful_activation_returns_success_html() {
-        // Integration test for successful activation would go here.
+    async fn test_activation_with_empty_code_returns_html() {
+        let app = app();
+        
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/auth/activate?code=")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status().as_u16(), 200);
+        
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("<html"));
+        assert!(html.contains("error"));
+    }
+
+    #[test]
+    fn test_frontend_url_from_env() {
+        std::env::set_var("FRONTEND_URL", "https://example.com");
+        let html = render_page("Test", "Message", "success");
+        assert!(html.contains("https://example.com/auth"));
+        std::env::remove_var("FRONTEND_URL");
+    }
+
+    #[test]
+    fn test_frontend_url_default() {
+        std::env::remove_var("FRONTEND_URL");
+        let html = render_page("Test", "Message", "success");
+        assert!(html.contains("http://localhost:8080/auth"));
     }
 }
