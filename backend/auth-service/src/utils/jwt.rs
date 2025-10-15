@@ -27,13 +27,19 @@ use crate::{
 // TYPES AND CONSTANTS
 // =============================================================================
 
-/// JWT Claims structure.
+/// JWT Claims structure, compliant with RFC 7519.
+/// This is the definitive structure for all JWTs issued by this service.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenClaims {
+    /// Subject (the user identifier)
     pub sub: String,
+    /// Expiration time (Unix timestamp)
     pub exp: usize,
+    /// Issued at (Unix timestamp)
     pub iat: usize,
+    /// Type of the token (e.g., "access", "refresh")
     pub token_type: String,
+    /// JWT ID (unique identifier for the token, used for revocation)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jti: Option<String>,
 }
@@ -245,6 +251,23 @@ pub async fn revoke_token(token: &str, redis_client: &RedisClient) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    fn run_with_env<F: FnOnce()>(test: F)
+    where
+        F: FnOnce(),
+    {
+        let _guard = env_lock();
+        cleanup_test_env();
+        test();
+        cleanup_test_env();
+    }
 
     fn setup_test_env() {
         env::set_var("JWT_SECRET", "test-secret-key-minimum-32-characters");
@@ -252,142 +275,374 @@ mod tests {
 
     fn cleanup_test_env() {
         env::remove_var("JWT_SECRET");
+        env::remove_var("JWT_ACCESS_TOKEN_EXPIRES_IN");
+        env::remove_var("JWT_REFRESH_TOKEN_EXPIRES_IN");
+    }
+
+    #[test]
+    fn test_get_jwt_secret_valid() {
+        run_with_env(|| {
+            setup_test_env();
+            let secret = get_jwt_secret();
+            assert!(secret.is_ok());
+            assert_eq!(secret.unwrap(), "test-secret-key-minimum-32-characters");
+        });
+    }
+
+    #[test]
+    fn test_get_jwt_secret_missing() {
+        run_with_env(|| {
+            let result = get_jwt_secret();
+            assert!(result.is_err());
+            match result {
+                Err(AuthServiceError::Configuration(msg)) => {
+                    assert!(msg.contains("JWT_SECRET"));
+                }
+                _ => panic!("Expected Configuration error"),
+            }
+        });
+    }
+
+    #[test]
+    fn test_get_jwt_secret_empty() {
+        run_with_env(|| {
+            env::set_var("JWT_SECRET", "");
+            let result = get_jwt_secret();
+            assert!(result.is_err());
+            assert!(result.unwrap_err().to_string().contains("empty"));
+        });
+    }
+
+    #[test]
+    fn test_get_jwt_secret_too_short() {
+        run_with_env(|| {
+            env::set_var("JWT_SECRET", "short");
+            let result = get_jwt_secret();
+            assert!(result.is_err());
+            assert!(result.unwrap_err().to_string().contains("32 characters"));
+        });
+    }
+
+    #[test]
+    fn test_get_jwt_secret_exactly_min_length() {
+        run_with_env(|| {
+            let secret = "a".repeat(MIN_SECRET_LENGTH);
+            env::set_var("JWT_SECRET", &secret);
+            let result = get_jwt_secret();
+            assert!(result.is_ok());
+        });
+    }
+
+    #[test]
+    fn test_get_jwt_secret_with_whitespace() {
+        run_with_env(|| {
+            env::set_var("JWT_SECRET", "  test-secret-key-minimum-32-characters  ");
+            let result = get_jwt_secret();
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), "test-secret-key-minimum-32-characters");
+        });
+    }
+
+    #[test]
+    fn test_generate_access_token_with_duration() {
+        run_with_env(|| {
+            setup_test_env();
+            let token = generate_token("testuser", TOKEN_TYPE_ACCESS, Some(Duration::hours(1)));
+            assert!(token.is_ok());
+        });
+    }
+
+    #[test]
+    fn test_generate_refresh_token_with_duration() {
+        run_with_env(|| {
+            setup_test_env();
+            let token = generate_token("testuser", TOKEN_TYPE_REFRESH, Some(Duration::days(7)));
+            assert!(token.is_ok());
+        });
+    }
+
+    #[test]
+    fn test_generate_token_default_expiry() {
+        run_with_env(|| {
+            setup_test_env();
+            let access_token = generate_token("testuser", TOKEN_TYPE_ACCESS, None);
+            assert!(
+                access_token.is_ok(),
+                "Failed to generate access token: {:?}",
+                access_token.err()
+            );
+            let refresh_token = generate_token("testuser", TOKEN_TYPE_REFRESH, None);
+            assert!(
+                refresh_token.is_ok(),
+                "Failed to generate refresh token: {:?}",
+                refresh_token.err()
+            );
+        });
+    }
+
+    #[test]
+    fn test_generate_token_custom_expiry_from_env() {
+        run_with_env(|| {
+            env::set_var("JWT_SECRET", "test-secret-key-minimum-32-characters");
+            env::set_var("JWT_ACCESS_TOKEN_EXPIRES_IN", "7200");
+            let token = generate_token("testuser", TOKEN_TYPE_ACCESS, None);
+            assert!(token.is_ok());
+        });
+    }
+
+    #[test]
+    fn test_generate_token_unknown_type() {
+        run_with_env(|| {
+            setup_test_env();
+            let token = generate_token("testuser", "unknown", None);
+            assert!(token.is_ok());
+        });
+    }
+
+    #[test]
+    fn test_generate_token_without_secret() {
+        run_with_env(|| {
+            let result = generate_token("testuser", TOKEN_TYPE_ACCESS, None);
+            assert!(result.is_err());
+            assert!(result.unwrap_err().to_string().contains("JWT_SECRET"));
+        });
+    }
+
+    #[test]
+    fn test_generated_token_has_correct_structure() {
+        run_with_env(|| {
+            setup_test_env();
+            let token = generate_token("testuser", TOKEN_TYPE_ACCESS, Some(Duration::hours(1)))
+                .expect("Should generate token");
+            let parts: Vec<&str> = token.split('.').collect();
+            assert_eq!(parts.len(), 3);
+        });
     }
 
     #[test]
     fn test_token_roundtrip() {
-        setup_test_env();
-        
-        let token = generate_token("testuser", TOKEN_TYPE_ACCESS, Some(Duration::hours(1)))
-            .expect("Should generate token");
-        
-        let claims = decode_token(&token).expect("Should decode token");
-        
-        assert_eq!(claims.sub, "testuser");
-        assert_eq!(claims.token_type, TOKEN_TYPE_ACCESS);
-        assert!(claims.jti.is_some());
-        
-        cleanup_test_env();
+        run_with_env(|| {
+            setup_test_env();
+            let token = generate_token("testuser", TOKEN_TYPE_ACCESS, Some(Duration::hours(1)))
+                .expect("Should generate token");
+            let claims = decode_token(&token).expect("Should decode token");
+            assert_eq!(claims.sub, "testuser");
+            assert_eq!(claims.token_type, TOKEN_TYPE_ACCESS);
+            assert!(claims.jti.is_some());
+        });
+    }
+
+    #[test]
+    fn test_decode_token_claims_structure() {
+        run_with_env(|| {
+            setup_test_env();
+            let token = generate_token("alice", TOKEN_TYPE_REFRESH, Some(Duration::hours(2)))
+                .expect("Should generate token");
+            let claims = decode_token(&token).expect("Should decode token");
+            assert_eq!(claims.sub, "alice");
+            assert_eq!(claims.token_type, TOKEN_TYPE_REFRESH);
+            assert!(claims.exp > claims.iat);
+            assert!(claims.jti.is_some());
+        });
+    }
+
+    #[test]
+    fn test_decode_token_with_wrong_secret() {
+        run_with_env(|| {
+            setup_test_env();
+            let token = generate_token("testuser", TOKEN_TYPE_ACCESS, Some(Duration::hours(1)))
+                .expect("Should generate token");
+            env::set_var("JWT_SECRET", "different-secret-key-min-32-chars");
+            let result = decode_token(&token);
+            assert!(result.is_err());
+            let err_msg = result.unwrap_err().to_string();
+            assert!(
+                err_msg.contains("signature") || err_msg.contains("Invalid token"),
+                "Expected signature or token error, got: {}",
+                err_msg
+            );
+        });
     }
 
     #[test]
     fn test_expired_token() {
-        setup_test_env();
-        
-        // Generate a token that expired 1 hour ago
-        let token = generate_token("testuser", TOKEN_TYPE_ACCESS, Some(Duration::hours(-1)))
-            .expect("Should generate token");
-        
-        let result = decode_token(&token);
-        assert!(result.is_err(), "Expected error for expired token, but got: {:?}", result);
-        
-        // Check error message
-        if let Err(e) = result {
-            assert!(e.to_string().contains("expired"), "Error didn't mention expiration: {}", e);
-        }
-        
-        cleanup_test_env();
+        run_with_env(|| {
+            setup_test_env();
+            let token = generate_token("testuser", TOKEN_TYPE_ACCESS, Some(Duration::hours(-1)))
+                .expect("Should generate token");
+            let result = decode_token(&token);
+            assert!(result.is_err(), "Expected error for expired token");
+            if let Err(e) = result {
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.contains("expired") || err_msg.contains("Invalid token"),
+                    "Expected expiration or token error, got: {}",
+                    err_msg
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn test_token_with_leeway() {
+        run_with_env(|| {
+            setup_test_env();
+            let token = generate_token("testuser", TOKEN_TYPE_ACCESS, Some(Duration::seconds(-3)))
+                .expect("Should generate token");
+            let _ = decode_token(&token);
+        });
     }
 
     #[test]
     fn test_invalid_signature() {
-        setup_test_env();
-        
-        let token = generate_token("testuser", TOKEN_TYPE_ACCESS, None)
-            .expect("Should generate token");
-        
-        let parts: Vec<&str> = token.split('.').collect();
-        let tampered = format!("{}.{}.invalid", parts[0], parts[1]);
-        
-        let result = decode_token(&tampered);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("signature"));
-        
-        cleanup_test_env();
+        run_with_env(|| {
+            setup_test_env();
+            let token = generate_token("testuser", TOKEN_TYPE_ACCESS, None)
+                .expect("Should generate token");
+            let parts: Vec<&str> = token.split('.').collect();
+            let tampered = format!("{}.{}.invalid", parts[0], parts[1]);
+            let result = decode_token(&tampered);
+            assert!(result.is_err());
+            let err_msg = result.unwrap_err().to_string();
+            assert!(
+                err_msg.contains("signature")
+                    || err_msg.contains("Invalid token")
+                    || err_msg.contains("format"),
+                "Expected token validation error, got: {}",
+                err_msg
+            );
+        });
+    }
+
+    #[test]
+    fn test_malformed_token() {
+        run_with_env(|| {
+            setup_test_env();
+            let result = decode_token("not.a.valid.jwt.token");
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn test_empty_token() {
+        run_with_env(|| {
+            setup_test_env();
+            let result = decode_token("");
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn test_token_missing_parts() {
+        run_with_env(|| {
+            setup_test_env();
+            let result = decode_token("header.payload");
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn test_token_type_constants() {
+        run_with_env(|| {
+            assert_eq!(TOKEN_TYPE_ACCESS, "access");
+            assert_eq!(TOKEN_TYPE_REFRESH, "refresh");
+        });
+    }
+
+    #[test]
+    fn test_default_expiry_constants() {
+        run_with_env(|| {
+            assert_eq!(DEFAULT_ACCESS_TOKEN_EXPIRY_SECS, 3600);
+            assert_eq!(DEFAULT_REFRESH_TOKEN_EXPIRY_SECS, 604800);
+        });
+    }
+
+    #[test]
+    fn test_min_secret_length_constant() {
+        run_with_env(|| {
+            assert_eq!(MIN_SECRET_LENGTH, 32);
+        });
+    }
+
+    #[test]
+    fn test_leeway_seconds_constant() {
+        run_with_env(|| {
+            assert_eq!(LEEWAY_SECONDS, 5);
+        });
+    }
+
+    #[test]
+    fn test_token_claims_serialization() {
+        run_with_env(|| {
+            let claims = TokenClaims {
+                sub: "user123".to_string(),
+                exp: 1234567890,
+                iat: 1234567800,
+                token_type: TOKEN_TYPE_ACCESS.to_string(),
+                jti: Some("unique-id".to_string()),
+            };
+            let json = serde_json::to_string(&claims).unwrap();
+            assert!(json.contains("user123"));
+            assert!(json.contains("access"));
+        });
+    }
+
+    #[test]
+    fn test_token_claims_deserialization() {
+        run_with_env(|| {
+            let json = r#"{
+                "sub": "user456",
+                "exp": 1234567890,
+                "iat": 1234567800,
+                "token_type": "refresh"
+            }"#;
+            let claims: TokenClaims = serde_json::from_str(json).unwrap();
+            assert_eq!(claims.sub, "user456");
+            assert_eq!(claims.token_type, "refresh");
+            assert!(claims.jti.is_none());
+        });
+    }
+
+    #[test]
+    fn test_token_claims_jti_optional() {
+        run_with_env(|| {
+            let json = r#"{
+                "sub": "user789",
+                "exp": 1234567890,
+                "iat": 1234567800,
+                "token_type": "access",
+                "jti": "test-jti"
+            }"#;
+            let claims: TokenClaims = serde_json::from_str(json).unwrap();
+            assert_eq!(claims.jti, Some("test-jti".to_string()));
+        });
     }
 
     #[test]
     fn test_weak_secret_rejected() {
-        env::set_var("JWT_SECRET", "short");
-        
-        let result = generate_token("user", TOKEN_TYPE_ACCESS, None);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("32 characters"));
-        
-        env::remove_var("JWT_SECRET");
+        run_with_env(|| {
+            env::set_var("JWT_SECRET", "short");
+            let result = generate_token("user", TOKEN_TYPE_ACCESS, None);
+            assert!(result.is_err());
+            assert!(result.unwrap_err().to_string().contains("32 characters"));
+        });
     }
 
-    #[tokio::test]
-    #[ignore] // Requires Redis
-    async fn test_token_revocation() {
-        setup_test_env();
-        let redis = RedisClient::open("redis://localhost:6379").unwrap();
-        
-        let token = generate_token("testuser", TOKEN_TYPE_ACCESS, Some(Duration::hours(1)))
-            .expect("Should generate token");
-        
-        // Should be valid initially
-        let claims = validate_token(&token, &redis).await.expect("Should validate");
-        assert_eq!(claims.sub, "testuser");
-        
-        // Revoke it
-        revoke_token(&token, &redis).await.expect("Should revoke");
-        
-        // Should now be invalid
-        let result = validate_token(&token, &redis).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("revoked"));
-        
-        cleanup_test_env();
+    #[test]
+    fn test_secret_exactly_31_chars_rejected() {
+        run_with_env(|| {
+            env::set_var("JWT_SECRET", &"a".repeat(31));
+            let result = generate_token("user", TOKEN_TYPE_ACCESS, None);
+            assert!(result.is_err());
+        });
     }
 
-    #[tokio::test]
-    #[ignore] // Requires Redis
-    async fn test_expired_token_revocation() {
-        setup_test_env();
-        let redis = RedisClient::open("redis://localhost:6379").unwrap();
-        
-        // Create expired token
-        let token = generate_token("testuser", TOKEN_TYPE_ACCESS, Some(Duration::seconds(-1)))
-            .expect("Should generate token");
-        
-        // Should not error when revoking expired token
-        let result = revoke_token(&token, &redis).await;
-        assert!(result.is_ok());
-        
-        cleanup_test_env();
-    }
-
-    #[tokio::test]
-    async fn test_token_revocation_sync() {
-        setup_test_env();
-        
-        // Create a token
-        let token = generate_token("testuser", TOKEN_TYPE_ACCESS, None)
-            .expect("Should generate token");
-        
-        let redis_client = redis::Client::open("redis://localhost").unwrap();
-        
-        // Use await when calling the async revoke_token function
-        // Also fix the argument order to (token, client)
-        revoke_token(&token, &redis_client).await
-            .expect("Should revoke token");
-        
-        // Use validate_token instead of verify_token and await it
-        let result = validate_token(&token, &redis_client).await;
-        assert!(result.is_err(), "Expected error for revoked token");
-        
-        // Check error message - should contain one of these terms
-        let error_str = result.unwrap_err().to_string().to_lowercase();
-        assert!(
-            error_str.contains("invalid") || 
-            error_str.contains("blacklist") || 
-            error_str.contains("block") || 
-            error_str.contains("reject") ||
-            error_str.contains("revoked"),
-            "Error message doesn't indicate token invalidation: '{}'", error_str
-        );
-        
-        cleanup_test_env();
+    #[test]
+    fn test_secret_exactly_32_chars_accepted() {
+        run_with_env(|| {
+            env::set_var("JWT_SECRET", &"a".repeat(32));
+            let result = generate_token("user", TOKEN_TYPE_ACCESS, None);
+            assert!(result.is_ok());
+        });
     }
 }

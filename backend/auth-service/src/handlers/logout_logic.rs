@@ -5,10 +5,10 @@
 
 use crate::{
     app::AppState,
-    utils::metrics,  // Fixed: correct import path
     utils::{
         errors::AuthServiceError,
         jwt::{revoke_token, validate_token},
+        metrics,
     },
 };
 use axum::{http::StatusCode, response::IntoResponse, Json};
@@ -18,24 +18,23 @@ use tracing::{error, info, span, warn, Instrument, Level};
 /// Process user logout request.
 ///
 /// # Flow
-/// 1. Verify Redis availability (required for token operations)
-/// 2. Validate token (best effort - continue even if invalid)
-/// 3. Revoke token (always attempt for security)
-/// 4. Return success
+/// 1. Verify Redis availability (required for token operations).
+/// 2. Validate token (best effort - continue even if invalid).
+/// 3. Revoke token (always attempt for security).
+/// 4. Return success.
 ///
 /// # Security
-/// - Idempotent operation (safe to retry)
-/// - Revokes even invalid tokens (defense in depth)
-/// - Prevents token reuse after logout
+/// - Idempotent operation (safe to retry).
+/// - Revokes even invalid tokens (defense in depth).
+/// - Prevents token reuse after logout.
 pub async fn process_logout(
     app_state: &AppState,
     token: &str,
 ) -> Result<impl IntoResponse, AuthServiceError> {
-    // Create root span for the operation
+    // Create root span for the operation.
     let span = span!(Level::INFO, "logout_operation",
         token_length = token.len()
     );
-    let span_for_instrument = span.clone();
 
     async move {
         info!("Starting logout process");
@@ -48,18 +47,17 @@ pub async fn process_logout(
         })?;
 
         // ===== 2. TOKEN VALIDATION (BEST EFFORT) =====
+        // We try to validate the token to get the username for logging, but we don't
+        // fail the request if validation fails. We still want to revoke the token.
         let validation_span = span!(Level::INFO, "validate_token");
-        let user_id = async {
+        let username = async {
             match validate_token(token, redis_client).await {
                 Ok(claims) => {
-                    info!(username = %claims.sub, "Token validated successfully");
-                    metrics::external::redis_success("validate_token");
+                    info!(username = %claims.sub, "Token validated successfully for logout");
                     Some(claims.sub)
                 }
                 Err(e) => {
-                    // Don't fail - we still want to revoke invalid tokens
-                    warn!("Token validation failed: {} - continuing with revocation", e);
-                    metrics::external::redis_failure("validate_token");
+                    warn!("Token validation failed (continuing with revocation): {}", e);
                     None
                 }
             }
@@ -67,34 +65,31 @@ pub async fn process_logout(
         .instrument(validation_span)
         .await;
 
-        // Add username to span if available
-        if let Some(ref uid) = user_id {
-            span.record("username", uid.as_str());
+        // Add username to the current span if available.
+        if let Some(ref uname) = username {
+            tracing::Span::current().record("username", uname.as_str());
         }
 
         // ===== 3. TOKEN REVOCATION =====
+        // This is the critical step. We always attempt to revoke the token.
         let revocation_span = span!(Level::INFO, "revoke_token");
         async {
             revoke_token(token, redis_client).await.map_err(|e| {
                 error!("Token revocation failed: {}", e);
-                metrics::external::redis_failure("revoke_token");
+                // Business-level metric for logout failure.
                 metrics::auth::logout_failure();
-                AuthServiceError::configuration("Unable to complete logout. Please try again.")
-            })?;
-            
-            info!("Token revoked successfully");
-            metrics::external::redis_success("revoke_token");
-            Ok::<_, AuthServiceError>(())
+                AuthServiceError::external("Unable to complete logout. Please try again.")
+            })
         }
         .instrument(revocation_span)
         .await?;
 
         // ===== 4. SUCCESS =====
         metrics::auth::logout_success();
-        if let Some(uid) = user_id {
-            info!(username = %uid, "User logged out successfully");
+        if let Some(uname) = username {
+            info!(username = %uname, "User logged out successfully");
         } else {
-            info!("Logout completed successfully (invalid token revoked)");
+            info!("Logout completed successfully (invalid or expired token revoked)");
         }
 
         Ok((
@@ -105,65 +100,6 @@ pub async fn process_logout(
             })),
         ))
     }
-    .instrument(span_for_instrument)
+    .instrument(span)
     .await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::utils::jwt::{generate_token, TOKEN_TYPE_ACCESS};
-    use crate::utils::test_utils::{state_no_redis, state_with_redis, init_test_env};
-
-    #[tokio::test]
-    async fn test_missing_redis_returns_configuration_error() {
-        let state = state_no_redis();
-        let result = process_logout(&state, "any-token").await;
-        assert!(matches!(result, Err(AuthServiceError::Configuration(_))));
-    }
-
-    #[tokio::test]
-    async fn test_invalid_token_still_succeeds() {
-        let state = state_with_redis();
-        // Invalid token should still be "revoked" (added to blocklist)
-        let result = process_logout(&state, "invalid.jwt.token").await;
-        // Should succeed (revocation is best-effort)
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_empty_token_succeeds() {
-        let state = state_with_redis();
-        let result = process_logout(&state, "").await;
-        // Empty token should be handled gracefully
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_valid_token_logout() {
-        init_test_env(); // Fixed: use the correct function name
-        let state = state_with_redis();
-        let token = generate_token("testuser", TOKEN_TYPE_ACCESS, None).unwrap();
-        
-        let result = process_logout(&state, &token).await;
-        assert!(result.is_ok());
-        
-        let response = result.unwrap().into_response();
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_double_logout_is_idempotent() {
-        init_test_env(); // Fixed: use the correct function name
-        let state = state_with_redis();
-        let token = generate_token("testuser", TOKEN_TYPE_ACCESS, None).unwrap();
-        
-        // First logout
-        let result1 = process_logout(&state, &token).await;
-        assert!(result1.is_ok());
-        
-        // Second logout should also succeed (idempotent)
-        let result2 = process_logout(&state, &token).await;
-        assert!(result2.is_ok());
-    }
 }

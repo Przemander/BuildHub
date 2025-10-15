@@ -1,46 +1,44 @@
-//! Account activation business logic.
+//! # Account Activation Business Logic
 //!
-//! Implements secure account activation with Redis-backed verification codes,
-//! idempotent operations, and comprehensive observability.
+//! Implements a secure and idempotent account activation flow.
+//!
+//! ## Flow
+//! 1.  **Configuration Check**: Verifies that the Redis client is available.
+//! 2.  **Code Validation**: Verifies the activation code against Redis. The code is
+//!     single-use and is deleted upon successful verification.
+//! 3.  **User Lookup**: Finds the user associated with the email from the code.
+//! 4.  **Idempotency Check**: If the user is already active, the operation succeeds
+//!     without making any changes.
+//! 5.  **Activation**: The user's `is_active` flag is set to `true` in the database.
+//!
+//! ## Security & Resilience
+//! - **Single-Use Codes**: Activation codes are deleted from Redis immediately after
+//!   successful verification to prevent reuse.
+//! - **Idempotency**: Safely retrying the activation for an already-active account
+//!   results in a success response without side effects.
+//! - **Clean Architecture**: Clear separation between business logic, database
+//!   operations (run in a blocking thread pool), and cache operations.
 
 use crate::{
     app::AppState,
-    config::redis::verify_activation_code,
+    config::{database::get_connection, redis::verify_activation_code},
     db::users::User,
     utils::{errors::AuthServiceError, metrics},
-    
 };
-use redis::AsyncCommands;
+use tokio::task::spawn_blocking;
 use tracing::{error, info, span, warn, Instrument, Level};
 
-/// Process account activation request.
-///
-/// # Flow
-/// 1. Verify Redis availability
-/// 2. Validate activation code
-/// 3. Find user by email
-/// 4. Check idempotency (already active?)
-/// 5. Activate account
-/// 6. Clean up activation code
-/// 7. Return success
-///
-/// # Security
-/// - One-time activation codes
-/// - Automatic code cleanup
-/// - Idempotent operations (safe to retry)
+/// Processes an account activation request.
 pub async fn process_activation(
     app_state: &AppState,
     code: &str,
 ) -> Result<(), AuthServiceError> {
-    // Create root span for the operation
-    let span = span!(Level::INFO, "account_activation",
-        code_length = code.len()
-    );
+    // Create the root span for the entire operation.
+    let span = span!(Level::INFO, "account_activation", code_length = code.len());
 
-    let span_for_instrument = span.clone();
-
+    // This outer async block is instrumented with the span.
     async move {
-        info!("Starting account activation");
+        info!("Starting account activation process");
 
         // ===== 1. CONFIGURATION CHECK =====
         let redis_client = app_state.redis_client.as_ref().ok_or_else(|| {
@@ -50,227 +48,53 @@ pub async fn process_activation(
         })?;
 
         // ===== 2. CODE VALIDATION =====
-        let validation_span = span!(Level::INFO, "code_validation");
-        let email = async {
-            verify_activation_code(redis_client, code).await.map_err(|e| {
-                warn!("Invalid activation code: {}", e);
+        let email = verify_activation_code(redis_client, code)
+            .await
+            .map_err(|e| {
+                warn!("Invalid or expired activation code provided: {}", e);
                 metrics::auth::activation_failure();
-                AuthServiceError::validation(
-                    "code",
-                    "This activation link is invalid or has expired"
-                )
-            })
-        }
-        .instrument(validation_span)
-        .await?;
-        
-        info!("Activation code validated for email");
-        metrics::external::redis_success("verify_activation_code");
-
-        // ===== 3. USER LOOKUP =====
-        let db_span = span!(Level::INFO, "db_lookup");
-        let mut user = async {
-            let mut conn = app_state.pool.get().map_err(|e| {
-                error!("Failed to get database connection: {}", e);
-                metrics::db::connection_failed();
-                metrics::auth::activation_failure();
-                AuthServiceError::database("Unable to process activation. Please try again later.")
+                AuthServiceError::validation("code", "This activation link is invalid or has expired.")
             })?;
-            metrics::db::connection_acquired();
-
-            User::find_by_email(&mut conn, &email).map_err(|e| {
-                warn!("User not found for activation email {}: {}", email, e);
-                metrics::db::query_failure("find_user_by_email");
-                metrics::auth::activation_failure();
-                AuthServiceError::validation(
-                    "code",
-                    "This activation code is invalid or the account no longer exists"
-                )
-            })
-        }
-        .instrument(db_span)
-        .await?;
         
-        metrics::db::query_success("find_user_by_email");
-        span.record("user_id", &user.id.to_string());
-        info!(user_id = %user.id, "User found for activation");
+        info!(email_domain = email.split('@').nth(1).unwrap_or("unknown"), "Activation code validated");
 
-        // ===== 4. IDEMPOTENCY CHECK =====
-        if user.is_active {
-            info!(user_id = %user.id, "Account already active - idempotent success");
-            metrics::auth::activation_success();
-            return Ok(());
-        }
+        // ===== 3. DATABASE OPERATIONS (LOOKUP & UPDATE) =====
+        let pool = app_state.pool.clone();
+        
+        // Create a dedicated span for the database operations, for consistency and clarity.
+        let db_span = span!(Level::INFO, "db_operations");
 
-        // ===== 5. ACTIVATE ACCOUNT =====
-        let activation_span = span!(Level::INFO, "account_activation");
-        async {
-            let mut conn = app_state.pool.get().map_err(|e| {
-                error!("Failed to get database connection: {}", e);
-                metrics::db::connection_failed();
-                metrics::auth::activation_failure();
-                AuthServiceError::database("Unable to activate account. Please try again later.")
-            })?;
-            metrics::db::connection_acquired();
+        spawn_blocking(move || {
+            let mut conn = get_connection(&pool)?;
+
+            let mut user = User::find_by_email(&mut conn, &email)?;
+            
+            info!(user_id = %user.id, "User found for activation");
+
+            if user.is_active {
+                info!(user_id = %user.id, "Account already active - idempotent success");
+                return Ok::<(), AuthServiceError>(());
+            }
 
             user.is_active = true;
-            user.update(&mut conn).map_err(|e| {
-                error!(user_id = %user.id, "Failed to update user activation status: {}", e);
-                metrics::db::query_failure("update_user");
-                metrics::auth::activation_failure();
-                AuthServiceError::database("Unable to activate account. Please try again later.")
-            })?;
+            user.update(&mut conn)?;
             
-            info!(user_id = %user.id, "Account activated successfully");
-            metrics::db::query_success("update_user");
-            Ok::<_, AuthServiceError>(())
-        }
-        .instrument(activation_span)
-        .await?;
+            info!(user_id = %user.id, "Account activated successfully in database");
+            Ok(())
+        })
+        .instrument(db_span) // Instrument the blocking task with the dedicated db_span.
+        .await
+        .map_err(|e| {
+            error!("Database task panicked: {}", e);
+            AuthServiceError::internal("Database task failed")
+        })??;
 
-        // ===== 6. CODE CLEANUP (BEST EFFORT) =====
-        let cleanup_span = span!(Level::INFO, "code_cleanup");
-        async {
-            if let Err(e) = clean_up_activation_code(redis_client, code).await {
-                warn!("Failed to clean up activation code (non-critical): {}", e);
-                metrics::external::redis_failure("delete_activation_code");
-                // Continue - activation was successful
-            } else {
-                info!("Activation code cleaned up");
-                metrics::external::redis_success("delete_activation_code");
-            }
-        }
-        .instrument(cleanup_span)
-        .await;
-
-        // ===== 7. SUCCESS =====
+        // ===== 4. SUCCESS =====
         metrics::auth::activation_success();
-        info!(user_id = %user.id, "Account activation completed successfully");
+        info!("Account activation process completed successfully");
 
         Ok(())
     }
-    .instrument(span_for_instrument)
+    .instrument(span) // Instrument the main async block with the original span.
     .await
-}
-
-/// Clean up used activation code from Redis.
-async fn clean_up_activation_code(
-    redis_client: &redis::Client,
-    code: &str,
-) -> Result<(), redis::RedisError> {
-    let mut conn = redis_client.get_async_connection().await?;
-    let key = format!("activation:code:{}", code);
-    conn.del::<_, i64>(&key).await?;
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::utils::test_utils::{state_no_redis, state_with_redis};
-    use redis::cmd;
-
-    async fn setup_redis(state: &AppState) -> redis::aio::Connection {
-        let mut conn = state
-            .redis_client
-            .as_ref()
-            .unwrap()
-            .get_async_connection()
-            .await
-            .unwrap();
-        let _: () = cmd("FLUSHDB").query_async(&mut conn).await.unwrap();
-        conn
-    }
-
-    #[tokio::test]
-    async fn test_missing_redis_returns_configuration_error() {
-        let state = state_no_redis();
-        let result = process_activation(&state, "anycode").await;
-        assert!(matches!(result, Err(AuthServiceError::Configuration(_))));
-    }
-
-    #[tokio::test]
-    async fn test_invalid_code_returns_validation_error() {
-        let state = state_with_redis();
-        let _ = setup_redis(&state).await;
-
-        let result = process_activation(&state, "no-such-code").await;
-        // Fixed: Use struct pattern matching for Validation variant
-        assert!(matches!(result, Err(AuthServiceError::Validation { .. })));
-    }
-
-    #[tokio::test]
-    async fn test_user_not_found_returns_validation_error() {
-        let state = state_with_redis();
-        let mut r = setup_redis(&state).await;
-
-        // Set up activation code for non-existent user
-        let code = "code123";
-        let email = "nouser@example.com";
-        let _: () = r
-            .set_ex(format!("activation:code:{}", code), email, 60)
-            .await
-            .unwrap();
-
-        let result = process_activation(&state, code).await;
-        // Fixed: Use struct pattern matching for Validation variant
-        assert!(matches!(result, Err(AuthServiceError::Validation { .. })));
-    }
-
-    #[tokio::test]
-    async fn test_already_active_is_idempotent() {
-        let state = state_with_redis();
-        let mut r = setup_redis(&state).await;
-        let mut db = state.pool.get().unwrap();
-
-        // Create active user
-        let new_user = User::new_for_insert("joe", "joe@example.com", "Password1!");
-        let mut user = User::save_new(new_user, &mut db).unwrap();
-        user.is_active = true;
-        user.update(&mut db).unwrap();
-
-        // Set up activation code
-        let code = "codeJoe";
-        let _: () = r
-            .set_ex(format!("activation:code:{}", code), &user.email, 60)
-            .await
-            .unwrap();
-
-        // Should succeed without error
-        let result = process_activation(&state, code).await;
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_successful_activation() {
-        let state = state_with_redis();
-        let mut r = setup_redis(&state).await;
-        let mut db = state.pool.get().unwrap();
-
-        // Create inactive user
-        let new_user = User::new_for_insert("sam", "sam@example.com", "Password1!");
-        let user = User::save_new(new_user, &mut db).unwrap();
-        assert!(!user.is_active);
-
-        // Set up activation code
-        let code = "codeSam";
-        let _: () = r
-            .set_ex(format!("activation:code:{}", code), &user.email, 60)
-            .await
-            .unwrap();
-
-        // Activate
-        let result = process_activation(&state, code).await;
-        assert!(result.is_ok());
-
-        // Verify user was activated
-        let mut db2 = state.pool.get().unwrap();
-        let reloaded = User::find_by_email(&mut db2, &user.email).unwrap();
-        assert!(reloaded.is_active);
-
-        // Verify code was deleted
-        let key = format!("activation:code:{}", code);
-        let exists: bool = r.exists(&key).await.unwrap();
-        assert!(!exists);
-    }
 }

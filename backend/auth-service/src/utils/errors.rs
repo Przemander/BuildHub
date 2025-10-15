@@ -72,9 +72,15 @@ pub enum CacheError {
 
 impl From<redis::RedisError> for CacheError {
     fn from(err: redis::RedisError) -> Self {
-        CacheError::Operation {
-            source: Box::new(err),
-            span: SpanTrace::capture(),
+        match err.kind() {
+            redis::ErrorKind::IoError => CacheError::Connection {
+                source: Box::new(err),
+                span: SpanTrace::capture(),
+            },
+            _ => CacheError::Operation {
+                source: Box::new(err),
+                span: SpanTrace::capture(),
+            },
         }
     }
 }
@@ -259,6 +265,46 @@ impl From<redis::RedisError> for AuthServiceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use diesel::result::{DatabaseErrorKind, Error as DieselError};
+    use std::fmt;
+
+    // Mock for diesel::result::DatabaseErrorInformation
+    #[derive(Debug)]
+    struct MockDbError {
+        constraint: Option<String>,
+    }
+
+    impl fmt::Display for MockDbError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "Mock DB Error")
+        }
+    }
+
+    impl std::error::Error for MockDbError {}
+
+    impl diesel::result::DatabaseErrorInformation for MockDbError {
+        fn message(&self) -> &str {
+            "mock error"
+        }
+        fn details(&self) -> Option<&str> {
+            None
+        }
+        fn hint(&self) -> Option<&str> {
+            None
+        }
+        fn table_name(&self) -> Option<&str> {
+            None
+        }
+        fn column_name(&self) -> Option<&str> {
+            None
+        }
+        fn constraint_name(&self) -> Option<&str> {
+            self.constraint.as_deref()
+        }
+        fn statement_position(&self) -> Option<i32> {
+            None
+        }
+    }
 
     #[test]
     fn test_api_error_creation() {
@@ -269,12 +315,42 @@ mod tests {
     }
 
     #[test]
+    fn test_api_error_with_string_message() {
+        let message = String::from("Dynamic error message");
+        let error = ApiError::new(StatusCode::NOT_FOUND, "not_found", message);
+        assert_eq!(error.message, "Dynamic error message");
+    }
+
+    #[test]
     fn test_auth_service_error_constructors() {
         let err = AuthServiceError::configuration("Missing env var");
         assert!(matches!(err, AuthServiceError::Configuration(_)));
 
+        let err = AuthServiceError::database("Connection failed");
+        assert!(matches!(err, AuthServiceError::Database(_)));
+
         let err = AuthServiceError::validation("email", "Invalid format");
         assert!(matches!(err, AuthServiceError::Validation { .. }));
+
+        let err = AuthServiceError::authentication("Bad token");
+        assert!(matches!(err, AuthServiceError::Authentication(_)));
+
+        let err = AuthServiceError::external("API down");
+        assert!(matches!(err, AuthServiceError::External(_)));
+
+        let err = AuthServiceError::internal("Panic");
+        assert!(matches!(err, AuthServiceError::Internal(_)));
+    }
+
+    #[test]
+    fn test_cache_error_key_not_found() {
+        let err = CacheError::KeyNotFound {
+            key: "session:123".to_string(),
+            span: SpanTrace::capture(),
+        };
+        let err_str = format!("{}", err);
+        assert!(err_str.contains("Cache key not found"));
+        assert!(err_str.contains("session:123"));
     }
 
     #[test]
@@ -286,7 +362,7 @@ mod tests {
 
     #[test]
     fn test_diesel_not_found_conversion() {
-        let diesel_err = diesel::result::Error::NotFound;
+        let diesel_err = DieselError::NotFound;
         let auth_err: AuthServiceError = diesel_err.into();
         match auth_err {
             AuthServiceError::Database(msg) => assert!(msg.contains("not found")),
@@ -295,18 +371,94 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_error_from_redis() {
+    fn test_diesel_unique_violation_email() {
+        let info = Box::new(MockDbError {
+            constraint: Some("users_email_key".to_string()),
+        });
+        let diesel_err = DieselError::DatabaseError(DatabaseErrorKind::UniqueViolation, info);
+        let auth_err: AuthServiceError = diesel_err.into();
+        
+        match auth_err {
+            AuthServiceError::Validation { field, message } => {
+                assert_eq!(field, "email");
+                assert_eq!(message, "Already exists");
+            }
+            _ => panic!("Expected Validation error"),
+        }
+    }
+
+    #[test]
+    fn test_diesel_unique_violation_username() {
+        let info = Box::new(MockDbError {
+            constraint: Some("users_username_key".to_string()),
+        });
+        let diesel_err = DieselError::DatabaseError(DatabaseErrorKind::UniqueViolation, info);
+        let auth_err: AuthServiceError = diesel_err.into();
+        
+        match auth_err {
+            AuthServiceError::Validation { field, message } => {
+                assert_eq!(field, "username");
+                assert_eq!(message, "Already exists");
+            }
+            _ => panic!("Expected Validation error"),
+        }
+    }
+
+    #[test]
+    fn test_diesel_unique_violation_unknown_field() {
+        let info = Box::new(MockDbError {
+            constraint: Some("unknown_constraint".to_string()),
+        });
+        let diesel_err = DieselError::DatabaseError(DatabaseErrorKind::UniqueViolation, info);
+        let auth_err: AuthServiceError = diesel_err.into();
+        
+        match auth_err {
+            AuthServiceError::Validation { field, message } => {
+                assert_eq!(field, "field"); // Falls back to generic "field"
+                assert_eq!(message, "Already exists");
+            }
+            _ => panic!("Expected Validation error"),
+        }
+    }
+
+    #[test]
+    fn test_diesel_other_database_errors() {
+        let info = Box::new(MockDbError { constraint: None });
+        let diesel_err = DieselError::DatabaseError(DatabaseErrorKind::ForeignKeyViolation, info);
+        let auth_err: AuthServiceError = diesel_err.into();
+        assert!(matches!(auth_err, AuthServiceError::Database(_)));
+    }
+
+    #[test]
+    fn test_cache_error_from_redis_io() {
         let redis_err = redis::RedisError::from((
             redis::ErrorKind::IoError,
             "Connection refused",
         ));
         let cache_err: CacheError = redis_err.into();
+        assert!(matches!(cache_err, CacheError::Connection { .. }));
+    }
+
+    #[test]
+    fn test_cache_error_from_redis_type_error() {
+        let redis_err = redis::RedisError::from((
+            redis::ErrorKind::TypeError,
+            "Wrong type",
+        ));
+        let cache_err: CacheError = redis_err.into();
         assert!(matches!(cache_err, CacheError::Operation { .. }));
     }
 
-    // Fixed: Simplified tests that don't try to extract response body content
-    // The body extraction in tests is complex and not necessary for error type verification
-    
+    #[test]
+    fn test_auth_service_error_from_redis() {
+        let redis_err = redis::RedisError::from((
+            redis::ErrorKind::IoError,
+            "Connection refused",
+        ));
+        let auth_err: AuthServiceError = redis_err.into();
+        assert!(matches!(auth_err, AuthServiceError::Cache(_)));
+    }
+
     #[test]
     fn test_configuration_error_response_status() {
         let err = AuthServiceError::configuration("DATABASE_URL missing");
@@ -343,6 +495,13 @@ mod tests {
     }
 
     #[test]
+    fn test_database_error_with_not_found_lowercase() {
+        let err = AuthServiceError::database("Resource Not found");
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
     fn test_cache_error_response_status() {
         let redis_err = redis::RedisError::from((
             redis::ErrorKind::IoError,
@@ -365,5 +524,29 @@ mod tests {
         let err = AuthServiceError::internal("Unexpected error");
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn test_error_display_messages() {
+        let err = AuthServiceError::Configuration("test".to_string());
+        assert_eq!(format!("{}", err), "Configuration error: test");
+
+        let err = AuthServiceError::Database("test".to_string());
+        assert_eq!(format!("{}", err), "Database error: test");
+
+        let err = AuthServiceError::Validation {
+            field: "email".to_string(),
+            message: "invalid".to_string(),
+        };
+        assert_eq!(format!("{}", err), "Validation error: email: invalid");
+
+        let err = AuthServiceError::Authentication("test".to_string());
+        assert_eq!(format!("{}", err), "Authentication error: test");
+
+        let err = AuthServiceError::External("test".to_string());
+        assert_eq!(format!("{}", err), "External service error: test");
+
+        let err = AuthServiceError::Internal("test".to_string());
+        assert_eq!(format!("{}", err), "Internal error: test");
     }
 }

@@ -1,7 +1,14 @@
-//! BuildHub Authentication Service
+//! # BuildHub Authentication Service
 //!
-//! Production-ready authentication microservice with JWT tokens, rate limiting,
-//! and comprehensive observability.
+//! A production-ready, secure, and observable authentication microservice.
+//!
+//! ## Features
+//! - JWT-based authentication (access & refresh tokens).
+//! - Secure user registration with email activation.
+//! - Two-step password reset flow.
+//! - Redis-backed rate limiting and token revocation.
+//! - Comprehensive observability with `tracing` and `Prometheus`.
+//! - Graceful shutdown and robust error handling.
 
 use axum::Server;
 use std::{env, net::SocketAddr, time::Duration};
@@ -14,8 +21,7 @@ use crate::{
         database::{check_database_health, init_pool, run_migrations},
         redis::init_redis,
     },
-    utils::metrics,  // Fixed: metrics is in utils module
-    utils::email::EmailConfig,
+    utils::{email::EmailConfig, metrics, validators},
 };
 
 // Module declarations
@@ -41,11 +47,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load .env file if present
     dotenvy::dotenv().ok();
 
-    // Initialize tracing
+    // Initialize tracing for structured logging
     init_tracing();
 
-    // Initialize metrics
+    // Initialize metrics and validators eagerly
     metrics::init();
+    validators::init();
 
     info!(
         service = SERVICE_NAME,
@@ -53,49 +60,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Starting authentication service"
     );
 
-    // Validate configuration
+    // Validate required configuration
     validate_config()?;
 
-    // Initialize components
+    // Initialize database connection pool and run migrations
     let pool = init_pool();
     run_migrations(&pool)?;
-    
-    // Fixed: check_database_health returns Result<(), Error>, not Result<bool, Error>
     if let Err(e) = check_database_health(&pool).await {
         error!("Database health check failed: {}", e);
-        return Err("Database unhealthy".into());
+        return Err("Database is unhealthy, shutting down.".into());
     }
 
+    // Initialize Redis client (optional)
     let redis_client = match init_redis() {
         Ok(client) => {
-            info!("Redis connected");
+            info!("Redis connected successfully");
             Some(client)
         }
         Err(e) => {
-            warn!("Redis unavailable: {}", e);
+            warn!("Redis is unavailable: {}. Some features may be disabled.", e);
             None
         }
     };
 
+    // Initialize email client (optional)
     let email_config = match EmailConfig::new() {
         Ok(config) => {
-            info!("Email configured");
+            info!("Email service configured successfully");
             Some(config)
         }
         Err(e) => {
-            warn!("Email unavailable: {}", e);
+            warn!("Email service is unavailable: {}. Some features may be disabled.", e);
             None
         }
     };
 
-    // Build application
+    // Build the main Axum application
     let app = build_app(pool, redis_client, email_config).await;
 
-    // Bind address
+    // Determine server bind address
     let addr = get_bind_address()?;
 
-    // Start server
-    info!("Listening on {}", addr);
+    // Start the server
+    info!("Server listening on {}", addr);
     print_banner(&addr);
 
     Server::bind(&addr)
@@ -108,43 +115,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // =============================================================================
-// INITIALIZATION
+// INITIALIZATION & SHUTDOWN
 // =============================================================================
 
-/// Initialize tracing subscriber.
+/// Initializes the `tracing` subscriber for structured, JSON-formatted logs.
 fn init_tracing() {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
-        .with_target(false)
+        .with_target(false) // Disable module path logging for cleaner output
         .json()
         .init();
 }
 
-/// Validate required environment variables.
+/// Validates that all required environment variables are set.
 fn validate_config() -> Result<(), Box<dyn std::error::Error>> {
     let required = ["DATABASE_URL", "JWT_SECRET"];
-    
     for var in &required {
         if env::var(var).is_err() {
-            return Err(format!("Missing required env var: {}", var).into());
+            let err_msg = format!("Missing required environment variable: {}", var);
+            error!("{}", err_msg);
+            return Err(err_msg.into());
         }
     }
-    
     Ok(())
 }
 
-/// Get server bind address.
+/// Determines the server's bind address from environment variables or defaults.
 fn get_bind_address() -> Result<SocketAddr, Box<dyn std::error::Error>> {
     let host = env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
     let port = env::var("PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(DEFAULT_PORT);
-    
     Ok(format!("{}:{}", host, port).parse()?)
 }
 
-/// Wait for shutdown signal.
+/// Listens for termination signals (Ctrl+C, SIGTERM) to trigger a graceful shutdown.
 async fn shutdown_signal() {
     let ctrl_c = async {
         signal::ctrl_c()
@@ -155,7 +161,7 @@ async fn shutdown_signal() {
     #[cfg(unix)]
     let terminate = async {
         signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("Failed to install signal handler")
+            .expect("Failed to install SIGTERM handler")
             .recv()
             .await;
     };
@@ -164,33 +170,38 @@ async fn shutdown_signal() {
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => info!("Received Ctrl+C"),
-        _ = terminate => info!("Received SIGTERM"),
+        _ = ctrl_c => info!("Received Ctrl+C, initiating shutdown..."),
+        _ = terminate => info!("Received SIGTERM, initiating shutdown..."),
     }
 
-    info!("Starting graceful shutdown ({}s timeout)", GRACEFUL_SHUTDOWN_TIMEOUT.as_secs());
+    info!(
+        "Graceful shutdown initiated (timeout: {}s)",
+        GRACEFUL_SHUTDOWN_TIMEOUT.as_secs()
+    );
 }
 
-/// Print startup banner.
+/// Prints a startup banner with key service information.
 fn print_banner(addr: &SocketAddr) {
+    let version_str = format!("{:<38}", SERVICE_VERSION);
+    let addr_str = format!("{:<38}", addr);
+    let health_str = format!("http://{}/health", addr);
+    let metrics_str = format!("http://{}/metrics", addr);
+    let ready_str = format!("http://{}/readiness", addr);
+
     println!(
         r#"
 ╔═══════════════════════════════════════════════════╗
 ║          BuildHub Authentication Service          ║
 ╠═══════════════════════════════════════════════════╣
-║  Version:  {}                              ║
-║  Address:  {}                    ║
+║ Version:  {}║
+║ Address:  {}║
 ║                                                   ║
-║  Health:   http://{}/health            ║
-║  Metrics:  http://{}/metrics           ║
-║  Ready:    http://{}/readiness         ║
+║ Health:   {:<38}║
+║ Metrics:  {:<38}║
+║ Ready:    {:<38}║
 ╚═══════════════════════════════════════════════════╝
 "#,
-        format!("{:<8}", SERVICE_VERSION),
-        format!("{:<21}", addr),
-        addr,
-        addr,
-        addr
+        version_str, addr_str, health_str, metrics_str, ready_str
     );
 }
 
@@ -202,5 +213,23 @@ mod tests {
     fn test_service_constants() {
         assert_eq!(SERVICE_NAME, "auth-service");
         assert_eq!(DEFAULT_PORT, 3000);
+    }
+
+    #[test]
+    fn test_get_bind_address_default() {
+        env::remove_var("HOST");
+        env::remove_var("PORT");
+        let addr = get_bind_address().unwrap();
+        assert_eq!(addr.to_string(), "0.0.0.0:3000");
+    }
+
+    #[test]
+    fn test_get_bind_address_custom() {
+        env::set_var("HOST", "127.0.0.1");
+        env::set_var("PORT", "8080");
+        let addr = get_bind_address().unwrap();
+        assert_eq!(addr.to_string(), "127.0.0.1:8080");
+        env::remove_var("HOST");
+        env::remove_var("PORT");
     }
 }

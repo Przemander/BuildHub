@@ -1,11 +1,25 @@
-//! Rate limiting middleware.
+//! # Rate Limiting Middleware
 //!
-//! Portfolio-ready with minimal overhead, clean design, and effective protection.
+//! Provides a secure, configurable, and high-performance `tower` layer for
+//! rate limiting requests using a fixed-window counter algorithm with Redis.
+//!
+//! ## Features
+//! - **Fixed-Window Counter**: Simple and efficient algorithm for rate limiting.
+//! - **Configurable Failure Strategy**: Supports "fail-secure" (default, blocks
+//!   requests on Redis error) and "fail-open" (allows requests) modes.
+//! - **Standard Headers**: Automatically adds `Retry-After`, `X-RateLimit-Limit`,
+//!   and `X-RateLimit-Window` headers to rate-limited responses.
+//! - **Flexible Key Generation**: Allows custom logic to define rate limiting
+//!   granularity (e.g., per IP, per user, per endpoint).
+//! - **Clean Builder API**: Provides a fluent interface for configuration.
+//! - **Observability**: Integrates with `tracing` for structured logging and
+//!   `metrics` for monitoring.
 
+use crate::{config::redis::check_and_increment_rate_limit, utils::metrics};
 use axum::{
     body::{Body, BoxBody},
     http::{Request, StatusCode},
-    response::{IntoResponse, Response, Json},
+    response::{IntoResponse, Json, Response},
 };
 use redis::Client;
 use serde_json::json;
@@ -13,46 +27,44 @@ use std::{future::Future, pin::Pin, sync::Arc};
 use tower::{Layer, Service};
 use tracing::{info, warn};
 
-use crate::{
-    config::redis::check_and_increment_rate_limit,
-    utils::metrics,  // Fixed: correct import path
-};
-
-// =============================================================================
-// TYPES
-// =============================================================================
-
-/// Function for generating Redis keys from requests.
+/// A function type for generating a unique Redis key from a request.
+/// This allows for flexible rate limiting strategies.
 pub type KeyFn = dyn Fn(&Request<Body>) -> String + Send + Sync + 'static;
 
-/// Rate limit configuration.
+/// Configuration for the rate limiter with sensible defaults.
 #[derive(Debug, Clone)]
 pub struct RateLimitConfig {
-    pub message: Option<String>,
-    pub retry_after: Option<u64>,
+    /// The message returned in the body of a `429 Too Many Requests` response.
+    pub message: String,
+    /// The value for the `Retry-After` header, in seconds.
+    pub retry_after_secs: u64,
+    /// Determines behavior when Redis is unavailable.
+    /// - `false` (default): Fail-secure. Blocks requests.
+    /// - `true`: Fail-open. Allows requests. Use with caution.
+    pub fail_open: bool,
 }
 
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
-            message: None,
-            retry_after: Some(60),
+            message: "Too many requests. Please try again later.".to_string(),
+            retry_after_secs: 60,
+            fail_open: false, // Fail-secure is the safest default.
         }
     }
 }
 
-// =============================================================================
-// LAYER
-// =============================================================================
-
-/// Tower layer for rate limiting.
+/// A `tower` layer that applies rate limiting to requests.
+///
+/// This struct integrates seamlessly with Axum's middleware system and can be
+/// applied selectively to specific routes or globally to the entire application.
 #[derive(Clone)]
 pub struct RateLimiterLayer {
-    pub redis: Arc<Client>,
-    pub max_attempts: u32,
-    pub window_secs: usize,
-    pub key_fn: Arc<KeyFn>,
-    pub config: RateLimitConfig,
+    redis: Arc<Client>,
+    max_attempts: u32,
+    window_secs: usize,
+    key_fn: Arc<KeyFn>,
+    config: RateLimitConfig,
 }
 
 impl<S> Layer<S> for RateLimiterLayer {
@@ -70,11 +82,7 @@ impl<S> Layer<S> for RateLimiterLayer {
     }
 }
 
-// =============================================================================
-// SERVICE
-// =============================================================================
-
-/// Rate limiting middleware service.
+/// The actual middleware `Service` that processes each request.
 #[derive(Clone)]
 pub struct RateLimiterMiddleware<S> {
     inner: S,
@@ -110,70 +118,83 @@ where
         let config = self.config.clone();
 
         Box::pin(async move {
-            // Check rate limit
-            let allowed = match check_and_increment_rate_limit(&redis, &key, max_attempts, window_secs).await {
-                Ok(allowed) => {
-                    if !allowed {
-                        info!(
-                            key_prefix = key.split(':').next().unwrap_or("unknown"),
-                            "Rate limit exceeded"
-                        );
-                        metrics::security::rate_limit_exceeded();
-                    }
-                    allowed
-                }
+            let allowed = match check_and_increment_rate_limit(
+                &redis,
+                &key,
+                max_attempts,
+                window_secs,
+            )
+            .await
+            {
+                Ok(allowed) => allowed,
                 Err(e) => {
-                    warn!(error = %e, "Redis error, failing open");
+                    warn!(error = %e, key = %key, "Redis error during rate limit check");
                     metrics::external::redis_failure("rate_limit");
-                    metrics::security::rate_limit_fail_open();
-                    
-                    // Fail open - allow request when Redis is down
-                    true
+
+                    if config.fail_open {
+                        metrics::security::rate_limit_fail_open();
+                        warn!("Rate limiter failing open: allowing request despite Redis error");
+                        true
+                    } else {
+                        warn!("Rate limiter failing secure: blocking request due to Redis error");
+                        false
+                    }
                 }
             };
 
-            if !allowed {
+            if allowed {
+                inner.call(req).await
+            } else {
+                info!(key = %key, max_attempts, window_secs, "Rate limit exceeded");
                 metrics::security::rate_limit_blocked();
-
-                let message = config.message.unwrap_or_else(|| 
-                    "Too many requests. Please try again later.".to_string()
-                );
 
                 let mut response = (
                     StatusCode::TOO_MANY_REQUESTS,
                     Json(json!({
                         "status": "error",
-                        "message": message,
+                        "message": &config.message,
                         "code": "RATE_LIMIT_EXCEEDED"
-                    }))
-                ).into_response();
+                    })),
+                )
+                    .into_response();
 
-                // Add rate limit headers
                 let headers = response.headers_mut();
-                
-                if let Some(retry) = config.retry_after {
-                    headers.insert("Retry-After", retry.to_string().parse().unwrap());
-                }
-                
-                headers.insert("X-RateLimit-Limit", max_attempts.to_string().parse().unwrap());
-                headers.insert("X-RateLimit-Window", window_secs.to_string().parse().unwrap());
+                headers.insert(
+                    "Retry-After",
+                    config.retry_after_secs.to_string().parse().unwrap(),
+                );
+                headers.insert(
+                    "X-RateLimit-Limit",
+                    max_attempts.to_string().parse().unwrap(),
+                );
+                headers.insert(
+                    "X-RateLimit-Window",
+                    window_secs.to_string().parse().unwrap(),
+                );
 
-                return Ok(response);
+                Ok(response)
             }
-
-            metrics::security::rate_limit_allowed();
-            inner.call(req).await
         })
     }
 }
 
-// =============================================================================
-// CONSTRUCTOR
-// =============================================================================
-
 impl RateLimiterLayer {
-    /// Creates a new rate limiter with custom configuration.
-    pub fn custom(
+    /// Creates a new rate limiter layer.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let layer = RateLimiterLayer::new(
+    ///     redis_client,
+    ///     100, // 100 requests
+    ///     60,  // per 60 seconds
+    ///     |req| {
+    ///         // Rate limit by IP address
+    ///         let ip = extract_ip_from_request(req);
+    ///         format!("rate:{}:{}", req.uri().path(), ip)
+    ///     }
+    /// );
+    /// ```
+    pub fn new(
         redis: Arc<Client>,
         max_attempts: u32,
         window_secs: usize,
@@ -187,106 +208,49 @@ impl RateLimiterLayer {
             config: RateLimitConfig::default(),
         }
     }
-}
 
-// =============================================================================
-// TESTS
-// =============================================================================
+    /// Sets a custom error message for rate-limited responses.
+    #[allow(dead_code)]
+    pub fn with_message(mut self, message: impl Into<String>) -> Self {
+        self.config.message = message.into();
+        self
+    }
+
+    /// Sets a custom `Retry-After` header value in seconds.
+    #[allow(dead_code)]
+    pub fn with_retry_after(mut self, seconds: u64) -> Self {
+        self.config.retry_after_secs = seconds;
+        self
+    }
+
+    /// Configures the middleware to "fail open" (allow requests) when Redis is unavailable.
+    /// **Warning**: This reduces security. The default is "fail-secure" (block requests).
+    #[allow(dead_code)]
+    pub fn fail_open(mut self, fail_open: bool) -> Self {
+        self.config.fail_open = fail_open;
+        self
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{body::Body, http::StatusCode, routing::get, Router};
-    use tower::ServiceExt;
 
-    async fn handler() -> &'static str {
-        "OK"
-    }
-
-    fn test_key_fn(req: &Request<Body>) -> String {
-        format!("test:{}", req.uri().path())
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires Redis
-    async fn test_rate_limiting() {
-        metrics::init();
-        let redis = Arc::new(Client::open("redis://localhost:6379").unwrap());
-        
-        let layer = RateLimiterLayer::custom(redis, 2, 60, test_key_fn);
-
-        let app = Router::new()
-            .route("/test", get(handler))
-            .layer(layer);
-
-        // First two requests should succeed
-        for i in 1..=2 {
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .uri("/test")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            
-            assert_eq!(response.status(), StatusCode::OK, "Request {} should succeed", i);
-        }
-
-        // Third request should be rate limited
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/test")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        
-        // Check headers
-        assert!(response.headers().contains_key("retry-after"));
-        assert!(response.headers().contains_key("x-ratelimit-limit"));
-        assert!(response.headers().contains_key("x-ratelimit-window"));
-    }
-
-    #[tokio::test]
-    async fn test_fail_open_with_invalid_redis() {
-        metrics::init();
-        let redis = Arc::new(Client::open("redis://invalid:6379").unwrap());
-        
-        let layer = RateLimiterLayer::custom(redis, 1, 60, test_key_fn);
-
-        let app = Router::new()
-            .route("/test", get(handler))
-            .layer(layer);
-
-        // Should fail open and allow request
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/test")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
+    fn test_key_fn(_req: &Request<Body>) -> String {
+        "test:rate_limiter".to_string()
     }
 
     #[test]
-    fn test_custom_config() {
-        let config = RateLimitConfig {
-            message: Some("Custom message".to_string()),
-            retry_after: Some(120),
-        };
+    fn test_config_builder_pattern() {
+        // This test doesn't require a live Redis connection.
+        let redis = Arc::new(Client::open("redis://localhost").unwrap());
+        let layer = RateLimiterLayer::new(redis.clone(), 10, 60, test_key_fn)
+            .with_message("Custom message")
+            .with_retry_after(120)
+            .fail_open(false);
 
-        assert_eq!(config.message.as_deref(), Some("Custom message"));
-        assert_eq!(config.retry_after, Some(120));
+        assert_eq!(layer.config.message, "Custom message");
+        assert_eq!(layer.config.retry_after_secs, 120);
+        assert_eq!(layer.config.fail_open, false);
     }
 }

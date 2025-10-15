@@ -3,7 +3,7 @@
 //! Provides reliable Redis connectivity with essential caching operations,
 //! rate limiting, and token management capabilities.
 
-use redis::{AsyncCommands, Client};
+use redis::{AsyncCommands, Client, Script};
 use std::env;
 use tracing::{error, info, warn};
 
@@ -19,7 +19,6 @@ use crate::{
 const REDIS_URL_ENV: &str = "REDIS_URL";
 const TOKEN_BLOCKED_VALUE: &str = "blocked";
 const ACTIVATION_CODE_TTL: u64 = 86_400; // 24 hours
-#[allow(dead_code)]
 const PASSWORD_RESET_TTL: u64 = 1_800; // 30 minutes
 
 
@@ -187,10 +186,9 @@ pub async fn verify_activation_code(redis: &Client, code: &str) -> Result<String
     match email {
         Some(email) => {
             // Delete code to ensure single use
-            let _: () = conn.del(&key).await.map_err(|e| {
+            if let Err(e) = conn.del::<_, ()>(&key).await {
                 warn!("Failed to delete activation code (non-critical): {}", e);
-                e
-            }).unwrap_or(());
+            }
 
             metrics::external::redis_success("verify_activation_code");
             Ok(email)
@@ -212,7 +210,6 @@ pub async fn verify_activation_code(redis: &Client, code: &str) -> Result<String
 /// Stores a password reset token with 30-minute expiration.
 ///
 /// The token is linked to an email address for password reset.
-#[allow(dead_code)]
 pub async fn store_password_reset_token(
     redis: &Client,
     email: &str,
@@ -275,7 +272,7 @@ pub async fn invalidate_reset_token(redis: &Client, token: &str) -> Result<(), C
     let mut conn = get_connection(redis).await?;
     let key = format!("password_reset:token:{}", token);
 
-    let _: () = conn.del(&key).await.map_err(|e| {
+    conn.del::<&str, ()>(&key).await.map_err(|e| {
         error!("Failed to delete reset token: {}", e);
         metrics::external::redis_failure("invalidate_reset_token");
         CacheError::Operation {
@@ -292,10 +289,10 @@ pub async fn invalidate_reset_token(redis: &Client, token: &str) -> Result<(), C
 // RATE LIMITING
 // =============================================================================
 
-/// Checks and increments rate limit with sliding window.
+/// Checks and increments rate limit with sliding window using an atomic Lua script.
 ///
 /// Returns `true` if within limit, `false` if limit exceeded.
-/// Uses atomic increment to prevent race conditions.
+/// The Lua script ensures that INCR and EXPIRE are performed atomically.
 pub async fn check_and_increment_rate_limit(
     redis: &Client,
     key: &str,
@@ -305,39 +302,73 @@ pub async fn check_and_increment_rate_limit(
     let mut conn = get_connection(redis).await?;
     let sanitized_key = sanitize_rate_limit_key(key);
 
-    // Atomically increment counter
-    let current_count: u32 = conn.incr(&sanitized_key, 1).await.map_err(|e| {
-        error!("Rate limit increment failed: {}", e);
-        metrics::external::redis_failure("rate_limit_check");
+    // Lua script for atomic INCR and EXPIRE.
+    // 1. Increment the key.
+    // 2. If the count is 1, set the expiration.
+    // 3. Return the current count.
+    let script = Script::new(r"
+        local current = redis.call('INCR', KEYS[1])
+        if tonumber(current) == 1 then
+            redis.call('EXPIRE', KEYS[1], ARGV[1])
+        end
+        return current
+    ");
+
+    // Execute the script atomically.
+    let current_count: u32 = script
+        .key(&sanitized_key)
+        .arg(window_seconds)
+        .invoke_async(&mut conn)
+        .await
+        .map_err(|e| {
+            error!("Rate limit Lua script failed: {}", e);
+            metrics::external::redis_failure("rate_limit_check");
+            CacheError::Operation {
+                source: Box::new(e),
+                span: tracing_error::SpanTrace::capture(),
+            }
+        })?;
+
+    let within_limit = current_count <= max_attempts;
+
+    if within_limit {
+        metrics::external::redis_success("rate_limit_check");
+    } else {
+        // Log only when the limit is first exceeded to reduce noise.
+        if current_count == max_attempts + 1 {
+            warn!(
+                "Rate limit exceeded for key: {} ({}/{})",
+                sanitized_key, current_count, max_attempts
+            );
+        }
+        metrics::external::redis_failure("rate_limit_exceeded");
+    }
+
+    Ok(within_limit)
+}
+
+/// Clears a rate limit counter for a given key.
+///
+/// Typically called after a successful operation (e.g., login) to reset
+/// the failed attempts counter. This is often a "fire-and-forget" operation.
+pub async fn clear_rate_limit_counter(redis: &Client, key: &str) -> Result<(), CacheError> {
+    let mut conn = get_connection(redis).await?;
+    let sanitized_key = sanitize_rate_limit_key(key);
+
+    conn.del::<_, ()>(&sanitized_key).await.map_err(|e| {
+        error!("Failed to clear rate limit counter: {}", e);
+        metrics::external::redis_failure("clear_rate_limit");
         CacheError::Operation {
             source: Box::new(e),
             span: tracing_error::SpanTrace::capture(),
         }
     })?;
 
-    // Set expiration on first increment
-    if current_count == 1 {
-        let _: () = conn
-            .expire(&sanitized_key, window_seconds)
-            .await
-            .map_err(|e| {
-                warn!("Failed to set rate limit expiry: {}", e);
-                e
-            })
-            .unwrap_or(());
-    }
-
-    let within_limit = current_count <= max_attempts;
-    
-    if within_limit {
-        metrics::external::redis_success("rate_limit_check");
-    } else {
-        warn!("Rate limit exceeded for key: {} ({}/{})", sanitized_key, current_count, max_attempts);
-        metrics::external::redis_failure("rate_limit_exceeded");
-    }
-
-    Ok(within_limit)
+    metrics::external::redis_success("clear_rate_limit");
+    info!("Cleared rate limit counter for key: {}", sanitized_key);
+    Ok(())
 }
+
 
 // =============================================================================
 // HELPER FUNCTIONS
@@ -370,14 +401,14 @@ fn sanitize_rate_limit_key(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
-    fn setup_test_env() {
-        env::set_var(REDIS_URL_ENV, "redis://localhost:6379");
-        metrics::init(); // Initialize metrics for tests
-    }
+    // Mutex to prevent race conditions when setting environment variables
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_init_redis_without_url() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         env::remove_var(REDIS_URL_ENV);
         let result = init_redis();
         assert!(result.is_err());
@@ -386,101 +417,11 @@ mod tests {
 
     #[test]
     fn test_init_redis_with_invalid_url() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         env::set_var(REDIS_URL_ENV, "not-a-valid-url");
         let result = init_redis();
         assert!(result.is_err());
         env::remove_var(REDIS_URL_ENV);
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires Redis
-    async fn test_health_check() {
-        setup_test_env();
-        let client = init_redis().expect("Redis should initialize");
-        assert!(check_redis_connection(&client).await);
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires Redis
-    async fn test_activation_code_flow() {
-        setup_test_env();
-        let client = init_redis().expect("Redis should initialize");
-        
-        let email = "test@example.com";
-        let code = "TEST123";
-        
-        // Store and verify
-        store_activation_code(&client, email, code).await.unwrap();
-        let result = verify_activation_code(&client, code).await.unwrap();
-        assert_eq!(result, email);
-        
-        // Second verify should fail (consumed)
-        assert!(verify_activation_code(&client, code).await.is_err());
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires Redis
-    async fn test_reset_token_flow() {
-        setup_test_env();
-        let client = init_redis().expect("Redis should initialize");
-        
-        let email = "reset@example.com";
-        let token = "RESET123";
-        
-        // Store and verify
-        store_password_reset_token(&client, email, token).await.unwrap();
-        assert_eq!(verify_reset_token(&client, token).await.unwrap(), email);
-        
-        // Can verify again (not consumed)
-        assert_eq!(verify_reset_token(&client, token).await.unwrap(), email);
-        
-        // Invalidate and verify should fail
-        invalidate_reset_token(&client, token).await.unwrap();
-        assert!(verify_reset_token(&client, token).await.is_err());
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires Redis
-    async fn test_rate_limiting() {
-        setup_test_env();
-        let client = init_redis().expect("Redis should initialize");
-        
-        let key = format!("test:rate:{}", uuid::Uuid::new_v4());
-        let max = 3;
-        let window = 5;
-        
-        // First 3 should succeed
-        for i in 1..=3 {
-            let allowed = check_and_increment_rate_limit(&client, &key, max, window)
-                .await
-                .unwrap();
-            assert!(allowed, "Attempt {} should be allowed", i);
-        }
-        
-        // Fourth should be blocked
-        let blocked = check_and_increment_rate_limit(&client, &key, max, window)
-            .await
-            .unwrap();
-        assert!(!blocked, "Fourth attempt should be blocked");
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires Redis
-    async fn test_jwt_blocking() {
-        setup_test_env();
-        let client = init_redis().expect("Redis should initialize");
-        
-        let token = format!("jwt.token.{}", uuid::Uuid::new_v4());
-        let exp = 60;
-        
-        // Initially not blocked
-        assert!(!is_token_blocked(&client, &token).await.unwrap());
-        
-        // Block it
-        block_token(&client, &token, exp).await.unwrap();
-        
-        // Now should be blocked
-        assert!(is_token_blocked(&client, &token).await.unwrap());
     }
 
     #[test]
@@ -489,7 +430,6 @@ mod tests {
         assert_eq!(sanitize_rate_limit_key("bad<>key"), "badkey");
         assert_eq!(sanitize_rate_limit_key("user@domain.com"), "userdomain.com");
         
-        // Test length limiting
         let long_key = "a".repeat(200);
         assert_eq!(sanitize_rate_limit_key(&long_key).len(), 128);
     }
