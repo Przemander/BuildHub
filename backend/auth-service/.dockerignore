@@ -1,11 +1,30 @@
-target
+# Git history
 .git
 .gitignore
-**/*.rs.bk
-**/*.swp
-**/*.swo
-**/node_modules
+
+# Docker-specific files
+.dockerignore
+docker-compose.yml
+docker-compose.override.yml
+prometheus.yml
+
+# Build artifacts
+target/
+
+# Secrets (should not be in the build context)
 .env
 .env.*
-/tests
-/.vscode
+!*.env.example
+
+# IDE & Editor config
+.vscode/
+.idea/
+
+# Test directories
+/tests/
+/integration-tests/
+
+# Temporary files
+*.swp
+*.swo
+*.rs.bk

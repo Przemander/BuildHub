@@ -79,7 +79,7 @@ pub fn hash_password(password: &str) -> String {
 pub fn verify_password(password: &str, hash: &str) -> Result<bool, AuthServiceError> {
     let start_time = std::time::Instant::now();
     
-    // Poprawka: obsługa błędów
+    // Fix: handle parsing errors
     let parsed_hash = match PasswordHash::new(hash) {
         Ok(hash) => hash,
         Err(e) => {

@@ -1,228 +1,121 @@
 # BuildHub Authentication Service
 
-A production-ready authentication microservice built with Rust, featuring JWT-based authentication, email verification, and comprehensive observability.
+A production-ready, secure, and observable authentication microservice built with Rust. This project demonstrates best practices in API design, database management, security, and containerization.
 
 ## 🚀 Features
 
-- **User Registration** with email activation
-- **JWT Authentication** (access & refresh tokens)
-- **Password Reset** flow with secure tokens
-- **Rate Limiting** to prevent abuse
-- **Account Lockout** protection
-- **OpenTelemetry** tracing and Prometheus metrics
-- **Docker Compose** setup for easy deployment
-- **PostgreSQL** for data persistence
-- **Redis** for caching and rate limiting
+-   **Secure User Management**: Registration with email activation and secure password reset flow.
+-   **JWT Authentication**: Stateless authentication using JSON Web Tokens (access & refresh tokens).
+-   **Robust Security**:
+    -   Argon2id for password hashing.
+    -   Redis-backed rate limiting to prevent brute-force attacks.
+    -   Token revocation list for immediate session invalidation (logout).
+    -   Protection against user enumeration attacks.
+-   **High Performance**: Built on Axum and Tokio for asynchronous, non-blocking I/O.
+-   **Comprehensive Observability**:
+    -   **Structured Logging** with `tracing`.
+    -   **Distributed Tracing** via OpenTelemetry, exportable to Jaeger.
+    -   **Metrics** exposed for Prometheus.
+-   **Clean Architecture**: Clear separation of concerns between API handlers, business logic, and data access layers.
+-   **Containerized Environment**: Full development and monitoring stack managed by Docker Compose.
 
-## 📋 Prerequisites
+## 🛠️ Tech Stack
 
-- Docker & Docker Compose (for containerized setup)
-- OR Rust 1.82+ (for local development)
-- Git
+-   **Language**: Rust (Stable)
+-   **Web Framework**: Axum
+-   **Database**: PostgreSQL (with Diesel ORM and R2D2 connection pooling)
+-   **Cache/Broker**: Redis
+-   **Containerization**: Docker & Docker Compose
+-   **Observability**: OpenTelemetry (Jaeger), Prometheus, Grafana
 
-## 🏃 Quick Start (Docker - Recommended)
+## 🏃‍♀️ Quick Start
 
-1. **Clone the repository**
-   ```bash
-   git clone https://github.com/yourusername/buildhub-auth-service.git
-   cd buildhub-auth-service
-   ```
+This project is designed to be run with Docker Compose, which orchestrates all services.
 
-2. **Create environment file**
-   ```bash
-   cp .env.example .env.docker
-   # Edit .env.docker with your settings (especially email credentials)
-   ```
+### Prerequisites
 
-3. **Start services**
-   ```bash
-   ./scripts/docker-run.sh up
-   ```
+-   Docker & Docker Compose
+-   Git
 
-4. **Test the service**
-   ```bash
-   # Health check
-   curl http://localhost:3000/health
-   
-   # Register a user
-   curl -X POST http://localhost:3000/auth/register \
-     -H "Content-Type: application/json" \
-     -d '{
-       "username": "testuser",
-       "email": "test@example.com",
-       "password": "SecurePass123!"
-     }'
-   ```
+### Running the Application
 
-## 🛠️ Development Setup
+1.  **Clone the repository:**
+    ```bash
+    git clone https://github.com/przemander/BuildHub.git
+    cd BuildHub/backend/auth-service
+    ```
 
-### Using Docker (Recommended)
+2.  **Create the environment file:**
+    Copy the example configuration and customize it with your secrets (especially for JWT and SMTP).
+    ```bash
+    cp .env.example .env
+    ```
+    > **Note**: The `.env` file is ignored by Git. You will need to create it manually.
 
-```bash
-# Start all services
-./scripts/docker-run.sh up
+3.  **Start the services:**
+    This command builds the Rust application, starts the database and Redis, and runs the service.
+    ```bash
+    docker compose up --build
+    ```
+    To run in the background, add the `-d` flag.
 
-# View logs
-./scripts/docker-run.sh logs
+4.  **Verify the service is running:**
+    In a new terminal, check the health endpoint.
+    ```bash
+    curl http://localhost:3000/health
+    ```
+    You should see `ok`.
 
-# Stop services
-./scripts/docker-run.sh down
+## 📈 Running with the Full Monitoring Stack
 
-# Clean everything (including data)
-./scripts/docker-run.sh clean
-```
+To run the application along with Jaeger, Prometheus, and Grafana, use the `monitoring` profile.
 
-### Local Development (Without Docker)
+1.  **Start all services:**
+    ```bash
+    docker compose --profile monitoring up --build -d
+    ```
 
-1. **Install dependencies**
-   ```bash
-   # Install PostgreSQL and Redis
-   sudo apt-get install postgresql redis-server
-   
-   # Install Rust
-   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-   ```
+2.  **Access the tools:**
+    -   **Jaeger UI** (Distributed Tracing): `http://localhost:16686`
+    -   **Prometheus UI** (Metrics): `http://localhost:9090`
+    -   **Grafana UI** (Dashboards): `http://localhost:3002` (login: `admin`, password in `.env`)
+    -   **Service Metrics**: `http://localhost:3000/metrics`
 
-2. **Setup database**
-   ```bash
-   # Create database and user
-   sudo -u postgres psql
-   CREATE USER buildhub WITH PASSWORD 'bhdbjpak';
-   CREATE DATABASE buildhub_auth OWNER buildhub;
-   \q
-   
-   # Run migrations
-   diesel migration run
-   ```
+## ⚙️ Configuration
 
-3. **Configure environment**
-   ```bash
-   cp .env.example .env
-   # Edit .env for local settings (use localhost instead of container names)
-   ```
+All configuration is managed via the `.env` file. See `.env.example` for a complete list of available variables.
 
-4. **Run the service**
-   ```bash
-   cargo run
-   ```
+| Variable                  | Description                                            | Example                                                    |
+| ------------------------- | ------------------------------------------------------ | ---------------------------------------------------------- |
+| `APP_PORT`                | The port the application will be exposed on.           | `3000`                                                     |
+| `POSTGRES_USER`           | PostgreSQL database username.                          | `buildhub`                                                 |
+| `POSTGRES_PASSWORD`       | PostgreSQL database password.                          | `bhdbjpak`                                                 |
+| `JWT_SECRET`              | **Critical**: A long, random secret for signing JWTs.  | `generate_a_strong_random_key_here`                        |
+| `SMTP_USERNAME`           | Your email account username for sending emails.        | `your-email@gmail.com`                                     |
+| `SMTP_PASSWORD`           | Your email account app-specific password.              | `your-google-app-password`                                 |
+| `OTEL_ENABLED`            | Set to `true` to enable OpenTelemetry tracing.         | `true`                                                     |
 
-## 📁 Project Structure
+## 🗂️ Project Structure
 
 ```
-auth-service/
-├── src/
-│   ├── main.rs              # Application entry point
-│   ├── app.rs               # Router configuration
-│   ├── handlers/            # HTTP request handlers
-│   ├── middleware/          # Auth, rate limiting, telemetry
-│   ├── db/                  # Database models and operations
-│   ├── config/              # Database and Redis configuration
-│   ├── utils/               # Utilities (JWT, email, validation)
-│   └── metricss/            # Prometheus metrics
-├── migrations/              # Database migrations
-├── scripts/                 # Helper scripts
-├── docker-compose.yml       # Docker services configuration
-├── Dockerfile              # Container build instructions
-└── .env.example            # Environment variables template
-```
-
-## 🔧 Configuration
-
-### Environment Variables
-
-Copy `.env.example` to `.env.docker` (for Docker) or `.env` (for local) and configure:
-
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `DATABASE_URL` | PostgreSQL connection string | `postgres://buildhub:password@localhost:5432/buildhub_auth` |
-| `REDIS_URL` | Redis connection string | `redis://localhost:6379` |
-| `JWT_SECRET` | Secret key for JWT signing (min 32 chars) | `your-super-secret-key-change-this` |
-| `SMTP_SERVER` | SMTP server for emails | `smtp.gmail.com` |
-| `SMTP_USERNAME` | Email account username | `your-email@gmail.com` |
-| `SMTP_PASSWORD` | Email account password | `your-app-password` |
-| `FRONTEND_URL` | Frontend application URL | `http://localhost:3001` |
-
-### Email Configuration (Gmail)
-
-1. Enable 2-factor authentication on your Gmail account
-2. Generate an app-specific password: https://myaccount.google.com/apppasswords
-3. Use this app password in `SMTP_PASSWORD`
-
-## 📊 Monitoring
-
-### With Monitoring Stack
-
-```bash
-# Start with Prometheus and Grafana
-./scripts/docker-run.sh monitoring
-```
-
-Access:
-- **Prometheus**: http://localhost:9090
-- **Grafana**: http://localhost:3002 (admin/admin)
-- **Metrics**: http://localhost:3000/metrics
-
-## 🧪 API Endpoints
-
-### Authentication
-
-- `POST /auth/register` - Register new user
-- `POST /auth/login` - User login
-- `POST /auth/logout` - Logout (revoke token)
-- `POST /auth/refresh` - Refresh access token
-- `GET /auth/activate?code=XXX` - Activate account
-
-### Password Reset
-
-- `POST /auth/password-reset/request` - Request reset email
-- `POST /auth/password-reset/confirm` - Reset with token
-
-### Health & Monitoring
-
-- `GET /health` - Service health check
-- `GET /readiness` - Readiness probe
-- `GET /metrics` - Prometheus metrics
-
-## 🐛 Troubleshooting
-
-### Port Conflicts
-
-If you get port conflicts, edit `.env.docker`:
-```bash
-POSTGRES_PORT=5433  # Different from default 5432
-REDIS_PORT=6380     # Different from default 6379
-```
-
-### Email Not Sending
-
-1. Check SMTP credentials in `.env.docker`
-2. For Gmail, ensure you're using an app password
-3. Check spam folder for activation emails
-
-### Database Connection Issues
-
-```bash
-# Test PostgreSQL connection
-psql postgres://buildhub:bhdbjpak@localhost:5433/buildhub_auth
-
-# Reset database
-./scripts/docker-run.sh clean
-./scripts/docker-run.sh up
+.
+├── src/                  # Application source code
+│   ├── app.rs            # Axum router and application state
+│   ├── main.rs           # Application entry point and setup
+│   ├── config/           # Database, Redis, and OTel configuration
+│   ├── db/               # Diesel schema and data models
+│   ├── handlers/         # HTTP request handlers and business logic
+│   ├── middleware/       # JWT auth, rate limiting, telemetry
+│   └── utils/            # Shared utilities (hashing, validation, etc.)
+├── migrations/           # Diesel database migrations
+├── .env.example          # Example environment file
+├── .gitignore            # Files and directories to ignore
+├── Cargo.toml            # Rust project definition
+├── Dockerfile            # Multi-stage Docker build instructions
+├── docker-compose.yml    # Service orchestration for all environments
+└── prometheus.yml        # Prometheus scrape configuration
 ```
 
 ## 📝 License
 
-MIT
-
-## 👥 Contributing
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-## 📧 Contact
-
-- Your Name - your.email@example.com
-- Project Link: https://github.com/yourusername/buildhub-auth-service
+This project is licensed under the MIT License. See the `LICENSE` file for details.

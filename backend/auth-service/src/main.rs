@@ -19,6 +19,7 @@ use crate::{
     app::build_app,
     config::{
         database::{check_database_health, init_pool, run_migrations},
+        otel::{init_telemetry, shutdown_telemetry},  // Add this
         redis::init_redis,
     },
     utils::{email::EmailConfig, metrics, validators},
@@ -43,12 +44,19 @@ const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 // =============================================================================
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() {
+    if let Err(err) = run().await {
+        eprintln!("auth-service failed: {err:?}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Load .env file if present
     dotenvy::dotenv().ok();
 
-    // Initialize tracing for structured logging
-    init_tracing();
+    // Initialize OpenTelemetry/Jaeger tracing
+    init_telemetry()?;
 
     // Initialize metrics and validators eagerly
     metrics::init();
@@ -67,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool = init_pool();
     run_migrations(&pool)?;
     if let Err(e) = check_database_health(&pool).await {
-        error!("Database health check failed: {}", e);
+        error!("Database health check failed: {e}");
         return Err("Database is unhealthy, shutting down.".into());
     }
 
@@ -78,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(client)
         }
         Err(e) => {
-            warn!("Redis is unavailable: {}. Some features may be disabled.", e);
+            warn!("Redis is unavailable: {e}. Some features may be disabled.");
             None
         }
     };
@@ -90,7 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(config)
         }
         Err(e) => {
-            warn!("Email service is unavailable: {}. Some features may be disabled.", e);
+            warn!("Email service is unavailable: {e}. Some features may be disabled.");
             None
         }
     };
@@ -102,7 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = get_bind_address()?;
 
     // Start the server
-    info!("Server listening on {}", addr);
+    info!("Server listening on {addr}");
     print_banner(&addr);
 
     Server::bind(&addr)
@@ -111,21 +119,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     info!("Service shut down gracefully");
+    
+    // Shutdown OpenTelemetry to ensure all traces are flushed
+    shutdown_telemetry();
+    
     Ok(())
 }
 
 // =============================================================================
 // INITIALIZATION & SHUTDOWN
 // =============================================================================
-
-/// Initializes the `tracing` subscriber for structured, JSON-formatted logs.
-fn init_tracing() {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_target(false) // Disable module path logging for cleaner output
-        .json()
-        .init();
-}
 
 /// Validates that all required environment variables are set.
 fn validate_config() -> Result<(), Box<dyn std::error::Error>> {

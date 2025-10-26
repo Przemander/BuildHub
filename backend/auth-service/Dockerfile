@@ -1,54 +1,67 @@
-# ---------- Build stage ----------
-FROM rust:1.82-slim AS builder
+# syntax=docker/dockerfile:1
 
-# Install only essential build dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config libssl-dev libpq-dev ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
+################################################################################
+# STAGE 1: BUILDER - Compiles the Rust application
+################################################################################
+FROM rust:1.85-slim-bookworm AS builder
 
-WORKDIR /app
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    libpq-dev \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy manifests first for layer caching
+WORKDIR /build
+
+# Cache dependencies to speed up subsequent builds
 COPY Cargo.toml Cargo.lock ./
-
-# Copy migrations directory (required for embed_migrations!)
 COPY migrations ./migrations
+RUN mkdir src && echo "fn main() {}" > src/main.rs
+RUN cargo build --release && rm -rf src
 
-# Create dummy src to build dependencies
-RUN mkdir -p src && echo "fn main() {}" > src/main.rs
-RUN cargo build --release
-RUN rm -rf src target/release/deps/auth_service*
-
-# Copy real source and build
+# Build the final application binary
 COPY src ./src
+RUN cargo build --release && \
+    strip /build/target/release/auth-service
 
-# Build the binary
-RUN cargo build --release
+################################################################################
+# STAGE 2: RUNTIME - Creates the final, minimal production image
+################################################################################
+FROM debian:bookworm-slim
 
-# ---------- Runtime stage ----------
-FROM debian:bookworm-slim AS runtime
-
-# Install runtime dependencies including wget for healthcheck
+# Install runtime dependencies + Tini
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates libpq5 libssl3 wget && \
-    rm -rf /var/lib/apt/lists/* && \
-    useradd -m -u 10001 appuser
+    ca-certificates \
+    libpq5 \
+    libssl3 \
+    curl \
+    tini \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create a non-root user for security
+RUN useradd -m -u 1001 appuser
 
 WORKDIR /app
 
-# Copy binary
-COPY --from=builder /app/target/release/auth-service /usr/local/bin/auth-service
+# Copy the compiled binary from the builder stage
+COPY --from=builder --chown=appuser:appuser /build/target/release/auth-service /app/auth-service
 
-# Make sure it's executable
-RUN chmod +x /usr/local/bin/auth-service
+# Set default environment variables
+ENV RUST_LOG=info \
+    HOST=0.0.0.0 \
+    PORT=3000
 
-# Default envs
-ENV APP_ENV=production \
-    RUST_LOG=info
-
-# Expose service port
 EXPOSE 3000
 
+# Health check to ensure the service is running correctly
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:3000/health || exit 1
+
+# Switch to the non-root user
 USER appuser
 
-CMD ["/usr/local/bin/auth-service"]
+# Use Tini as the entrypoint to handle signals properly (PID 1 problem)
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["/app/auth-service"]

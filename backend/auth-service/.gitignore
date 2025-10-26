@@ -1,84 +1,72 @@
-# Build artifacts
-target/
+# =============================================================================
+# General
+# =============================================================================
+# OS-generated files
+.DS_Store
+Thumbs.db
+.directory
+
+# IDE & Editor directories
+.idea/
+.vscode/
+
+# Swap & backup files
+*.swp
+*.swo
+*~
+*.bak
+*.backup
 *.rs.bk
-*.pdb
-dist/
-build/
 
-# Environment files (IMPORTANT: Never commit these!)
-.env
-.env.local
-.env.test
-.env.*.local
-!.env.example
-!.env.docker.example
+# =============================================================================
+# Rust & Cargo
+# =============================================================================
+# Build artifacts
+/target/
+/dist/
+/build/
 
-# Database files
+# Database files (local development)
 *.db
 *.db-*
 *.sqlite
 *.sqlite3
 *.db-journal
 
-# IDE/Editor
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-.DS_Store
-Thumbs.db
+# =============================================================================
+# Secrets & Environment (IMPORTANT)
+# =============================================================================
+# Ignore all .env files...
+.env
+.env.*
+# ...but NOT the example files
+!*.env.example
 
-# Logs
+# =============================================================================
+# Logs & Temporary Files
+# =============================================================================
 *.log
-logs/
+/logs/
+/tmp/
+/.tmp/
+/temp/
 
-# Temporary files
-tmp/
-.tmp/
-temp/
+# =============================================================================
+# Docker Local Data
+# =============================================================================
+# These are local volumes, not part of the source code
+/postgres_data/
+/redis_data/
+/prometheus_data/
+/grafana_data/
 
-# OS files
-.DS_Store
-Thumbs.db
-.directory
-
-# Docker volumes (local data)
-postgres_data/
-redis_data/
-prometheus_data/
-grafana_data/
-
-# Backup files
-*.bak
-*.backup
-
-# Python specific (for integration tests)
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-venv/
-env/
-ENV/
-.venv
-.pytest_cache/
-.coverage
-htmlcov/
-.tox/
-.hypothesis/
-*.egg-info/
-.eggs/
-pip-log.txt
-pip-delete-this-directory.txt
-
-# Integration test specific
-integration-tests/venv/
-integration-tests/.pytest_cache/
-integration-tests/__pycache__/
-integration-tests/**/__pycache__/
-integration-tests/*.pyc
-integration-tests/.env
-integration-tests/test-results/
-integration-tests/reports/
+# =============================================================================
+# Integration Testing (Python example)
+# =============================================================================
+/integration-tests/venv/
+/integration-tests/.pytest_cache/
+/integration-tests/**/__pycache__/
+/integration-tests/*.pyc
+/integration-tests/.env
+/integration-tests/test-results/
+/integration-tests/reports/

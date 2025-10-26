@@ -1,133 +1,148 @@
+# Docker Compose configuration for the BuildHub Authentication Service
+# Defines the application and its dependent services (PostgreSQL, Redis, Monitoring)
+
 version: "3.9"
 
 services:
-  postgres:
-    image: postgres:15-alpine
-    container_name: auth-postgres
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-buildhub}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-bhdbjpak}
-      POSTGRES_DB: ${POSTGRES_DB:-buildhub_auth}
-    ports:
-      - "${POSTGRES_PORT:-5433}:5432"  # External port 5433, internal 5432
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-buildhub} -d ${POSTGRES_DB:-buildhub_auth}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    networks:
-      - auth-network
-
-  redis:
-    image: redis:7-alpine
-    container_name: auth-redis
-    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
-    ports:
-      - "${REDIS_PORT:-6380}:6379"  # Change external port to 6380
-    volumes:
-      - redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 3s
-      retries: 5
-    networks:
-      - auth-network
-
+  # 1. The main application service, built from the local Dockerfile
   auth-service:
     build:
       context: .
       dockerfile: Dockerfile
     image: buildhub/auth-service:latest
     container_name: auth-service
+    restart: on-failure
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
-    environment:
-      # Application settings
-      APP_ENV: ${APP_ENV:-development}
-      RUST_LOG: ${RUST_LOG:-info,auth_service=debug}
-      HOST: 0.0.0.0
-      PORT: 3000
-      
-      # Database - using container names for internal networking
-      DATABASE_URL: postgres://${POSTGRES_USER:-buildhub}:${POSTGRES_PASSWORD:-bhdbjpak}@postgres:5432/${POSTGRES_DB:-buildhub_auth}
-      
-      # Redis - using container name
-      REDIS_URL: redis://redis:6379
-      
-      # JWT Settings
-      JWT_SECRET: ${JWT_SECRET:-your-super-secret-jwt-key-at-least-32-chars-long-change-in-production}
-      JWT_ACCESS_TOKEN_EXPIRES_IN: ${JWT_ACCESS_TOKEN_EXPIRES_IN:-3600}
-      JWT_REFRESH_TOKEN_EXPIRES_IN: ${JWT_REFRESH_TOKEN_EXPIRES_IN:-604800}
-      
-      # Email Settings
-      SMTP_SERVER: ${SMTP_SERVER:-smtp.gmail.com}
-      SMTP_USERNAME: ${SMTP_USERNAME:-przemekjackowski23@gmail.com}
-      SMTP_PASSWORD: ${SMTP_PASSWORD:-qptxhycypwuiboep}
-      SMTP_FROM_ADDRESS: ${SMTP_FROM_ADDRESS:-przemekjackowski23@gmail.com}
-      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3001}
-      
-      # CORS
-      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3001}
-      
-      # Testing
-      TEST_SECRET: ${TEST_SECRET:-test-secret-key}
-      TEST_MODE: ${TEST_MODE:-false}
-      USE_DUMMY_EMAIL: ${USE_DUMMY_EMAIL:-false}
     ports:
-      - "${APP_PORT:-3000}:3000"
+      - "${PORT:-3000}:3000"
+    networks:
+      - app-network
+    environment:
+      # Application settings sourced from the .env file
+      APP_ENV: ${APP_ENV}
+      RUST_LOG: ${RUST_LOG}
+      RUST_BACKTRACE: "1"
+
+      # Service connection URLs (using Docker's internal DNS)
+      # These override the localhost URLs from your .env file
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+
+      # Secrets and credentials sourced directly from your .env file
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ACCESS_TOKEN_EXPIRES_IN: ${JWT_ACCESS_TOKEN_EXPIRES_IN}
+      JWT_REFRESH_TOKEN_EXPIRES_IN: ${JWT_REFRESH_TOKEN_EXPIRES_IN}
+      SMTP_SERVER: ${SMTP_SERVER}
+      SMTP_USERNAME: ${SMTP_USERNAME}
+      SMTP_PASSWORD: ${SMTP_PASSWORD}
+      SMTP_FROM_ADDRESS: ${SMTP_FROM_ADDRESS}
+      USE_DUMMY_EMAIL: ${USE_DUMMY_EMAIL}
+      OTEL_ENABLED: ${OTEL_ENABLED}
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:3000/health || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 40s
-    networks:
-      - auth-network
-    restart: unless-stopped
+      start_period: 30s
 
-  # Optional: Prometheus for metrics
+  # 2. PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: auth-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # 3. Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: auth-redis
+    restart: unless-stopped
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379" # Using default Redis port for simplicity inside compose
+    volumes:
+      - redis_data:/data
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  # 4. Prometheus (for metrics collection)
   prometheus:
     image: prom/prometheus:latest
     container_name: auth-prometheus
+    restart: unless-stopped
+    profiles: ["monitoring"]
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
     ports:
-      - "${PROMETHEUS_PORT:-9090}:9090"
+      - "9090:9090"
     networks:
-      - auth-network
-    profiles:
-      - monitoring
+      - app-network
 
-  # Optional: Grafana for visualization
+  # 5. Jaeger (for OpenTelemetry trace visualization)
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: auth-jaeger
+    restart: unless-stopped
+    profiles: ["monitoring"]
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "4317:4317"    # OTLP gRPC Receiver
+    networks:
+      - app-network
+
+  # 6. Grafana (for metrics visualization and dashboards)
   grafana:
     image: grafana/grafana:latest
     container_name: auth-grafana
+    restart: unless-stopped
+    profiles: ["monitoring"]
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
-      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
     volumes:
       - grafana_data:/var/lib/grafana
     ports:
-      - "${GRAFANA_PORT:-3001}:3000"
+      - "3002:3000"
     networks:
-      - auth-network
-    profiles:
-      - monitoring
+      - app-network
 
+# Shared network for all services to communicate via service names
 networks:
-  auth-network:
+  app-network:
     driver: bridge
+    name: auth_service_network
 
+# Named volumes for persistent data storage
 volumes:
   postgres_data:
   redis_data:
